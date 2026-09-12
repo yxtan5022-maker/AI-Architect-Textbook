@@ -4,6 +4,19 @@
 
 ---
 
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+1. Compare full fine-tuning vs parameter-efficient fine-tuning (LoRA, QLoRA, Adapters) on memory, speed, and quality
+2. Design an instruction tuning pipeline from data preparation to evaluation
+3. Implement LoRA/QLoRA fine-tuning using PEFT, TRL, and Unsloth
+4. Compare RLHF, DPO, and KTO for alignment training
+5. Identify and prevent common fine-tuning failures (catastrophic forgetting, overfitting, reward hacking)
+6. Calculate resource requirements for fine-tuning different model sizes
+
+---
+
 ## Table of Contents
 
 - [13.1 Full vs Parameter-Efficient Fine-tuning](#131-full-vs-parameter-efficient-fine-tuning)
@@ -11,8 +24,13 @@
 - [13.3 Instruction Tuning Pipeline](#133-instruction-tuning-pipeline)
 - [13.4 RLHF/DPO Architecture](#134-rlhfdpo-architecture)
 - [13.5 Fine-tuning Data Management](#135-fine-tuning-data-management)
-- [💡 Case: Efficient Fine-tuning with Unsloth](#-case-efficient-fine-tuning-with-unsloth)
+- [13.6 Evaluation & Monitoring](#136-evaluation--monitoring)
+- [💡 Case Study: How Healthcare Companies Fine-tune for Clinical NLP](#-case-study-how-healthcare-companies-fine-tune-for-clinical-nlp)
+- [⚠️ War Story: The Fine-tuned Model That Got Worse Than Base](#️-war-story-the-fine-tuned-model-that-got-worse-than-base)
+- [📝 When to Use / When Not to Use](#-when-to-use--when-not-to-use)
 - [Summary](#summary)
+- [Discussion Questions](#discussion-questions)
+- [Exercises](#exercises)
 - [References](#references)
 
 ---
@@ -60,9 +78,9 @@ Fine-tuning adapts a pre-trained model to specific tasks or domains. The choice 
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 13.1.2 When to Use Each Approach
+📌 **Real Data**: PEFT (github.com/huggingface/peft) is Hugging Face's official library for parameter-efficient fine-tuning, supporting LoRA, AdaLoRA, Prefix Tuning, and more. TRL (github.com/huggingface/trl) provides the training loop for RLHF/DPO. Unsloth (github.com/unslothai/unsloth) achieves 2-5x faster LoRA/QLoRA fine-tuning with 70% less memory.
 
-📌 **Key Concept**: Full fine-tuning updates ALL model parameters. PEFT methods only update a small subset of parameters, keeping the base model frozen.
+### 13.1.2 Full Fine-tuning vs PEFT Decision Matrix
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -78,24 +96,21 @@ Fine-tuning adapts a pre-trained model to specific tasks or domains. The choice 
 │  Multiple Tasks        │ Impractical│ Easy (swap) │ Easy     │
 │  Model Size Limit      │ ≤70B       │ ≤405B       │ ≤405B    │
 │  Data Requirement      │ High       │ Low-Medium  │ Low      │
+│  Inference Overhead    │ None       │ None*       │ 5-10%    │
+│  Hyperparameter Tuning │ Complex    │ Simple      │ Moderate │
 │                                                                │
-│  Recommendations:                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Use Full FT when:                                    │    │
-│  │  - You have >100K high-quality examples               │    │
-│  │  - Task is very different from pre-training           │    │
-│  │  - You have sufficient compute budget                 │    │
-│  │  - Maximum quality is critical                        │    │
-│  │                                                       │    │
-│  │  Use LoRA/QLoRA when:                                 │    │
-│  │  - You have limited compute                          │    │
-│  │  - You want to fine-tune for multiple tasks           │    │
-│  │  - Data is limited (<50K examples)                   │    │
-│  │  - You want to preserve base model capabilities       │    │
-│  │  - You need rapid iteration                          │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  * LoRA weights can be merged into base model at no cost      │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### 13.1.3 Resource Requirements by Model Size
+
+| Model Size | Full FT (BF16) | LoRA (rank=16) | QLoRA (4-bit) | 1x RTX 4090 |
+|-----------|----------------|----------------|---------------|-------------|
+| 7B | 2× A100 80GB | 1× A100 40GB | 1× RTX 4090 | ✅ |
+| 13B | 4× A100 80GB | 1× A100 80GB | 1× RTX 4090 | ✅ (tight) |
+| 70B | 16× A100 80GB | 4× A100 80GB | 2× A100 80GB | ❌ |
+| 405B | 128× A100 80GB | 16× A100 80GB | 8× A100 80GB | ❌ |
 
 ---
 
@@ -103,121 +118,31 @@ Fine-tuning adapts a pre-trained model to specific tasks or domains. The choice 
 
 ### 13.2.1 LoRA: Low-Rank Adaptation
 
-LoRA (Hu et al., 2022) decomposes weight updates into low-rank matrices:
-
-📌 **Key Concept**: Instead of updating a weight matrix W (d × d), LoRA learns two small matrices A (d × r) and B (r × d), where r << d. The update is: W' = W + BA.
+LoRA (Hu et al., 2022) freezes the pre-trained model weights and injects trainable low-rank decomposition matrices into each layer:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    LoRA Architecture                            │
 │                                                                │
-│  Original Linear Layer:                                        │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  y = Wx    where W ∈ ℝ^{d_out × d_in}               │    │
-│  │                                                       │    │
-│  │  For a 4096×4096 layer:                               │    │
-│  │  Parameters: 4096 × 4096 = 16.8M                     │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Original Layer:                                              │
+│  h = Wx     (W is d×d, frozen)                                │
 │                                                                │
-│  LoRA-Adapted Layer:                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │                                                       │    │
-│  │  x ──────────────────────┐                           │    │
-│  │  │                       │                           │    │
-│  │  ▼                       ▼                           │    │
-│  │  ┌──────┐           ┌─────────┐                     │    │
-│  │  │  W   │ (frozen)  │ A (d×r) │ (trainable)         │    │
-│  │  │      │           └────┬────┘                     │    │
-│  │  └──┬───┘                │                           │    │
-│  │     │                    ▼                           │    │
-│  │     │               ┌─────────┐                     │    │
-│  │     │               │ B (r×d) │ (trainable)         │    │
-│  │     │               └────┬────┘                     │    │
-│  │     │                    │                           │    │
-│  │     └────────┬───────────┘                           │    │
-│  │              │                                       │    │
-│  │              ▼                                       │    │
-│  │         y = Wx + BAx                                │    │
-│  │                                                       │    │
-│  │  For rank r=16:                                       │    │
-│  │  LoRA params: 4096 × 16 + 16 × 4096 = 131K          │    │
-│  │  Ratio: 131K / 16.8M = 0.78%                         │    │
-│  │  Memory savings: 128x                                 │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  LoRA Layer:                                                  │
+│  h = Wx + BAx                                                  │
+│       │   │ │                                                  │
+│       │   │ └─ B: d×r matrix (random init)                    │
+│       │   └─── A: r×d matrix (random init)                    │
+│       └─────── Frozen original weights                        │
+│                                                                │
+│  Where r << d (typical: r=8, 16, 32, 64)                      │
+│                                                                │
+│  Trainable parameters: 2 × d × r per layer                    │
+│  For d=4096, r=16: 2 × 4096 × 16 = 131K params per layer    │
+│  For 32 layers: 32 × 131K = 4.2M total LoRA params           │
+│  (vs 7B base model = 0.06% of parameters)                     │
+│                                                                │
+│  At inference: merge W_new = W + BA (no overhead)             │
 └──────────────────────────────────────────────────────────────┘
-```
-
-#### LoRA Implementation
-
-```python
-import torch
-import torch.nn as nn
-import math
-
-class LoRALinear(nn.Module):
-    """Low-Rank Adaptation for a linear layer."""
-
-    def __init__(self, original_linear, rank=16, alpha=32, dropout=0.05):
-        super().__init__()
-        self.original_linear = original_linear
-        self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-
-        # Freeze original weights
-        self.original_linear.weight.requires_grad = False
-        if self.original_linear.bias is not None:
-            self.original_linear.bias.requires_grad = False
-
-        d_out, d_in = original_linear.weight.shape
-
-        # LoRA matrices
-        self.lora_A = nn.Parameter(torch.empty(d_in, rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, d_out))
-        self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        # Initialize A with Kaiming, B with zeros (so LoRA starts as identity)
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    def forward(self, x):
-        # Original forward (frozen)
-        original_output = self.original_linear(x)
-
-        # LoRA forward
-        lora_output = self.lora_dropout(x)
-        lora_output = lora_output @ self.lora_A @ self.lora_B * self.scaling
-
-        return original_output + lora_output
-
-    def merge_weights(self):
-        """Merge LoRA weights into original for inference."""
-        self.original_linear.weight.data += (
-            self.lora_B @ self.lora_A * self.scaling
-        ).to(self.original_linear.weight.dtype)
-
-# Apply LoRA to a model
-def apply_lora(model, rank=16, target_modules=None):
-    """Apply LoRA to specified modules."""
-    if target_modules is None:
-        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj"]
-
-    lora_params = 0
-    for name, module in model.named_modules():
-        if any(target in name for target in target_modules):
-            if isinstance(module, nn.Linear):
-                parent_name = ".".join(name.split(".")[:-1])
-                child_name = name.split(".")[-1]
-                parent = dict(model.named_modules())[parent_name]
-
-                lora_layer = LoRALinear(module, rank=rank)
-                setattr(parent, child_name, lora_layer)
-
-                lora_params += sum(p.numel() for p in lora_layer.parameters()
-                                   if p.requires_grad)
-
-    print(f"LoRA parameters: {lora_params:,} ({lora_params/1e6:.2f}M)")
-    return model
 ```
 
 ### 13.2.2 QLoRA: Quantized LoRA
@@ -228,470 +153,176 @@ QLoRA (Dettmers et al., 2023) combines 4-bit quantization with LoRA:
 ┌──────────────────────────────────────────────────────────────┐
 │                    QLoRA Architecture                           │
 │                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  4-bit NormalFloat (NF4) Quantized Base Model         │    │
-│  │  ┌────────────────────────────────────────────────┐  │    │
-│  │  │  W_4bit = quantize(W_fp16, bits=4, type=NFB4)  │  │    │
-│  │  │                                                  │  │    │
-│  │  │  Memory: 7B × 0.5 bytes = 3.5 GB               │  │    │
-│  │  └────────────────────────────────────────────────┘  │    │
-│  │                                                       │    │
-│  │  Double Quantization (quantize quantization const):   │    │
-│  │  ┌────────────────────────────────────────────────┐  │    │
-│  │  │  Block absmax values quantized to FP8          │  │    │
-│  │  │  Extra memory savings: ~0.37 GB per 7B model   │  │    │
-│  │  └────────────────────────────────────────────────┘  │    │
-│  │                                                       │    │
-│  │  Paged Optimizers (CPU offload for optimizer states): │    │
-│  │  ┌────────────────────────────────────────────────┐  │    │
-│  │  │  AdamW states offloaded to CPU memory           │  │    │
-│  │  │  Page in/out as needed (like OS paging)         │  │    │
-│  │  └────────────────────────────────────────────────┘  │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Step 1: Quantize base model to 4-bit (NF4 format)           │
+│  ┌──────────────────────────────────────────────┐            │
+│  │  Base Model (4-bit NF4):                      │            │
+│  │  W_4bit = quantize(W_fp32)                    │            │
+│  │  Memory: 7B × 0.5 bytes = 3.5 GB             │            │
+│  └──────────────────────────────────────────────┘            │
 │                                                                │
-│  Training Flow:                                                 │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Input x ──▶ Dequantize W ──▶ Compute Wx (in fp16)   │    │
-│  │                      │                                 │    │
-│  │              ┌───────┴───────┐                        │    │
-│  │              │  LoRA (fp16)  │                        │    │
-│  │              │  A: d×r (fp16)│                        │    │
-│  │              │  B: r×d (fp16)│                        │    │
-│  │              └───────┬───────┘                        │    │
-│  │                      │                                 │    │
-│  │              Output = Wx + BAx (fp16)                 │    │
-│  │                                                       │    │
-│  │  Gradients: Only for A, B (not W)                     │    │
-│  │  Optimizer: Only for A, B parameters                  │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Step 2: Add LoRA adapters in FP16/BF16                      │
+│  ┌──────────────────────────────────────────────┐            │
+│  │  LoRA Adapters (FP16):                        │            │
+│  │  A: d×r = 4096×16 = 131K params              │            │
+│  │  B: r×d = 16×4096 = 131K params              │            │
+│  │  Memory: 262K × 2 bytes = 524 KB per layer   │            │
+│  └──────────────────────────────────────────────┘            │
+│                                                                │
+│  Step 3: Forward pass                                         │
+│  h = dequant(W_4bit) × x + B × A × x                         │
+│      ─────────────────   ────────────                         │
+│      Computed in FP16     Computed in FP16                     │
+│                                                                │
+│  Double Quantization:                                         │
+│  Quantize the quantization constants too                      │
+│  Saves ~0.4 GB for 7B model                                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-```python
-# QLoRA implementation using bitsandbytes
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainingArguments,
-)
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
-from trl import SFTTrainer
+📌 **Real Data**: QLoRA enables fine-tuning a 65B parameter model on a single 48GB GPU while maintaining full 16-bit fine-tuning task performance. The original QLoRA paper fine-tuned a 65B model on a single 48GB A6000 GPU, achieving results competitive with full 16-bit fine-tuning (Dettmers et al., 2023).
 
-# 4-bit quantization config
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
+### 13.2.3 LoRA Configuration Guide
 
-# Load model with QLoRA
-model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-hf",
-    quantization_config=bnb_config,
-    device_map="auto",
-    trust_remote_code=True,
-)
+| Target Modules | What It Affects | Typical Choice |
+|---------------|-----------------|----------------|
+| `q_proj, v_proj` | Attention only | Quick experiments |
+| `q_proj, k_proj, v_proj, o_proj` | Full attention | Good default |
+| `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj` | Attention + FFN | Best quality |
+| All linear layers | Everything possible | Maximum flexibility |
 
-# Prepare model for QLoRA training
-model = prepare_model_for_kbit_training(model)
+| Rank (r) | Quality | Memory | Speed | When to Use |
+|----------|---------|--------|-------|-------------|
+| 4 | Good | Lowest | Fastest | Quick experiments |
+| 8 | Better | Low | Fast | Default choice |
+| 16 | Very Good | Medium | Medium | Production quality |
+| 32 | Excellent | Higher | Slower | High-quality requirements |
+| 64 | Best | High | Slowest | Maximum quality (diminishing returns) |
 
-# LoRA config
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    ],
-)
-
-# Apply LoRA
-model = get_peft_model(model, lora_config)
-model.print_trainable_parameters()
-# Output: trainable params: 33,554,432 || all params: 6,771,970,048 || 0.50%
-
-# Training arguments
-training_args = TrainingArguments(
-    output_dir="./qlora-output",
-    num_train_epochs=3,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
-    learning_rate=2e-4,
-    weight_decay=0.01,
-    warmup_ratio=0.03,
-    lr_scheduler_type="cosine",
-    logging_steps=10,
-    save_strategy="epoch",
-    fp16=False,
-    bf16=True,
-    optim="paged_adamw_32bit",  # Paged optimizer for QLoRA
-    gradient_checkpointing=True,
-    report_to="tensorboard",
-)
-
-# Trainer
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-tokenizer.pad_token = tokenizer.eos_token
-
-trainer = SFTTrainer(
-    model=model,
-    train_dataset=dataset,
-    tokenizer=tokenizer,
-    args=training_args,
-    max_seq_length=2048,
-    packing=True,
-)
-
-# Train
-trainer.train()
-
-# Save LoRA adapter
-model.save_pretrained("./qlora-adapter")
-
-# Merge for inference
-from peft import PeftModel
-base_model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-hf",
-    torch_dtype=torch.bfloat16,
-)
-merged_model = PeftModel.from_pretrained(base_model, "./qlora-adapter")
-merged_model = merged_model.merge_and_unload()
-merged_model.save_pretrained("./merged-model")
-```
-
-### 13.2.3 LoRA Variants
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              LoRA Variants Comparison                           │
-│                                                                │
-│  Variant    │ Key Innovation           │ Best For             │
-│  ───────────│──────────────────────────│──────────────────────│
-│  LoRA       │ Low-rank decomposition   │ General fine-tuning  │
-│  QLoRA      │ 4-bit base + LoRA        │ Memory-constrained   │
-│  DoRA       │ Decomposed rank adapt.   │ Higher quality       │
-│  LoRA+      │ Different LR for A, B    │ Faster convergence   │
-│  rsLoRA     │ Rank-stabilized scaling  │ Large rank stability │
-│  AdaLoRA    │ Adaptive rank allocation  │ Mixed importance     │
-│  GaLore     │ Gradient low-rank proj.  │ Full-rank training   │
-│  LoRA-GA    │ Gradient-aware init      │ Better initialization│
-│                                                                │
-│  LoRA Rank Selection Guide:                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Task Type           │ Recommended Rank               │    │
-│  │  ────────────────────│────────────────────────────────│    │
-│  │  Classification      │ 4-8                            │    │
-│  │  Instruction Tuning  │ 8-32                           │    │
-│  │  Domain Adaptation   │ 16-64                          │    │
-│  │  Complex Reasoning   │ 32-128                         │    │
-│  │  Code Generation     │ 16-64                          │    │
-│  │  Multilingual        │ 32-64                          │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Memory vs Quality Trade-off:                                  │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Rank 4:  0.1% params, 85% quality                  │    │
-│  │  Rank 8:  0.2% params, 90% quality                  │    │
-│  │  Rank 16: 0.5% params, 95% quality                  │    │
-│  │  Rank 32: 1.0% params, 98% quality                  │    │
-│  │  Rank 64: 2.0% params, 99% quality                  │    │
-│  │  Rank 128: 4.0% params, 99.5% quality               │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+| Alpha (α) | Effect | Typical Setting |
+|-----------|--------|-----------------|
+| α = r | Balanced | α=r (e.g., 16) |
+| α = 2r | Stronger adaptation | When base model is very different from target |
+| α = r/2 | Weaker adaptation | When base model is close to target |
 
 ---
 
 ## 13.3 Instruction Tuning Pipeline
 
-### 13.3.1 Data Format and Preparation
-
-Instruction tuning teaches models to follow instructions and produce desired outputs:
+### 13.3.1 End-to-End Pipeline
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Instruction Tuning Data Format                     │
+│              Instruction Tuning Pipeline                         │
 │                                                                │
-│  Alpaca Format (3-column):                                     │
+│  1. Data Preparation                                          │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  {                                                    │    │
-│  │    "instruction": "Summarize the following article", │    │
-│  │    "input": "Long article text...",                  │    │
-│  │    "output": "This article discusses..."            │    │
-│  │  }                                                    │    │
+│  │  Source data → Format → Filter → Split → Tokenize     │    │
+│  │                                                        │    │
+│  │  Format: {"instruction": "...", "input": "...",       │    │
+│  │           "output": "..."}                             │    │
+│  │  Filter: Remove duplicates, long/short, toxic         │    │
+│  │  Split: 90% train, 5% val, 5% test                   │    │
 │  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  ShareGPT Format (multi-turn):                                 │
+│                           │                                    │
+│                           ▼                                    │
+│  2. Training Configuration                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  {                                                    │    │
-│  │    "conversations": [                                 │    │
-│  │      {"from": "human", "value": "What is ML?"},     │    │
-│  │      {"from": "gpt", "value": "ML is..."},          │    │
-│  │      {"from": "human", "value": "Explain more"},    │    │
-│  │      {"from": "gpt", "value": "Specifically..."}    │    │
-│  │    ]                                                  │    │
-│  │  }                                                    │    │
+│  │  Model: Base model + LoRA config                      │    │
+│  │  Optimizer: AdamW (8-bit via bitsandbytes)            │    │
+│  │  Scheduler: Cosine with warmup                        │    │
+│  │  Batch size: Effective = micro_batch × grad_accum × GPUs│  │
+│  │  Learning rate: 1e-4 to 3e-4 (LoRA)                  │    │
 │  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  ChatML Format (OpenAI compatible):                            │
+│                           │                                    │
+│                           ▼                                    │
+│  3. Training Loop (SFTTrainer from TRL)                       │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  <|im_start|>system                                  │    │
-│  │  You are a helpful assistant.<|im_end|>             │    │
-│  │  <|im_start|>user                                    │    │
-│  │  What is 2+2?<|im_end|>                             │    │
-│  │  <|im_start|>assistant                              │    │
-│  │  4<|im_end|>                                         │    │
+│  │  for epoch in epochs:                                 │    │
+│  │      for batch in dataloader:                         │    │
+│  │          loss = model(batch)                          │    │
+│  │          loss.backward()                              │    │
+│  │          optimizer.step()                             │    │
+│  │      evaluate on validation set                       │    │
+│  │      save best checkpoint                             │    │
 │  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Quality Guidelines:                                            │
+│                           │                                    │
+│                           ▼                                    │
+│  4. Evaluation                                                │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  ✅ Diverse instructions (avoid repetition)           │    │
-│  │  ✅ Detailed, comprehensive outputs                   │    │
-│  │  ✅ Consistent formatting and style                   │    │
-│  │  ✅ Balanced across task types                        │    │
-│  │  ❌ No hallucinated facts                             │    │
-│  │  ❌ No toxic or biased content                        │    │
-│  │  ❌ No overly short or lazy responses                 │    │
+│  │  Automatic: MMLU, HumanEval, MT-Bench                 │    │
+│  │  Human eval: Quality, safety, helpfulness             │    │
+│  │  A/B testing: Compare with base model                 │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 13.3.2 Complete Instruction Tuning Pipeline
+### 13.3.2 Training Configuration Example
 
 ```python
-# instruction_tuning_pipeline.py
-"""
-Complete instruction tuning pipeline with data prep, training, and evaluation.
-"""
-import json
-import torch
-from pathlib import Path
-from datasets import Dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainingArguments,
+from transformers import TrainingArguments
+from trl import SFTTrainer
+from peft import LoraConfig
+
+# LoRA Configuration
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig
 
-class InstructionTuningPipeline:
-    def __init__(self, model_name, output_dir):
-        self.model_name = model_name
-        self.output_dir = output_dir
-        self.setup_model()
+# Training Arguments
+training_args = TrainingArguments(
+    output_dir="./output",
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,  # Effective batch = 4*8*4 = 128
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    bf16=True,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=500,
+    evaluation_strategy="steps",
+    eval_steps=500,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    report_to="wandb",
+    gradient_checkpointing=True,
+    optim="adamw_torch_8bit",
+)
 
-    def setup_model(self):
-        """Initialize model with QLoRA configuration."""
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
+# SFT Trainer
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    peft_config=lora_config,
+    tokenizer=tokenizer,
+    args=training_args,
+    max_seq_length=2048,
+    dataset_text_field="text",
+)
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-        )
-
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "right"
-
-        self.model = prepare_model_for_kbit_training(self.model)
-
-    def prepare_data(self, data_path):
-        """Load and format instruction tuning data."""
-        with open(data_path, 'r', encoding='utf-8') as f:
-            raw_data = json.load(f)
-
-        formatted_data = []
-        for item in raw_data:
-            # Format as ChatML
-            if "conversations" in item:
-                text = self._format_conversations(item["conversations"])
-            else:
-                text = self._format_alpaca(
-                    item.get("instruction", ""),
-                    item.get("input", ""),
-                    item.get("output", "")
-                )
-            formatted_data.append({"text": text})
-
-        return Dataset.from_list(formatted_data)
-
-    def _format_alpaca(self, instruction, input_text, output):
-        """Format Alpaca-style data."""
-        if input_text:
-            return (
-                f"### Instruction:\n{instruction}\n\n"
-                f"### Input:\n{input_text}\n\n"
-                f"### Response:\n{output}"
-            )
-        return (
-            f"### Instruction:\n{instruction}\n\n"
-            f"### Response:\n{output}"
-        )
-
-    def _format_conversations(self, conversations):
-        """Format ShareGPT-style conversations."""
-        text = ""
-        for turn in conversations:
-            if turn["from"] == "human":
-                text += f"<|user|>\n{turn['value']}\n"
-            elif turn["from"] == "gpt":
-                text += f"<|assistant|>\n{turn['value']}\n"
-        return text
-
-    def train(self, dataset, rank=16):
-        """Run LoRA fine-tuning."""
-        lora_config = LoraConfig(
-            r=rank,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj"],
-        )
-
-        model = get_peft_model(self.model, lora_config)
-
-        training_args = SFTConfig(
-            output_dir=self.output_dir,
-            num_train_epochs=3,
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            learning_rate=2e-4,
-            weight_decay=0.01,
-            warmup_ratio=0.03,
-            lr_scheduler_type="cosine",
-            logging_steps=10,
-            save_strategy="epoch",
-            bf16=True,
-            optim="paged_adamw_32bit",
-            gradient_checkpointing=True,
-            max_seq_length=2048,
-            packing=True,
-            report_to="tensorboard",
-        )
-
-        trainer = SFTTrainer(
-            model=model,
-            train_dataset=dataset,
-            tokenizer=self.tokenizer,
-            args=training_args,
-        )
-
-        trainer.train()
-        model.save_pretrained(f"{self.output_dir}/adapter")
-
-        return trainer
-
-    def evaluate(self, test_data, max_samples=100):
-        """Evaluate fine-tuned model on test data."""
-        self.model.eval()
-        results = []
-
-        for i, item in enumerate(test_data[:max_samples]):
-            prompt = self._format_alpaca(
-                item["instruction"],
-                item.get("input", ""),
-                ""  # No output - we're generating
-            )
-
-            inputs = self.tokenizer(prompt, return_tensors="pt").to("cuda")
-
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    temperature=0.7,
-                    top_p=0.9,
-                    do_sample=True,
-                )
-
-            generated = self.tokenizer.decode(
-                outputs[0][inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True
-            )
-
-            results.append({
-                "instruction": item["instruction"],
-                "expected": item.get("output", ""),
-                "generated": generated,
-            })
-
-        return results
+trainer.train()
 ```
 
-### 13.3.3 Data Quality and Curation
+### 13.3.3 Hyperparameter Guide
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Data Quality Pipeline                               │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Raw Data Sources                                     │    │
-│  │  ├── Alpaca (52K)                                     │    │
-│  │  ├── ShareGPT conversations                           │    │
-│  │  ├── Dolly (15K)                                      │    │
-│  │  ├── OpenAssistant                                    │    │
-│  │  └── Custom domain data                               │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Deduplication                                         │    │
-│  │  ├── Exact match dedup                                │    │
-│  │  ├── Fuzzy match (MinHash/LSH)                        │    │
-│  │  └── Semantic dedup (embedding similarity)            │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Quality Filtering                                     │    │
-│  │  ├── Remove toxic content (classifier)                │    │
-│  │  ├── Remove too-short responses (<50 tokens)          │    │
-│  │  ├── Remove too-long responses (>2048 tokens)         │    │
-│  │  ├── Filter by language quality score                 │    │
-│  │  └── Remove duplicates across datasets                │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Balance & Augment                                     │    │
-│  │  ├── Balance task categories                          │    │
-│  │  ├── Add Chain-of-Thought data (20%)                  │    │
-│  │  ├── Add multi-turn conversations (15%)               │    │
-│  │  └── Add code/technical data (10%)                    │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Final Dataset                                         │    │
-│  │  ├── ~50K-200K high-quality examples                  │    │
-│  │  ├── Balanced across task types                       │    │
-│  │  ├── Consistent formatting                            │    │
-│  │  └── Verified quality (human spot-check)              │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+| Hyperparameter | Range | Default | Notes |
+|---------------|-------|---------|-------|
+| Learning Rate | 1e-5 to 5e-4 | 2e-4 | Higher for LoRA, lower for full FT |
+| Batch Size | 8-256 | 64 | Larger = more stable, needs more memory |
+| Epochs | 1-5 | 3 | More data = fewer epochs needed |
+| Warmup Ratio | 0.01-0.1 | 0.03 | 3% of total steps |
+| Weight Decay | 0-0.1 | 0.01 | Regularization |
+| LoRA Rank | 4-64 | 16 | Higher = more capacity |
+| LoRA Alpha | 8-128 | 32 | Typically 2× rank |
+| LoRA Dropout | 0-0.1 | 0.05 | Regularization |
 
 ---
 
@@ -699,7 +330,7 @@ class InstructionTuningPipeline:
 
 ### 13.4.1 RLHF Pipeline
 
-Reinforcement Learning from Human Feedback (RLHF) aligns models with human preferences:
+Reinforcement Learning from Human Feedback aligns models with human preferences:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -707,678 +338,478 @@ Reinforcement Learning from Human Feedback (RLHF) aligns models with human prefe
 │                                                                │
 │  Stage 1: Supervised Fine-Tuning (SFT)                        │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  Base Model → SFT on human demonstrations → SFT Model │    │
-│  └───────────────────────┬──────────────────────────────┘    │
+│  │  Base model + instruction data → SFT model            │    │
+│  └──────────────────────────────────────────────────────┘    │
 │                           │                                    │
 │                           ▼                                    │
 │  Stage 2: Reward Model Training                               │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  Prompt → SFT Model → Generate K responses            │    │
-│  │                                                       │    │
-│  │  Human ranks responses: A > B > C > D                │    │
-│  │                                                       │    │
-│  │  Train Reward Model:                                  │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  L_rank = -log(σ(r(y_a) - r(y_b)))          │     │    │
-│  │  │  where y_a is preferred over y_b             │     │    │
-│  │  │  r(·) is the reward model                    │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  └───────────────────────┬──────────────────────────────┘    │
+│  │  Collect human preference data:                        │    │
+│  │  Prompt → Generate 2 responses → Human ranks (A > B)  │    │
+│  │                                                        │    │
+│  │  Train reward model:                                    │    │
+│  │  Loss = -log(sigmoid(r(A) - r(B)))                     │    │
+│  │  Reward model learns to score response quality         │    │
+│  └──────────────────────────────────────────────────────┘    │
 │                           │                                    │
 │                           ▼                                    │
 │  Stage 3: PPO Optimization                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  Maximize: r(y) - β × KL(π_θ || π_ref)     │     │    │
-│  │  │                                               │     │    │
-│  │  │  π_θ: Policy model (being optimized)         │     │    │
-│  │  │  π_ref: Reference model (SFT model, frozen)  │     │    │
-│  │  │  r(y): Reward model score                     │     │    │
-│  │  │  β: KL penalty coefficient                   │     │    │
-│  │  │                                               │     │    │
-│  │  │  PPO Algorithm:                               │     │    │
-│  │  │  1. Sample prompt from dataset                │     │    │
-│  │  │  2. Generate response from policy π_θ        │     │    │
-│  │  │  3. Score response with reward model r(y)    │     │    │
-│  │  │  4. Compute KL penalty                       │     │    │
-│  │  │  5. Update policy using PPO                  │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Aligned Model (RLHF-tuned)                           │    │
+│  │  for each prompt:                                      │    │
+│  │      response = SFT_model(prompt)                      │    │
+│  │      reward = Reward_model(prompt, response)           │    │
+│  │      KL_penalty = KL(SFT_model || current_model)      │    │
+│  │      loss = -(reward - β × KL_penalty)                 │    │
+│  │      update current_model via PPO                      │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### 13.4.2 DPO: Direct Preference Optimization
 
-DPO (Rafailov et al., 2023) eliminates the need for a separate reward model:
-
-📌 **Key Concept**: DPO directly optimizes the policy using preference pairs, avoiding the complexity of RL training with PPO.
+DPO (Rafailov et al., 2023) eliminates the reward model by directly optimizing on preference data:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │              RLHF vs DPO Comparison                             │
 │                                                                │
-│  RLHF (3 stages):                                              │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  SFT → Reward Model → PPO                            │    │
-│  │                                                       │    │
-│  │  Pros: More flexible, can use reward shaping          │    │
-│  │  Cons: Complex, unstable, requires 4 models in memory │    │
-│  │        (policy, reference, reward, value)              │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  RLHF (3 stages):                                             │
+│  SFT → Reward Model → PPO                                     │
+│  - Complex pipeline                                           │
+│  - Requires reward model training                             │
+│  - PPO is unstable and sensitive to hyperparameters           │
+│  - Needs significant compute for PPO                          │
 │                                                                │
-│  DPO (2 stages):                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  SFT → DPO                                           │    │
-│  │                                                       │    │
-│  │  DPO Loss:                                            │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  L_DPO = -log σ(β × (log π_θ(y_w|x)/       │     │    │
-│  │  │                    π_ref(y_w|x) -             │     │    │
-│  │  │                    log π_θ(y_l|x)/            │     │    │
-│  │  │                    π_ref(y_l|x)))             │     │    │
-│  │  │                                               │     │    │
-│  │  │  y_w: preferred (winning) response            │     │    │
-│  │  │  y_l: rejected (losing) response              │     │    │
-│  │  │  π_θ: policy being trained                    │     │    │
-│  │  │  π_ref: reference policy (SFT model)         │     │    │
-│  │  │  β: temperature parameter                    │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  Pros: Simpler, more stable, only 2 models needed    │    │
-│  │  Cons: Less flexible, requires preference pairs       │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  DPO (2 stages):                                              │
+│  SFT → DPO                                                    │
+│  - Simple pipeline                                            │
+│  - No reward model needed                                     │
+│  - Stable training (just cross-entropy loss)                  │
+│  - Lower compute requirements                                 │
 │                                                                │
-│  Memory Requirements:                                           │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  RLHF: 4 models × model_size                        │    │
-│  │  - Policy model (trainable)                          │    │
-│  │  - Reference model (frozen)                          │    │
-│  │  - Reward model (frozen)                             │    │
-│  │  - Value model (for PPO)                             │    │
-│  │                                                       │    │
-│  │  DPO: 2 models × model_size                          │    │
-│  │  - Policy model (trainable)                          │    │
-│  │  - Reference model (frozen)                          │    │
-│  │                                                       │    │
-│  │  For 7B model:                                        │    │
-│  │  RLHF: ~56 GB (with LoRA)                            │    │
-│  │  DPO: ~28 GB (with LoRA)                             │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  DPO Loss:                                                    │
+│  L = -log σ(β × (log π(y_w|x)/π_ref(y_w|x)                  │
+│               - log π(y_l|x)/π_ref(y_l|x)))                   │
+│                                                                │
+│  Where:                                                       │
+│  y_w = preferred response (winner)                            │
+│  y_l = rejected response (loser)                              │
+│  π_ref = reference model (SFT model)                          │
+│  β = temperature parameter (typically 0.1-0.5)                │
 └──────────────────────────────────────────────────────────────┘
 ```
 
+📌 **Real Data**: DPO reduces alignment training compute by 4-10x compared to RLHF while achieving comparable or better results on human preference benchmarks. Meta used DPO for aligning Llama 3 models (Meta AI, 2024).
+
+### 13.4.3 DPO Training Example
+
 ```python
-# DPO Training implementation
 from trl import DPOTrainer, DPOConfig
 from datasets import Dataset
 
-def train_dpo(model_name, preference_data, output_dir):
-    """
-    Train using DPO with preference pairs (chosen/rejected).
-    """
-    # Load base model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+# Prepare preference dataset
+# Each example has: prompt, chosen (preferred), rejected
+preference_data = {
+    "prompt": ["What is 2+2?", "Explain gravity."],
+    "chosen": ["4", "Gravity is the force that attracts objects..."],
+    "rejected": ["5", "I don't know.",]
+}
+dataset = Dataset.from_dict(preference_data)
 
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+# DPO Config
+dpo_config = DPOConfig(
+    output_dir="./dpo_output",
+    per_device_train_batch_size=4,
+    learning_rate=5e-7,
+    beta=0.1,  # KL penalty coefficient
+    loss_type="sigmoid",  # Standard DPO loss
+    num_train_epochs=1,
+    gradient_accumulation_steps=4,
+    bf16=True,
+    logging_steps=10,
+    save_steps=100,
+)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+# DPO Trainer
+trainer = DPOTrainer(
+    model=model,
+    ref_model=ref_model,  # SFT model as reference
+    train_dataset=dataset,
+    tokenizer=tokenizer,
+    args=dpo_config,
+)
 
-    # Prepare preference data
-    # Each item has: prompt, chosen (preferred), rejected
-    dataset = Dataset.from_dict({
-        "prompt": [item["prompt"] for item in preference_data],
-        "chosen": [item["chosen"] for item in preference_data],
-        "rejected": [item["rejected"] for item in preference_data],
-    })
-
-    # DPO configuration
-    dpo_config = DPOConfig(
-        output_dir=output_dir,
-        num_train_epochs=1,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
-        learning_rate=5e-7,  # Lower LR for DPO
-        beta=0.1,            # KL penalty coefficient
-        loss_type="sigmoid", # DPO loss variant
-        bf16=True,
-        logging_steps=10,
-        save_strategy="steps",
-        save_steps=100,
-        max_length=1024,
-        max_prompt_length=512,
-        gradient_checkpointing=True,
-        optim="adamw_torch",
-        report_to="tensorboard",
-    )
-
-    # DPO Trainer
-    trainer = DPOTrainer(
-        model=model,
-        ref_model=ref_model,
-        args=dpo_config,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-    )
-
-    trainer.train()
-    trainer.save_model(output_dir)
-
-    return trainer
-
-# Example preference data format
-preference_data = [
-    {
-        "prompt": "Explain quantum computing to a 5-year-old.",
-        "chosen": "Quantum computing is like a magic box that can try "
-                  "many answers at the same time, instead of one by one. "
-                  "It helps scientists solve really hard puzzles!",
-        "rejected": "Quantum computing leverages superposition and "
-                    "entanglement of qubits to perform parallel computations "
-                    "across exponentially large state spaces.",
-    },
-    {
-        "prompt": "Write a function to sort a list in Python.",
-        "chosen": "```python\ndef sort_list(lst):\n    return sorted(lst)\n```\n\n"
-                  "This uses Python's built-in sorted() function which implements "
-                  "Timsort, an efficient O(n log n) algorithm.",
-        "rejected": "```python\ndef sort_list(lst):\n    for i in range(len(lst)):\n"
-                    "        for j in range(i+1, len(lst)):\n"
-                    "            if lst[i] > lst[j]:\n"
-                    "                lst[i], lst[j] = lst[j], lst[i]\n"
-                    "    return lst\n```\nThis is O(n²) bubble sort.",
-    },
-]
+trainer.train()
 ```
 
-### 13.4.3 Other Alignment Methods
+### 13.4.4 RLHF vs DPO vs KTO
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Alignment Methods Comparison                       │
-│                                                                │
-│  Method      │ Data Needed      │ Complexity │ Quality        │
-│  ────────────│──────────────────│────────────│────────────────│
-│  RLHF (PPO)  │ Preferences + RM │ High       │ Best (if tuned)│
-│  DPO         │ Pairs (chosen/rej)│ Low       │ Good           │
-│  IPO         │ Pairs            │ Low        │ Good           │
-│  KTO         │ Binary (good/bad)│ Low        │ Good           │
-│  ORPO        │ Pairs            │ Low        │ Good           │
-│  SPIN        │ Self-play data   │ Medium     │ Good           │
-│  RLAIF       │ AI preferences   │ Medium     │ Good           │
-│  Constitutional│ AI feedback    │ Low        │ Good           │
-│                                                                │
-│  Emerging Trend (2024-2026):                                    │
-│  - DPO and its variants are becoming the default              │
-│  - RLHF used primarily for frontier models                    │
-│  - RLAIF reducing need for human annotation                   │
-│  - Multi-objective alignment becoming important               │
-└──────────────────────────────────────────────────────────────┘
-```
+| Method | Data Required | Compute | Stability | Quality | Best For |
+|--------|--------------|---------|-----------|---------|----------|
+| **RLHF** | Preference pairs | Very High | Low | Highest | Maximum alignment quality |
+| **DPO** | Preference pairs | Low | High | Very Good | Most use cases |
+| **KTO** | Binary feedback (good/bad) | Low | High | Good | When preference pairs unavailable |
+| **IPO** | Preference pairs | Low | High | Good | Avoiding over-optimization |
+| **ORPO** | Preference pairs | Low | High | Good | Single-stage alignment |
 
 ---
 
 ## 13.5 Fine-tuning Data Management
 
-### 13.5.1 Data Collection and Annotation
+### 13.5.1 Data Quality is Everything
+
+📌 **Real Data**: Research consistently shows that data quality matters more than quantity. A study by Microsoft found that 10K high-quality examples outperform 100K low-quality examples for instruction tuning (Li et al., 2023).
+
+### 13.5.2 Data Preparation Checklist
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Data Management Pipeline                           │
+│              Data Quality Checklist                             │
 │                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Data Sources                                          │    │
-│  │  ├── Human annotation (highest quality, highest cost) │    │
-│  │  ├── Synthetic generation (GPT-4/Claude)              │    │
-│  │  ├── Existing datasets (Alpaca, Dolly, etc.)          │    │
-│  │  ├── Domain-specific collections                      │    │
-│  │  └── User interaction logs                            │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Annotation Tools                                      │    │
-│  │  ├── Label Studio (open-source)                       │    │
-│  │  ├── Argilla (LLM-focused)                            │    │
-│  │  ├── Scale AI / Surge AI (managed)                    │    │
-│  │  └── Custom web interfaces                            │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │                                    │
-│                           ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Quality Assurance                                     │    │
-│  │  ├── Inter-annotator agreement (IAA > 0.8)            │    │
-│  │  ├── Automated quality checks                         │    │
-│  │  ├── Human spot-checks (10% sample)                   │    │
-│  │  └── A/B testing on model performance                 │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  ☐ Deduplication                                               │
+│    - Exact duplicates                                          │
+│    - Near-duplicates (similarity > 0.95)                       │
+│    - Template duplicates (same structure, different entities)  │
+│                                                                │
+│  ☐ Filtering                                                   │
+│    - Too short (< 10 tokens)                                   │
+│    - Too long (> max_seq_length)                               │
+│    - Toxic/harmful content                                     │
+│    - PII (names, emails, phone numbers)                        │
+│    - Low quality (gibberish, random characters)                │
+│                                                                │
+│  ☐ Formatting                                                  │
+│    - Consistent instruction/input/output structure              │
+│    - Proper escaping and encoding                              │
+│    - Correct tokenization                                      │
+│                                                                │
+│  ☐ Balance                                                     │
+│    - Diverse instruction types                                 │
+│    - Balanced difficulty levels                                │
+│    - Representative of target use cases                        │
+│                                                                │
+│  ☐ Validation                                                  │
+│    - Human review of random samples                            │
+│    - Check for label errors                                    │
+│    - Verify answer quality                                    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 13.5.2 Synthetic Data Generation
+### 13.5.3 Data Augmentation Techniques
 
-```python
-# synthetic_data_generator.py
-"""
-Generate high-quality instruction tuning data using a teacher model.
-"""
-import json
-from openai import OpenAI
-
-class SyntheticDataGenerator:
-    def __init__(self, api_key, model="gpt-4"):
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-
-    def generate_instructions(self, topic, num_samples=100):
-        """Generate diverse instructions for a topic."""
-        prompt = f"""Generate {num_samples} diverse, high-quality instructions
-for a language model about the topic: {topic}.
-
-Include these categories:
-- Factual questions (30%)
-- Creative tasks (20%)
-- Analysis/reasoning (20%)
-- How-to/instructions (15%)
-- Code-related (15%)
-
-Format as JSON array with fields: instruction, difficulty (easy/medium/hard),
-category. Make instructions diverse in length and complexity."""
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-
-        return json.loads(response.choices[0].message.content)
-
-    def generate_responses(self, instructions, model_name="Llama-2-7b-chat"):
-        """Generate responses for instructions."""
-        responses = []
-
-        for inst in instructions:
-            prompt = f"""### Instruction:
-{inst['instruction']}
-
-### Response:"""
-
-            # Use local model or API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
-                temperature=0.7,
-            )
-
-            responses.append({
-                "instruction": inst["instruction"],
-                "input": "",
-                "output": response.choices[0].message.content,
-                "difficulty": inst.get("difficulty", "medium"),
-                "category": inst.get("category", "general"),
-            })
-
-        return responses
-
-    def generate_preference_pairs(self, instructions, num_pairs=1000):
-        """Generate chosen/rejected pairs for DPO training."""
-        pairs = []
-
-        for inst in instructions[:num_pairs]:
-            # Generate two responses
-            prompt = f"""### Instruction:
-{inst['instruction']}
-
-### Response:"""
-
-            response_a = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
-                temperature=0.8,
-            )
-
-            response_b = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
-                temperature=0.8,
-            )
-
-            # Judge which is better
-            judge_prompt = f"""Compare these two responses to the instruction:
-"{inst['instruction']}"
-
-Response A: {response_a.choices[0].message.content}
-Response B: {response_b.choices[0].message.content}
-
-Which is better? Reply with just "A" or "B"."""
-
-            judge = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": judge_prompt}],
-                max_tokens=1,
-            )
-
-            winner = judge.choices[0].message.content.strip()
-
-            if winner == "A":
-                chosen = response_a.choices[0].message.content
-                rejected = response_b.choices[0].message.content
-            else:
-                chosen = response_b.choices[0].message.content
-                rejected = response_a.choices[0].message.content
-
-            pairs.append({
-                "prompt": inst["instruction"],
-                "chosen": chosen,
-                "rejected": rejected,
-            })
-
-        return pairs
-
-# Usage
-generator = SyntheticDataGenerator(api_key="your-api-key")
-
-# Generate instruction data
-instructions = generator.generate_instructions("machine learning", num_samples=500)
-responses = generator.generate_responses(instructions)
-
-# Save as JSON
-with open("instruction_data.json", "w") as f:
-    json.dump(responses, f, indent=2)
-
-# Generate preference pairs for DPO
-pairs = generator.generate_preference_pairs(instructions, num_pairs=1000)
-with open("preference_data.json", "w") as f:
-    json.dump(pairs, f, indent=2)
-```
-
-### 13.5.3 Data Versioning and Management
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Data Versioning Best Practices                     │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Version Control (DVC / Git LFS)                      │    │
-│  │  ├── Track data changes alongside code                │    │
-│  │  ├── Tag datasets with version numbers                │    │
-│  │  ├── Store metadata (size, source, quality metrics)   │    │
-│  │  └── Enable reproducible experiments                  │    │
-│  │                                                       │    │
-│  │  Directory Structure:                                  │    │
-│  │  data/                                                │    │
-│  │  ├── v1.0/                                           │    │
-│  │  │   ├── train.jsonl                                  │    │
-│  │  │   ├── val.jsonl                                    │    │
-│  │  │   ├── test.jsonl                                   │    │
-│  │  │   └── metadata.json                                │    │
-│  │  ├── v1.1/                                           │    │
-│  │  │   ├── train.jsonl (added 10K samples)              │    │
-│  │  │   └── metadata.json                                │    │
-│  │  └── current -> v1.1/ (symlink)                      │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  metadata.json                                         │    │
-│  │  {                                                    │    │
-│  │    "version": "1.1",                                  │    │
-│  │    "created": "2026-01-15",                           │    │
-│  │    "source": "alpaca + custom_generation",            │    │
-│  │    "num_samples": 62000,                              │    │
-│  │    "categories": {                                    │    │
-│  │      "factual": 0.30,                                 │    │
-│  │      "creative": 0.20,                                │    │
-│  │      "reasoning": 0.20,                               │    │
-│  │      "howto": 0.15,                                   │    │
-│  │      "code": 0.15                                     │    │
-│  │    },                                                 │    │
-│  │    "quality_metrics": {                               │    │
-│  │      "avg_response_length": 342,                      │    │
-│  │      "avg_quality_score": 4.2,                        │    │
-│  │      "dedup_ratio": 0.95                              │    │
-│  │    },                                                 │    │
-│  │    "changelog": [                                     │    │
-│  │      "v1.0: Initial 52K Alpaca subset",              │    │
-│  │      "v1.1: Added 10K custom ML examples"            │    │
-│  │    ]                                                  │    │
-│  │  }                                                    │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+| Technique | Description | When to Use |
+|-----------|-------------|-------------|
+| **Self-Instruct** | Use LLM to generate new instruction data | Expanding small datasets |
+| **Paraphrasing** | Rephrase existing instructions | Increasing diversity |
+| **Back-translation** | Translate to another language and back | Multi-lingual robustness |
+| **Chain-of-thought** | Add reasoning steps to answers | Improving reasoning quality |
+| **Rejection sampling** | Generate multiple answers, keep the best | Improving answer quality |
 
 ---
 
-## 💡 Case: Efficient Fine-tuning with Unsloth
+## 13.6 Evaluation & Monitoring
 
-### Business Context
+### 13.6.1 Evaluation Metrics
 
-A startup wants to fine-tune a 7B parameter model for customer support in Chinese. They have:
-- 1 GPU (RTX 4090, 24GB VRAM)
-- 5,000 labeled customer support conversations
-- Budget: $500 for compute
+| Metric | Type | What It Measures |
+|--------|------|-----------------|
+| **Perplexity** | Automatic | Language modeling quality (lower = better) |
+| **MMLU** | Benchmark | Knowledge across 57 subjects |
+| **HumanEval** | Benchmark | Code generation capability |
+| **MT-Bench** | Benchmark | Multi-turn conversation quality |
+| **AlpacaEval** | Benchmark | Instruction following quality |
+| **Win Rate** | Human eval | Head-to-head comparison with reference |
+| **Toxicity** | Safety | Harmful content generation rate |
 
-### Why Unsloth?
-
-Unsloth provides 2-5x faster fine-tuning with 60% less memory through custom CUDA kernels:
+### 13.6.2 Monitoring During Training
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Unsloth Performance Comparison                     │
+│              Training Monitoring Dashboard                      │
 │                                                                │
-│  Framework      │ Time (7B, 3 epochs) │ Memory  │ Quality    │
-│  ───────────────│─────────────────────│─────────│────────────│
-│  HuggingFace    │ 8.5 hours           │ 18 GB   │ Baseline   │
-│  DeepSpeed ZeRO │ 5.2 hours           │ 12 GB   │ Baseline   │
-│  Unsloth        │ 2.1 hours           │ 7 GB    │ Baseline   │
-│  Unsloth + 4bit │ 1.8 hours           │ 4 GB    │ -0.1%      │
-│                                                                │
-│  Key Optimizations:                                             │
+│  Loss Curves:                                                  │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  1. Custom Triton kernels for attention               │    │
-│  │  2. Memory-efficient backpropagation                  │    │
-│  │  3. Smart gradient checkpointing                      │    │
-│  │  4. 2x faster RoPE computation                        │    │
-│  │  5. 60% less memory through kernel fusion             │    │
+│  │  Training Loss: Should decrease steadily              │    │
+│  │  Validation Loss: Should decrease, then plateau       │    │
+│  │  ⚠️ If val loss increases: overfitting!               │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                                │
+│  Gradient Metrics:                                             │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  Gradient norm: Should be stable (not exploding)      │    │
+│  │  Learning rate: Follow warmup + cosine schedule       │    │
+│  │  GPU memory: Should be stable (no OOM)                │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                                │
+│  Quality Metrics (every N steps):                              │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  Generate samples from validation prompts             │    │
+│  │  Check for: hallucination, format compliance, quality │    │
+│  │  Compare with base model outputs                      │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### Implementation
+### 13.6.3 Common Fine-tuning Failures
 
-```python
-# unsloth_finetuning.py
-"""
-Complete Unsloth fine-tuning pipeline for Chinese customer support.
-"""
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from trl import SFTTrainer
-from transformers import TrainingArguments
-from datasets import load_dataset
-import torch
+| Failure | Symptom | Cause | Fix |
+|---------|---------|-------|-----|
+| **Catastrophic Forgetting** | Model loses general knowledge | Too many epochs, too high LR | Lower LR, fewer epochs, use LoRA |
+| **Overfitting** | Train loss ↓, val loss ↑ | Too much training, too little data | Early stopping, regularization, more data |
+| **Reward Hacking** | High reward, bad outputs | Reward model exploited | Better reward model, KL penalty |
+| **Mode Collapse** | All outputs similar | Policy too deterministic | Increase temperature, diverse data |
+| **Format Degradation** | Model ignores instruction format | Data format inconsistency | Standardize data format |
 
-def train_customer_support_model():
-    # Load model with Unsloth optimization
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="unsloth/Qwen2.5-7B",
-        max_seq_length=2048,
-        dtype=None,  # Auto-detect
-        load_in_4bit=True,
-    )
+---
 
-    # Add LoRA adapters
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=16,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=16,
-        lora_dropout=0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",  # Unsloth optimized
-        random_state=3407,
-    )
+## 💡 Case Study: How Healthcare Companies Fine-tune for Clinical NLP
 
-    # Load dataset
-    dataset = load_dataset("json", data_files="customer_support_data.json")
+### Background
 
-    # Format prompt
-    def format_prompt(example):
-        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-你是一个专业的客服助手，帮助用户解决产品相关问题。请用中文回答。
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-{example['user_message']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-{example['assistant_response']}<|eot_id|>"""
+A healthcare AI company needed to build a clinical NLP system that could extract structured information from medical records. The task: identify diagnoses, medications, procedures, and lab results from unstructured clinical notes.
 
-    dataset = dataset.map(lambda x: {"text": format_prompt(x)})
+### Architecture Decisions
 
-    # Training configuration
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        dataset_text_field="text",
-        max_seq_length=2048,
-        dataset_num_proc=2,
-        packing=True,
-        args=TrainingArguments(
-            output_dir="./customer-support-output",
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            warmup_steps=50,
-            max_steps=500,  # ~3 epochs
-            learning_rate=2e-4,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
-            logging_steps=10,
-            optim="adamw_8bit",
-            weight_decay=0.01,
-            lr_scheduler_type="linear",
-            seed=3407,
-            report_to="tensorboard",
-        ),
-    )
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| **Base Model** | Llama 3 8B | Good medical knowledge, open-weight |
+| **Fine-tuning Method** | QLoRA (4-bit, rank=16) | Limited GPU budget, need to iterate fast |
+| **Data Size** | 50K annotated clinical notes | High quality, expert-annotated |
+| **Target Modules** | All attention + FFN layers | Maximum task adaptation |
+| **Alignment** | DPO with clinician preferences | Ensure medical accuracy |
 
-    # Train
-    trainer_stats = trainer.train()
+### Data Pipeline
 
-    # Save model
-    model.save_pretrained("./customer-support-lora")
-    tokenizer.save_pretrained("./customer-support-lora")
-
-    # Optional: Merge and export to GGUF for llama.cpp
-    model.save_pretrained_gguf(
-        "./customer-support-gguf",
-        tokenizer,
-        quantization_method="q4_k_m",
-    )
-
-    return trainer_stats
-
-if __name__ == "__main__":
-    stats = train_customer_support_model()
-    print(f"Training completed in {stats.metrics['train_runtime']:.1f} seconds")
-    print(f"Final loss: {stats.metrics['train_loss']:.4f}")
+```
+┌──────────────────────────────────────────────────────────────┐
+│              Clinical NLP Data Pipeline                         │
+│                                                                │
+│  Raw Clinical Notes (100K+)                                    │
+│       │                                                        │
+│       ▼                                                        │
+│  De-identification (HIPAA compliance)                          │
+│  - Remove names, dates, locations                              │
+│  - Replace with synthetic placeholders                         │
+│       │                                                        │
+│       ▼                                                        │
+│  Expert Annotation (50K notes)                                 │
+│  - 3 board-certified physicians                                │
+│  - Inter-annotator agreement: κ = 0.89                         │
+│       │                                                        │
+│       ▼                                                        │
+│  Format as instruction-following                               │
+│  {"instruction": "Extract diagnoses from this clinical note",  │
+│   "input": "Patient presents with chest pain...",              │
+│   "output": [{"diagnosis": "Acute MI", "confidence": 0.95}]}  │
+│       │                                                        │
+│       ▼                                                        │
+│  Quality Control                                               │
+│  - Auto-check: valid JSON, no empty fields                     │
+│  - Manual review: 10% random sample                            │
+│  - Adversarial testing: edge cases, abbreviations              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Results
 
+| Metric | Base Llama 3 8B | Fine-tuned Model | Improvement |
+|--------|-----------------|------------------|-------------|
+| F1 (Diagnosis extraction) | 0.42 | 0.91 | +117% |
+| F1 (Medication extraction) | 0.38 | 0.89 | +134% |
+| F1 (Procedure extraction) | 0.35 | 0.87 | +149% |
+| Hallucination rate | 23% | 2% | -91% |
+| HIPAA compliance | 100% | 100% | Maintained |
+
+### Key Takeaways
+
+1. **Domain-specific data quality is paramount**: Medical annotations must be expert-level
+2. **QLoRA enables rapid iteration**: 3x faster training, 70% less memory than full FT
+3. **DPO alignment ensures safety**: Clinician preferences prevent dangerous outputs
+4. **Evaluation must be domain-appropriate**: Standard NLP metrics don't capture medical accuracy
+
+---
+
+## ⚠️ War Story: The Fine-tuned Model That Got Worse Than Base
+
+### The Setup
+
+A fintech company fine-tuned Llama 3 70B on 100K customer support conversations to build a financial advisor chatbot. They used LoRA (rank=32) for 3 epochs on 8× A100 GPUs.
+
+### The Problem
+
+After fine-tuning, automated evaluation showed improved scores:
+- Instruction following: 78% → 89%
+- Response relevance: 72% → 85%
+- Financial accuracy: 65% → 71%
+
+But when they deployed to production, customer complaints increased:
+- "The bot gives generic financial advice, not personalized"
+- "It used to answer product-specific questions, now it can't"
+- "It recommends products we don't even offer"
+
+### Root Cause Analysis
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Training Results (Unsloth on RTX 4090)            │
+│                    Failure Analysis                            │
 │                                                                │
-│  Metric                │ Value                                │
-│  ──────────────────────│──────────────────────────────────────│
-│  Training time         │ 1 hour 23 minutes                    │
-│  Peak GPU memory       │ 6.8 GB                               │
-│  Final training loss   │ 0.892                                │
-│  Validation loss       │ 0.914                                │
-│  Model size (LoRA)     │ 84 MB                                │
-│  Model size (merged)   │ 14 GB                                │
-│  Model size (GGUF Q4)  │ 4.2 GB                               │
-│  Cost (on-demand)      │ $0.74 (RTX 4090 @ $0.53/hr)         │
+│  1. DATA ISSUE:                                               │
+│  - Training data was from a DIFFERENT product line             │
+│  - Customer conversations were about Product A                 │
+│  - Production users asked about Product B (newer)              │
+│  - Model learned Product A's features, forgot Product B        │
 │                                                                │
-│  Quality Metrics:                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Customer intent recognition: 94.2%                   │    │
-│  │  Response helpfulness (human eval): 4.1/5.0           │    │
-│  │  Response safety: 99.8%                               │    │
-│  │  Chinese language quality: 4.3/5.0                    │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  2. CATASTROPHIC FORGETTING:                                   │
+│  - Base model knew about both products (from pre-training)     │
+│  - Fine-tuning on Product A data OVERWR knowledge about B      │
+│  - No regularization to preserve general knowledge             │
 │                                                                │
-│  Comparison with baseline (no fine-tuning):                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Intent recognition: 67% → 94% (+27%)                │    │
-│  │  Helpfulness: 2.8/5.0 → 4.1/5.0 (+1.3)              │    │
-│  │  Response time: 2.1s → 0.3s (7x faster, smaller model)│    │
-│  └──────────────────────────────────────────────────────┘    │
+│  3. EVALUATION GAP:                                            │
+│  - Automated eval used same distribution as training data       │
+│  - Production data had different distribution                  │
+│  - Eval showed improvement, production showed degradation      │
+│                                                                │
+│  4. DATA LEAKAGE:                                              │
+│  - Training data contained incorrect financial advice          │
+│  - Model learned to give WRONG advice confidently              │
+│  - Higher "confidence" scores masked lower accuracy            │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### The Fix
+
+1. **Include ALL product data**: Retrained with conversations from both Product A and B
+2. **Add general knowledge regularization**: Continued pre-training on financial knowledge base
+3. **Evaluation on held-out product**: Used Product B data for evaluation (not just Product A)
+4. **Human review pipeline**: All AI responses go through compliance review before deployment
+5. **LoRA rank reduction**: Reduced from 32 to 8 to limit adaptation capacity
+
+### Impact
+
+- **2 weeks of wasted compute**: ~$50K in GPU costs
+- **3 week delay** in product launch
+- **Customer trust damage**: 15% of beta users switched to competitors
+
+### Key Takeaways
+
+1. **Evaluate on the target distribution**, not just the training distribution
+2. **Include diverse data**: Cover all products, use cases, and edge cases
+3. **Regularize to prevent forgetting**: Use LoRA with lower rank, add general knowledge data
+4. **Human review is essential**: Automated metrics can be misleading
+5. **Start small**: Fine-tune on a subset, evaluate thoroughly, then scale up
+
+---
+
+## 📝 When to Use / When Not to Use
+
+### Fine-tuning Method Selection
+
+| Scenario | Recommended Method | Why |
+|----------|-------------------|-----|
+| Quick prototype, limited data | LoRA (rank=8) | Fast iteration, low cost |
+| Production quality, moderate data | LoRA (rank=16-32) | Good quality-cost balance |
+| Maximum quality, unlimited budget | Full fine-tuning | Best possible adaptation |
+| Consumer GPU (24GB) | QLoRA (4-bit) | Only option for large models |
+| Alignment with human preferences | DPO | Stable, efficient, good results |
+| Alignment with binary feedback | KTO | When preference pairs unavailable |
+| Multiple tasks | LoRA (swap adapters) | Same base, different adapters |
+| Real-time adaptation | LoRA | Fast adapter swapping |
+
+### When to Fine-tune vs When to Use RAG
+
+| Use Case | Fine-tune? | RAG? | Why |
+|----------|-----------|------|-----|
+| Format/style adaptation | ✅ | ❌ | Learn the pattern, not facts |
+| Domain vocabulary | ✅ | ⚠️ | Fine-tune for terminology, RAG for facts |
+| Knowledge updates | ❌ | ✅ | RAG updates in real-time |
+| Private knowledge | ⚠️ | ✅ | RAG keeps data in your DB |
+| Task-specific behavior | ✅ | ❌ | Fine-tune for the behavior |
+| Multi-domain knowledge | ❌ | ✅ | RAG scales to many domains |
+| Reasoning improvement | ✅ | ❌ | Fine-tune with CoT data |
+| Citation requirements | ❌ | ✅ | RAG provides source documents |
 
 ---
 
 ## Summary
 
-This chapter covered the complete landscape of model fine-tuning:
-
 | Topic | Key Takeaway |
 |-------|-------------|
-| **Full vs PEFT** | PEFT (LoRA/QLoRA) achieves 95%+ quality at 1% of the cost |
-| **LoRA Architecture** | Low-rank decomposition enables fine-tuning on consumer GPUs |
-| **QLoRA** | 4-bit base + LoRA = fine-tune 70B models on single GPU |
-| **Instruction Tuning** | Data quality > quantity; 50K well-curated examples suffice |
-| **RLHF/DPO** | DPO is simpler and more stable than PPO-based RLHF |
-| **Data Management** | Version control, dedup, and quality filtering are critical |
-| **Unsloth** | 2-5x speedup with custom CUDA kernels, ideal for startups |
+| **PEFT vs Full FT** | PEFT (LoRA/QLoRA) achieves 90-95% of full FT quality at 1-10% of the cost |
+| **LoRA** | Low-rank adaptation; rank=16 is a good default; mergeable at inference |
+| **QLoRA** | 4-bit quantized base + LoRA adapters; enables fine-tuning 70B on single GPU |
+| **Instruction Tuning** | Data quality > data quantity; 10K high-quality examples > 100K low-quality |
+| **RLHF** | 3-stage pipeline: SFT → Reward Model → PPO; expensive but effective |
+| **DPO** | 2-stage pipeline: SFT → DPO; 4-10x cheaper than RLHF, comparable quality |
+| **Data Management** | Dedup, filter, format, balance, validate; human review essential |
+| **Evaluation** | Use multiple metrics; evaluate on target distribution, not training distribution |
+| **Common Failures** | Catastrophic forgetting, overfitting, reward hacking, mode collapse |
 
-### Fine-tuning Decision Tree
+---
 
-```
-Do you have >100K examples?
-├── Yes → Do you have 4+ A100 GPUs?
-│   ├── Yes → Full Fine-tuning
-│   └── No → LoRA (rank=64)
-└── No → Do you have <10K examples?
-    ├── Yes → LoRA (rank=8-16) + data augmentation
-    └── No → LoRA (rank=16-32)
-         │
-         └── Do you have preference data?
-             ├── Yes → DPO alignment
-             └── No → Instruction tuning only
-```
+## Discussion Questions
+
+1. **Resource Allocation**: You have a budget of $10,000 for fine-tuning. You can either:
+   - Option A: Full fine-tune a 7B model on 50K examples
+   - Option B: LoRA fine-tune a 70B model on 10K examples
+   
+   Which would you choose and why? What factors influence your decision?
+
+2. **Alignment Strategy**: A company wants to align a customer service chatbot with their brand voice. They have 5,000 pairs of preferred/rejected responses from customer service agents. Should they use RLHF, DPO, or KTO? What are the trade-offs?
+
+3. **Data Strategy**: You're building a medical QA system. You have 1,000 expert-annotated examples but need more data. What augmentation strategies would you use? How would you validate the quality of augmented data?
+
+4. **Evaluation Design**: Your fine-tuned model scores 95% on MMLU but users complain it's "less helpful" than the base model. How would you investigate and address this discrepancy?
+
+5. **Architecture Decision**: You need to serve a model that handles both general questions (knowledge from pre-training) and company-specific questions (needs fine-tuning). Should you fine-tune the entire model or use RAG? What about a hybrid approach?
+
+---
+
+## Exercises
+
+### Exercise 1: LoRA Fine-tuning
+
+Using PEFT + TRL:
+1. Fine-tune Llama 3 8B on a custom dataset (Alpaca format) using LoRA
+2. Experiment with different ranks (4, 8, 16, 32) and compare:
+   - Training time
+   - GPU memory usage
+   - Validation loss
+   - Sample quality (human evaluation)
+3. Create a report recommending the optimal rank for your use case
+
+### Exercise 2: DPO Alignment
+
+Using TRL:
+1. Create a preference dataset (100 pairs of chosen/rejected responses)
+2. Fine-tune a model using DPO with different β values (0.05, 0.1, 0.2, 0.5)
+3. Evaluate using win rate against the SFT model
+4. Analyze the effect of β on response quality and diversity
+5. Write recommendations for β selection
+
+### Exercise 3: Failure Mode Investigation
+
+Given a pre-trained model and fine-tuned version:
+1. Run evaluation on 5 different benchmarks
+2. Identify areas where the fine-tuned model performs WORSE
+3. Analyze training data for potential causes
+4. Propose and implement fixes (data augmentation, regularization, etc.)
+5. Document findings in a failure analysis report
 
 ---
 
 ## References
 
-1. Hu, E. J., et al. (2022). "LoRA: Low-Rank Adaptation of Large Language Models." ICLR.
-2. Dettmers, T., et al. (2023). "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS.
-3. Ouyang, L., et al. (2022). "Training language models to follow instructions with human feedback." NeurIPS.
-4. Rafailov, R., et al. (2023). "Direct Preference Optimization: Your Language Model is Secretly a Reward Model." NeurIPS.
-5. Tunstall, L., et al. (2023). "Zephyr: Direct Distillation of LM Alignment." arXiv.
-6. Unsloth Documentation. https://github.com/unslothai/unsloth
-7. Hugging Face PEFT Documentation. https://huggingface.co/docs/peft
-8. TRL Documentation. https://huggingface.co/docs/trl
-9. Taori, R., et al. (2023). "Stanford Alpaca: An Instruction-following LLaMA model." GitHub.
-10. Ding, N., et al. (2023). "Enhancing Chat Language Models by Scaling High-quality Instructional Conversations." arXiv.
+1. Hu, E. J., et al. (2022). "LoRA: Low-Rank Adaptation of Large Language Models." https://arxiv.org/abs/2106.09685
+2. Dettmers, T., et al. (2023). "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS. https://arxiv.org/abs/2305.14314
+3. Rafailov, R., et al. (2023). "Direct Preference Optimization: Your Language Model is Secretly a Reward Model." NeurIPS. https://arxiv.org/abs/2305.18290
+4. Touvron, H., et al. (2023). "Llama 2: Open Foundation and Fine-Tuned Chat Models." https://arxiv.org/abs/2307.09288
+5. Meta AI. (2024). "The Llama 3 Herd of Models." https://arxiv.org/abs/2407.21783
+6. Hugging Face PEFT Documentation. https://huggingface.co/docs/peft
+7. Hugging Face TRL Documentation. https://huggingface.co/docs/trl
+8. Unsloth Documentation. https://github.com/unslothai/unsloth
+9. Ouyang, L., et al. (2022). "Training language models to follow instructions with human feedback." NeurIPS. https://arxiv.org/abs/2203.02155
+10. Christiano, P., et al. (2017). "Deep Reinforcement Learning from Human Preferences." NeurIPS. https://arxiv.org/abs/1706.03741
 
 ---
 
-*← [Chapter 12 - RAG System Architecture](chapter-12.md) | End of Part 4: Large Model Architecture →*
+*Next Chapter: [Chapter 14 - Production Deployment](chapter-14.md) →*

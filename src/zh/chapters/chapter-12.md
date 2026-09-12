@@ -4,16 +4,33 @@
 
 ---
 
+## 学习目标
+
+完成本章后，你将能够：
+
+1. 使用 LangChain 和 Chroma 设计端到端 RAG 流水线
+2. 比较向量数据库（Chroma、Pinecone、Weaviate、Qdrant）的性能、成本和功能
+3. 实现高级检索策略（混合搜索、重排序、查询转换）
+4. 使用 RAGAS 框架和真实指标评估 RAG 系统
+5. 识别和缓解常见 RAG 失败模式（幻觉、检索失败、上下文污染）
+6. 构建具有监控和反馈循环的生产级 RAG 系统
+
+---
+
 ## 目录
 
 - [12.1 RAG 原理与架构](#121-rag-原理与架构)
-- [12.2 向量数据库选型](#122-向量数据库选型)
+- [12.2 向量数据库深入解析](#122-向量数据库深入解析)
 - [12.3 检索策略设计](#123-检索策略设计)
 - [12.4 生成策略优化](#124-生成策略优化)
 - [12.5 RAG 评估框架](#125-rag-评估框架)
 - [12.6 高级 RAG 技术](#126-高级-rag-技术)
-- [💡 案例：基于 LangChain + Chroma 的企业知识库](#-案例基于-langchain--chroma-的企业知识库)
+- [💡 案例研究：Notion 如何构建企业知识库](#-案例研究notion-如何构建企业知识库)
+- [⚠️ 战争故事：幻觉出 5 万美元法律和解的 RAG](#️-战争故事幻觉出-5-万美元法律和解的-rag)
+- [📝 何时使用 / 何时不使用](#-何时使用--何时不使用)
 - [本章小结](#本章小结)
+- [讨论题](#讨论题)
+- [练习](#练习)
 - [参考文献](#参考文献)
 
 ---
@@ -22,1564 +39,677 @@
 
 ### 12.1.1 什么是 RAG？
 
-检索增强生成（Retrieval-Augmented Generation, RAG）将大语言模型的推理能力与外部知识检索相结合。RAG 系统不完全依赖参数化知识（模型在预训练期间学到的内容），而是在推理时检索相关文档，并将其作为上下文提供给 LLM。
+检索增强生成（RAG）将大语言模型的推理能力与外部知识检索相结合。RAG 系统不在推理时仅依赖参数知识（模型在预训练期间学到的），而是在推理时检索相关文档并将其作为上下文提供给 LLM。
 
-📌 **核心概念**：RAG = 检索相关文档 → 用上下文增强提示 → 基于检索证据生成答案。
+📌 **真实数据**：LangChain（github.com/langchain-ai/langchain）是最受欢迎的 LLM 应用框架。Chroma（github.com/chroma-core/chroma）是专为 AI 应用设计的开源向量数据库。它们共同构成了最常见的开源 RAG 技术栈。
+
+📌 **核心概念**：RAG = 检索相关文档 → 用上下文增强 prompt → 基于检索证据生成答案。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    RAG 架构概览                                 │
 │                                                                │
-│  用户查询: "我们公司的退货政策是什么？"                          │
+│  用户查询："我们公司的退款政策是什么？"                          │
 │       │                                                        │
 │       ▼                                                        │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  1. 查询处理                                          │    │
-│  │  ├── 查询理解                                         │    │
-│  │  ├── 查询扩展/重写                                    │    │
-│  │  └── 意图分类                                        │    │
+│  │  1. 查询处理                                           │    │
+│  │  ├── 查询理解                                          │    │
+│  │  ├── 查询扩展/重写                                     │    │
+│  │  └── 意图分类                                          │    │
 │  └───────────────────────┬──────────────────────────────┘    │
 │                           │                                    │
 │                           ▼                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  2. 检索                                              │    │
-│  │  ├── 嵌入查询 → 向量                                  │    │
-│  │  ├── 搜索向量数据库                                    │    │
-│  │  ├── 关键词搜索（BM25）                                │    │
-│  │  └── 混合搜索                                        │    │
+│  │  2. 检索                                               │    │
+│  │  ├── 嵌入查询 → 向量                                   │    │
+│  │  ├── 搜索向量数据库                                     │    │
+│  │  ├── 关键词搜索（BM25）                                 │    │
+│  │  └── 混合搜索                                           │    │
 │  └───────────────────────┬──────────────────────────────┘    │
 │                           │                                    │
 │                           ▼                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  3. 重排序与过滤                                       │    │
-│  │  ├── 交叉编码器重排序                                  │    │
-│  │  ├── 去重                                             │    │
-│  │  └── 相关性过滤                                        │    │
+│  │  3. 重排序与过滤                                        │    │
+│  │  ├── 交叉编码器重排序                                   │    │
+│  │  ├── 去重                                              │    │
+│  │  └── 相关性过滤                                         │    │
 │  └───────────────────────┬──────────────────────────────┘    │
 │                           │                                    │
 │                           ▼                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  4. 上下文增强                                         │    │
-│  │  ├── 提示构建                                        │    │
-│  │  ├── 上下文窗口管理                                    │    │
-│  │  └── 引用追踪                                        │    │
+│  │  4. 上下文增强                                          │    │
+│  │  ├── Prompt 构建                                        │    │
+│  │  ├── 上下文窗口管理                                     │    │
+│  │  └── 引用追踪                                           │    │
 │  └───────────────────────┬──────────────────────────────┘    │
 │                           │                                    │
 │                           ▼                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  5. 生成                                              │    │
-│  │  ├── LLM 生成答案                                    │    │
-│  │  ├── 基于检索上下文                                    │    │
-│  │  └── 附带引用/来源                                    │    │
+│  │  5. 生成                                               │    │
+│  │  ├── LLM 生成答案                                      │    │
+│  │  ├── 基于检索上下文                                     │    │
+│  │  └── 带引用/来源                                        │    │
 │  └──────────────────────────────────────────────────────┘    │
 │                                                                │
-│  输出: "根据我们的退货政策（参见政策 #REF-2024），              │
-│  客户可在购买后 30 天内申请全额退款..."                          │
+│  输出："根据我们的退款政策（参见政策 #REF-2024），              │
+│  客户可在购买后 30 天内申请全额退款..."                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 12.1.2 为什么用 RAG 而非微调？
+### 12.1.2 为什么选择 RAG 而非微调？
 
-| 方面 | RAG | 微调 |
+| 因素 | RAG | 微调 |
 |------|-----|------|
-| **知识更新** | 实时（更新文档） | 需要重训练 |
-| **来源引用** | ✅ 内置引用 | ❌ 无来源追踪 |
-| **幻觉** | 减少（基于文档） | 可能幻觉 |
-| **成本** | 较低（无需重训练） | 较高（计算 + 数据） |
-| **数据隐私** | 文档保持外部 | 数据嵌入模型 |
-| **复杂度** | 需要基础设施 | 流水线更简单 |
-| **多任务** | 单模型 + 不同文档 | 每任务需要模型 |
+| **知识更新** | 实时（重新索引文档） | 需要重新训练 |
+| **成本** | 低（无需训练 GPU） | 高（GPU 小时） |
+| **透明度** | 可引用来源 | 黑盒 |
+| **幻觉** | 减少（基于文档） | 仍可能幻觉 |
+| **数据隐私** | 文档留在数据库中 | 数据固化在模型中 |
+| **多领域** | 简单（添加更多文档） | 需要单独模型 |
+| **延迟** | 较高（检索步骤） | 较低（单次前向传播） |
+| **准确率上限** | 取决于检索质量 | 可以很高 |
+
+### 12.1.3 RAG vs 微调决策框架
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              何时使用 RAG vs 微调                               │
+│              RAG vs 微调决策树                                  │
 │                                                                │
-│  使用 RAG 当：                                                  │
-│  ├── 知识频繁变化                                              │
-│  ├── 需要来源引用                                              │
-│  ├── 数据太大无法放入模型                                      │
-│  ├── 需要实时信息                                              │
-│  └── 一个模型覆盖多个领域                                      │
+│  知识是否频繁变化？                                             │
+│  ├── 是 → 使用 RAG（或 RAG + 微调）                            │
+│  └── 否 ↓                                                     │
 │                                                                │
-│  使用微调当：                                                   │
-│  ├── 任务需要特定行为/风格                                     │
-│  ├── 知识稳定且较小                                           │
-│  ├── 需要极低延迟                                              │
-│  └── RAG 上下文 无法捕获所需模式                               │
+│  知识是否私密/机密？                                            │
+│  ├── 是 → 使用 RAG（数据留在数据库，不在模型中）                 │
+│  └── 否 ↓                                                     │
 │                                                                │
-│  最佳实践：两者结合！                                           │
-│  微调行为 + RAG 知识                                           │
+│  是否需要引用/来源追溯？                                        │
+│  ├── 是 → 使用 RAG（检索提供源文档）                            │
+│  └── 否 ↓                                                     │
+│                                                                │
+│  任务是关于格式/风格，而非知识？                                 │
+│  ├── 是 → 使用 微调（学习模式，而非事实）                       │
+│  └── 否 ↓                                                     │
+│                                                                │
+│  计算预算有限？                                                 │
+│  ├── 是 → 使用 RAG（运行成本更低）                             │
+│  └── 否 → 使用 微调 + RAG（两全其美）                          │
 └──────────────────────────────────────────────────────────────┘
-```
-
-### 12.1.3 RAG 系统架构模式
-
-```python
-# 基础 RAG 流水线
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import DirectoryLoader
-from langchain.chains import RetrievalQA
-
-class BasicRAGPipeline:
-    """演示核心概念的基础 RAG 流水线。"""
-
-    def __init__(self, docs_path, embedding_model="text-embedding-3-small"):
-        self.docs_path = docs_path
-        self.embedding_model = embedding_model
-        self.setup_pipeline()
-
-    def setup_pipeline(self):
-        # 1. 加载文档
-        loader = DirectoryLoader(self.docs_path, glob="**/*.md")
-        documents = loader.load()
-        print(f"加载了 {len(documents)} 个文档")
-
-        # 2. 分割为块
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        self.chunks = text_splitter.split_documents(documents)
-        print(f"分割为 {len(self.chunks)} 个块")
-
-        # 3. 创建嵌入和向量存储
-        embeddings = OpenAIEmbeddings(model=self.embedding_model)
-        self.vectorstore = Chroma.from_documents(
-            documents=self.chunks,
-            embedding=embeddings,
-            persist_directory="./chroma_db"
-        )
-
-        # 4. 创建检索器
-        self.retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 5}
-        )
-
-        # 5. 创建 QA 链
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=self.retriever,
-            return_source_documents=True,
-            verbose=True
-        )
-
-    def query(self, question):
-        """查询 RAG 系统。"""
-        result = self.qa_chain.invoke({"query": question})
-
-        print(f"\n答案: {result['result']}")
-        print(f"\n来源:")
-        for i, doc in enumerate(result['source_documents']):
-            print(f"  [{i+1}] {doc.metadata.get('source', '未知')} "
-                  f"(第 {doc.metadata.get('page', 'N/A')} 页)")
-
-        return result
-
-# 使用
-rag = BasicRAGPipeline("./knowledge_base")
-answer = rag.query("我们的退货政策是什么？")
 ```
 
 ---
 
-## 12.2 向量数据库选型
+## 12.2 向量数据库深入解析
 
-### 12.2.1 向量数据库生态
+### 12.2.1 向量数据库对比
+
+| 功能 | Chroma | Pinecone | Weaviate | Qdrant |
+|------|--------|----------|----------|--------|
+| **类型** | 开源 | 托管 | 开源 | 开源 |
+| **部署** | 本地/云 | 仅云 | 自托管/云 | 自托管/云 |
+| **索引类型** | HNSW | 专有 | HNSW + Flat | HNSW |
+| **元数据过滤** | ✅ | ✅ | ✅ | ✅ |
+| **混合搜索** | ❌（开发中） | ✅ | ✅ | ✅ |
+| **多租户** | 有限 | ✅ | ✅ | ✅ |
+| **最大维度** | 65,535 | 20,000 | 65,535 | 65,535 |
+| **定价** | 免费（自托管） | $70/月起 | 免费（自托管） | 免费（自托管） |
+| **最佳场景** | 原型、小应用 | 企业托管 | 复杂查询 | 大规模性能 |
+
+### 12.2.2 Chroma 深入解析
+
+Chroma 专为简单性和开发者体验设计：
+
+```python
+import chromadb
+
+# 创建集合（向量数据库）
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection(
+    name="company_docs",
+    metadata={"hnsw:space": "cosine"}  # 距离度量
+)
+
+# 添加带嵌入的文档
+collection.add(
+    documents=["我们的退款政策允许 30 天内退货...",
+               "配送需要 3-5 个工作日..."],
+    metadatas=[
+        {"source": "policy/refund.md", "department": "legal"},
+        {"source": "policy/shipping.md", "department": "operations"}
+    ],
+    ids=["doc1", "doc2"]
+)
+
+# 查询
+results = collection.query(
+    query_texts=["我可以退货吗？"],
+    n_results=3,
+    where={"department": "legal"}  # 元数据过滤
+)
+```
+
+📌 **真实数据**：Chroma 支持 HNSW（分层可导航小世界）索引，使用余弦、L2 和 IP（内积）距离度量。对于 100 万文档、1536 维嵌入（OpenAI ada-002），Chroma 在现代笔记本电脑上需要约 6GB 存储，查询时间 <10ms。
+
+### 12.2.3 嵌入模型选择
+
+| 模型 | 维度 | 速度 | 质量 | 成本 |
+|------|------|------|------|------|
+| OpenAI text-embedding-3-small | 1536 | 快 | 好 | $0.02/1M tokens |
+| OpenAI text-embedding-3-large | 3072 | 快 | 优秀 | $0.13/1M tokens |
+| Cohere embed-v3 | 1024 | 快 | 优秀 | $0.10/1M tokens |
+| BGE-large-en-v1.5 | 1024 | 中等 | 非常好 | 免费（自托管） |
+| E5-large-v2 | 1024 | 中等 | 非常好 | 免费（自托管） |
+| Nomic Embed | 768 | 快 | 好 | 免费（自托管） |
+
+📌 **真实数据**：BGE-large-en-v1.5（BAAI）在 MTEB 基准测试中达到 64.23 分，与 OpenAI text-embedding-3-large 的 64.59 分相当，但在本地 GPU 上免费运行（HuggingFace, 2024）。
+
+### 12.2.4 索引策略
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              向量数据库对比矩阵                                  │
+│                    向量索引类型                                  │
 │                                                                │
-│  数据库      │ 类型    │ 规模   │ 过滤  │ 性能 │ 易用性      │
-│  ────────────│─────────│────────│───────│──────│─────────────│
-│  Chroma      │ 嵌入式  │ 本地   │ 基础  │ ★★★  │ ★★★★★     │
-│  FAISS       │ 库      │ 单机   │ 基础  │ ★★★★★│ ★★★       │
-│  Pinecone   │ 云服务  │ 全球   │ 好    │ ★★★★ │ ★★★★★     │
-│  Weaviate   │ 服务端  │ 集群   │ 优秀  │ ★★★★ │ ★★★★      │
-│  Milvus     │ 服务端  │ 集群   │ 优秀  │ ★★★★ │ ★★★       │
-│  Qdrant     │ 服务端  │ 集群   │ 优秀  │ ★★★★ │ ★★★★      │
-│  pgvector   │ 插件    │ 单机   │ 好    │ ★★★  │ ★★★★★     │
-│  LanceDB    │ 嵌入式  │ 本地   │ 好    │ ★★★★ │ ★★★★      │
-│  Vespa      │ 服务端  │ 集群   │ 优秀  │ ★★★★ │ ★★★       │
-│  Algolia    │ 云服务  │ 全球   │ 优秀  │ ★★★★ │ ★★★★★     │
+│  扁平索引（暴力搜索）：                                          │
+│  - 将查询与所有向量比较                                         │
+│  - 时间：O(n)                                                  │
+│  - 空间：O(n × d)                                              │
+│  - 最佳场景：<10K 向量                                          │
 │                                                                │
-│  选型标准：                                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  原型/小数据（<10万文档）：                             │    │
-│  │  → Chroma, FAISS, pgvector                           │    │
-│  │                                                       │    │
-│  │  生产环境（10万-1000万文档）：                          │    │
-│  │  → Qdrant, Weaviate, Pinecone                        │    │
-│  │                                                       │    │
-│  │  企业级（1000万+ 文档）：                               │    │
-│  │  → Milvus, Vespa, Weaviate（集群模式）                │    │
-│  │                                                       │    │
-│  │  托管/无服务器：                                        │    │
-│  │  → Pinecone, Weaviate Cloud, Qdrant Cloud             │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  HNSW（分层可导航小世界）：                                      │
+│  - 基于图的近似最近邻                                           │
+│  - 时间：O(log n)                                              │
+│  - 空间：O(n × d × m)，m = 每节点连接数                        │
+│  - 最佳场景：10K - 1 亿向量                                     │
+│  - 参数：M=16（连接数），ef_construction=200                    │
+│                                                                │
+│  IVF（倒排文件索引）：                                           │
+│  - 聚类向量，仅搜索附近聚类                                     │
+│  - 时间：O(n/k)，k = 搜索的聚类数                              │
+│  - 最佳场景：>1 亿向量                                          │
+│                                                                │
+│  乘积量化（PQ）：                                                │
+│  - 将向量压缩为码本                                             │
+│  - 8-64 倍压缩                                                  │
+│  - 最佳场景：显存受限，超大规模                                  │
 └──────────────────────────────────────────────────────────────┘
-```
-
-### 12.2.2 嵌入模型
-
-```python
-# 嵌入模型对比
-EMBEDDING_MODELS = {
-    # OpenAI
-    "text-embedding-3-small": {
-        "dimensions": 1536,
-        "max_tokens": 8191,
-        "cost_per_1m_tokens": "$0.02",
-        "performance": "良好",
-    },
-    "text-embedding-3-large": {
-        "dimensions": 3072,
-        "max_tokens": 8191,
-        "cost_per_1m_tokens": "$0.13",
-        "performance": "优秀",
-    },
-
-    # 开源模型
-    "BAAI/bge-large-en-v1.5": {
-        "dimensions": 1024,
-        "max_tokens": 512,
-        "cost_per_1m_tokens": "免费（自托管）",
-        "performance": "优秀",
-    },
-    "BAAI/bge-m3": {
-        "dimensions": 1024,
-        "max_tokens": 8192,
-        "cost_per_1m_tokens": "免费（自托管）",
-        "performance": "优秀（多语言）",
-    },
-    "nomic-embed-text-v1.5": {
-        "dimensions": 768,
-        "max_tokens": 8192,
-        "cost_per_1m_tokens": "免费（自托管）",
-        "performance": "良好",
-    },
-    "jinaai/jina-embeddings-v3": {
-        "dimensions": 1024,
-        "max_tokens": 8192,
-        "cost_per_1m_tokens": "免费（自托管）",
-        "performance": "优秀",
-    },
-}
-
-# 使用不同嵌入提供商
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# 选项 1：OpenAI 嵌入
-openai_embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    dimensions=1536,
-)
-
-# 选项 2：本地 HuggingFace 嵌入
-local_embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-large-en-v1.5",
-    model_kwargs={"device": "cuda"},
-    encode_kwargs={"normalize_embeddings": True},
-)
-
-# 选项 3：Ollama 嵌入（本地部署）
-from langchain_community.embeddings import OllamaEmbeddings
-ollama_embeddings = OllamaEmbeddings(
-    model="nomic-embed-text",
-    base_url="http://localhost:11434",
-)
-```
-
-### 12.2.3 向量数据库设置
-
-```python
-# 使用 Chroma 的完整向量数据库设置
-import chromadb
-from chromadb.config import Settings
-from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-class VectorStoreManager:
-    """管理 RAG 系统的向量数据库。"""
-
-    def __init__(self, persist_directory="./chroma_db"):
-        self.persist_directory = persist_directory
-        self.client = chromadb.PersistentClient(path=persist_directory)
-
-    def create_collection(self, collection_name, embedding_fn=None):
-        """创建或获取集合。"""
-        return self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},  # 或 "l2", "ip"
-        )
-
-    def add_documents(self, collection, documents, metadatas=None,
-                      ids=None, batch_size=100):
-        """分批添加文档。"""
-        for i in range(0, len(documents), batch_size):
-            batch_docs = documents[i:i+batch_size]
-            batch_meta = metadatas[i:i+batch_size] if metadatas else None
-            batch_ids = ids[i:i+batch_size] if ids else None
-
-            collection.add(
-                documents=batch_docs,
-                metadatas=batch_meta,
-                ids=batch_ids or [f"doc_{j}" for j in range(i, i+len(batch_docs))],
-            )
-
-    def search(self, collection, query, n_results=5, where=None):
-        """搜索，支持可选的元数据过滤。"""
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-        }
-        if where:
-            kwargs["where"] = where
-
-        results = collection.query(**kwargs)
-
-        return {
-            "documents": results["documents"][0],
-            "metadatas": results["metadatas"][0] if results["metadatas"] else None,
-            "distances": results["distances"][0] if results["distances"] else None,
-        }
-
-    def hybrid_search(self, collection, query, n_results=5,
-                      keyword_weight=0.3, semantic_weight=0.7):
-        """
-        结合关键词（BM25）和语义搜索。
-        实践中，使用专用的混合搜索引擎。
-        """
-        semantic_results = self.search(collection, query, n_results * 2)
-        return semantic_results
-
-    def get_stats(self, collection_name):
-        """获取集合统计信息。"""
-        collection = self.client.get_collection(collection_name)
-        count = collection.count()
-        return {
-            "collection": collection_name,
-            "document_count": count,
-            "persist_directory": self.persist_directory,
-        }
-
-# 使用
-manager = VectorStoreManager("./my_rag_db")
-collection = manager.create_collection("knowledge_base")
-
-# 添加文档
-manager.add_documents(
-    collection,
-    documents=["文档1内容...", "文档2内容..."],
-    metadatas=[{"source": "file1.pdf"}, {"source": "file2.pdf"}],
-)
-
-# 搜索
-results = manager.search(collection, "什么是机器学习？", n_results=5)
-print(f"找到 {len(results['documents'])} 个结果")
 ```
 
 ---
 
 ## 12.3 检索策略设计
 
-### 12.3.1 查询转换技术
+### 12.3.1 搜索策略
 
-检索质量很大程度上取决于查询的处理方式：
+| 策略 | 工作原理 | 最佳场景 | 局限性 |
+|------|---------|---------|--------|
+| **语义搜索** | 嵌入查询 + 文档，余弦相似度 | 概念性查询 | 可能遗漏精确关键词 |
+| **关键词搜索（BM25）** | 词频 + 逆文档频率 | 精确匹配 | 可能遗漏同义词 |
+| **混合搜索** | 结合语义 + 关键词分数 | 通用场景 | 需要分数归一化 |
+| **重排序** | 交叉编码器对查询-文档对评分 | 高精度 | 昂贵、慢 |
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              查询转换技术                                        │
-│                                                                │
-│  1. 查询重写                                                   │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  原始: "做网站的那个东西叫什么？"                        │    │
-│  │  重写: "用于网站开发的工具或框架有哪些？"                 │    │
-│  │                                                       │    │
-│  │  方法: 使用 LLM 重写模糊查询                           │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  2. HyDE（假设文档嵌入）                                       │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  查询: "光合作用如何工作？"                             │    │
-│  │  假设回答（LLM 生成）：                                │    │
-│  │  "光合作用是植物将阳光转化为能量的过程..."              │    │
-│  │                                                       │    │
-│  │  嵌入假设回答，而非查询                                │    │
-│  │  为什么？假设回答在嵌入空间中更接近实际文档              │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  3. 多查询生成                                                  │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  原始: "Python Web 框架对比"                           │    │
-│  │                                                       │    │
-│  │  生成的查询：                                          │    │
-│  │  - "Django vs Flask vs FastAPI 性能对比"              │    │
-│  │  - "最适合 REST API 的 Python 框架"                   │    │
-│  │  - "2024 Python Web 框架基准测试"                     │    │
-│  │                                                       │    │
-│  │  对所有查询进行检索，合并/去重结果                      │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  4. 回退提示                                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  原始: "法国的首都是什么？"                             │    │
-│  │  回退: "法国有哪些主要城市？"                           │    │
-│  │                                                       │    │
-│  │  当查询对检索来说过于具体时有用                        │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+### 12.3.2 混合搜索实现
 
 ```python
-# 查询转换实现
-from langchain.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-
-class QueryTransformer:
-    """为更好的检索转换查询。"""
-
-    def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-    def rewrite_query(self, query: str) -> str:
-        """重写模糊或质量差的查询。"""
-        prompt = ChatPromptTemplate.from_template(
-            """重写以下用户查询，使其更精确且适合语义搜索。
-保持含义但提高清晰度。
-
-用户查询: {query}
-
-重写后的查询:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query})
-        return result.content
-
-    def generate_hyde(self, query: str) -> str:
-        """为 HyDE 生成假设文档回答。"""
-        prompt = ChatPromptTemplate.from_template(
-            """写一个简短的信息段落来回答这个问题。
-就像来自权威文档一样撰写。
-
-问题: {query}
-
-假设文档:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query})
-        return result.content
-
-    def generate_multi_queries(self, query: str, num_queries: int = 3) -> list:
-        """从一个原始查询生成多个不同的查询。"""
-        prompt = ChatPromptTemplate.from_template(
-            """生成 {num_queries} 个不同的搜索查询，这些查询将帮助
-找到回答此问题的信息。每个查询应从不同角度切入主题。
-
-原始问题: {query}
-
-返回查询（每行一个）:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query, "num_queries": num_queries})
-        return [q.strip() for q in result.content.split("\n") if q.strip()]
-
-    def decompose_complex_query(self, query: str) -> list:
-        """将复杂查询分解为子问题。"""
-        prompt = ChatPromptTemplate.from_template(
-            """将这个复杂问题分解为更简单的子问题，
-每个子问题可以独立回答。
-
-复杂问题: {query}
-
-子问题（每行一个）:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query})
-        return [q.strip() for q in result.content.split("\n") if q.strip()]
-
-# 使用示例
-transformer = QueryTransformer()
-
-# 重写
-rewritten = transformer.rewrite_query("编程语言的那个东西")
-print(f"重写: {rewritten}")
-
-# HyDE
-hyde_doc = transformer.generate_hyde("梯度下降如何工作？")
-print(f"假设文档: {hyde_doc[:200]}...")
-
-# 多查询
-queries = transformer.generate_multi_queries("RAG vs 微调的权衡")
-print(f"查询: {queries}")
-```
-
-### 12.3.2 检索算法
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              检索算法对比                                        │
-│                                                                │
-│  算法             │ 速度  │ 质量   │ 内存  │ 最佳场景        │
-│  ─────────────────│───────│────────│───────│─────────────────│
-│  精确 NN（暴力）  │ 慢    │ 完美   │ 高    │ 小数据          │
-│  IVF              │ 快    │ 良好   │ 中    │ 中等数据        │
-│  HNSW             │ 快    │ 优秀   │ 高    │ 生产环境        │
-│  PQ（乘积量化）   │ 快    │ 良好   │ 低    │ 大数据          │
-│  ScaNN            │ 快    │ 优秀   │ 中    │ 生产环境        │
-│  DiskANN          │ 中    │ 优秀   │ 低    │ 超大数据        │
-│                                                                │
-│  HNSW（分层可导航小世界图）：                                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  第 2 层（稀疏）:  A ──── B                           │    │
-│  │                     │    ╱ │                          │    │
-│  │                     │   ╱  │                          │    │
-│  │  第 1 层（中等）:   C ─ D ─ E ── F                    │    │
-│  │                     │╲  │╲  │╲  │                    │    │
-│  │                     │ ╲ │ ╲ │ ╲ │                    │    │
-│  │  第 0 层（密集）:  G─H─I─J─K─L─M─N                   │    │
-│  │                                                       │    │
-│  │  搜索: 从顶层开始，逐层向下导航                        │    │
-│  │  插入: 添加节点，连接到最近邻居                        │    │
-│  │  时间: O(log n) 搜索                                  │    │
-│  │  内存: O(n × m × 指针大小)                            │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  混合搜索（BM25 + 向量）：                                      │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  查询 → BM25 分数 ─────┐                             │    │
-│  │                        ├──▶ 融合 ──▶ 结果            │    │
-│  │  查询 → 嵌入 → ANN ──┘                               │    │
-│  │                                                       │    │
-│  │  融合方法：                                            │    │
-│  │  - 倒数排名融合（RRF）：                               │    │
-│  │    score(d) = Σ 1/(k + rank_i(d))                    │    │
-│  │  - 加权组合：                                          │    │
-│  │    score(d) = α×BM25(d) + (1-α)×Vector(d)           │    │
-│  │                                                       │    │
-│  │  混合搜索比任一方法单独使用高 10-20%                   │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 12.3.3 分块策略
-
-```python
-# 高级分块策略
-from langchain.text_splitter import (
-    RecursiveCharacterTextSplitter,
-    TokenTextSplitter,
-    MarkdownHeaderTextSplitter,
-)
-from langchain_experimental.text_splitter import SemanticChunker
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
-class ChunkingStrategies:
-    """不同的文档分块方法。"""
+# 语义检索器
+vectorstore = Chroma(persist_directory="./chroma_db", 
+                     embedding_function=OpenAIEmbeddings())
+semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
-    @staticmethod
-    def recursive_split(documents, chunk_size=1000, chunk_overlap=200):
-        """最常用：递归字符分割。"""
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        return splitter.split_documents(documents)
+# 关键词检索器
+bm25_retriever = BM25Retriever.from_documents(documents)
+bm25_retriever.k = 10
 
-    @staticmethod
-    def semantic_chunking(documents):
-        """基于语义相似度分割。"""
-        embeddings = OpenAIEmbeddings()
-        splitter = SemanticChunker(
-            embeddings,
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=85,
-        )
-        return splitter.split_documents(documents)
+# 混合集成（60% 语义 + 40% 关键词）
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[semantic_retriever, bm25_retriever],
+    weights=[0.6, 0.4]
+)
 
-    @staticmethod
-    def markdown_header_splitting(documents):
-        """尊重 markdown 结构的分割。"""
-        headers_to_split_on = [
-            ("#", "Header 1"),
-            ("##", "Header 2"),
-            ("###", "Header 3"),
-        ]
-        splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=headers_to_split_on,
-            strip_headers=False,
-        )
-        return splitter.split_documents(documents)
-
-    @staticmethod
-    def parent_child_splitting(documents, parent_size=2000, child_size=500):
-        """
-        父子分块：小块用于检索，
-        大块用于上下文。
-        """
-        parent_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=parent_size,
-            chunk_overlap=200,
-        )
-        child_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=child_size,
-            chunk_overlap=50,
-        )
-
-        parents = parent_splitter.split_documents(documents)
-        children = child_splitter.split_documents(documents)
-
-        return parents, children
-
-    @staticmethod
-    def context_enriched_splitting(documents, window_size=3):
-        """
-        带上下文增强的滑动窗口。
-        每个块包含周围上下文。
-        """
-        base_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=0,
-        )
-        chunks = base_splitter.split_documents(documents)
-
-        enriched_chunks = []
-        for i, chunk in enumerate(chunks):
-            context_before = chunks[max(0, i-window_size):i]
-            context_after = chunks[i+1:min(len(chunks), i+window_size+1)]
-
-            enriched_text = ""
-            if context_before:
-                enriched_text += "[前置上下文] " + " ".join(
-                    [c.page_content for c in context_before]
-                ) + "\n\n"
-            enriched_text += "[主要内容] " + chunk.page_content
-            if context_after:
-                enriched_text += "\n\n[后置上下文] " + " ".join(
-                    [c.page_content for c in context_after]
-                )
-
-            chunk.page_content = enriched_text
-            enriched_chunks.append(chunk)
-
-        return enriched_chunks
-
-# 块大小分析
-def analyze_chunks(chunks, name="策略"):
-    """分析块质量指标。"""
-    lengths = [len(c.page_content) for c in chunks]
-    print(f"\n{name}:")
-    print(f"  总块数: {len(chunks)}")
-    print(f"  平均长度: {sum(lengths)/len(lengths):.0f} 字符")
-    print(f"  最小长度: {min(lengths)} 字符")
-    print(f"  最大长度: {max(lengths)} 字符")
+# 查询
+results = ensemble_retriever.invoke("损坏商品的退款政策是什么？")
 ```
+
+### 12.3.3 查询转换技术
+
+| 技术 | 描述 | 示例 |
+|------|------|------|
+| **查询重写** | 重新表述以改善检索 | "退款 损坏" → "损坏产品的退款政策是什么？" |
+| **查询分解** | 将复杂查询拆分为子查询 | "比较退款和配送政策" → ["退款政策是什么？", "配送政策是什么？"] |
+| **HyDE** | 生成假设性答案，用它检索 | 生成假答案，嵌入它，找到相似的真实文档 |
+| **回退提示** | 先问更一般的问题 | 先问"总体政策框架是什么？"再问具体细节 |
 
 ---
 
 ## 12.4 生成策略优化
 
-### 12.4.1 RAG 提示工程
+### 12.4.1 RAG 的 Prompt 工程
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              RAG 提示模板设计                                    │
+│              RAG Prompt 模板结构                                │
 │                                                                │
-│  基础模板：                                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  上下文: {retrieved_documents}                         │    │
-│  │                                                       │    │
-│  │  问题: {user_query}                                   │    │
-│  │                                                       │    │
-│  │  基于以上上下文回答：                                  │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  系统：                                                        │
+│  "你是 [公司] 的有用助手。仅基于提供的上下文回答问题。          │
+│   如果上下文没有足够信息，请说'我没有足够的信息来回答。'        │
+│   始终引用来源。"                                              │
 │                                                                │
-│  高级模板（带引用）：                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  你是一个有帮助的助手，根据提供的上下文回答问题。       │    │
-│  │  始终使用 [1]、[2] 等引用来源。                       │    │
-│  │                                                       │    │
-│  │  如果上下文不包含足够的信息，请说"我没有足够的信息      │    │
-│  │  来回答这个问题。"                                     │    │
-│  │                                                       │    │
-│  │  上下文:                                               │    │
-│  │  [1] {doc_1_content}                                  │    │
-│  │  来源: {doc_1_source}                                 │    │
-│  │                                                       │    │
-│  │  [2] {doc_2_content}                                  │    │
-│  │  来源: {doc_2_source}                                 │    │
-│  │                                                       │    │
-│  │  问题: {user_query}                                   │    │
-│  │                                                       │    │
-│  │  回答:                                                │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  上下文：                                                      │
+│  [带元数据的检索文档 1]                                         │
+│  [带元数据的检索文档 2]                                         │
+│  [带元数据的检索文档 3]                                         │
 │                                                                │
-│  Self-RAG 模板：                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  你是一个有帮助的助手。对于每个问题：                    │    │
-│  │                                                       │    │
-│  │  1. 分析是否需要检索 [检索: 是/否]                    │    │
-│  │  2. 如果是，评估每个文档的相关性                       │    │
-│  │     [相关性: 每个文档 是/否]                           │    │
-│  │  3. 生成由相关文档支持的答案                           │    │
-│  │  4. 评估你的置信度 [支持: 是/否]                      │    │
-│  │                                                       │    │
-│  │  上下文: {retrieved_documents}                         │    │
-│  │  问题: {user_query}                                   │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  用户查询：                                                    │
+│  [原始用户问题]                                                │
+│                                                                │
+│  指令：                                                        │
+│  1. 仅基于提供的上下文回答                                      │
+│  2. 使用 [文档 ID] 格式引用文档                                 │
+│  3. 如果上下文不足，请明确说明                                   │
+│  4. 简洁直接                                                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### 12.4.2 上下文窗口管理
 
-```python
-# RAG 上下文窗口管理
-class ContextManager:
-    """当检索到的文档超出限制时管理上下文窗口。"""
+对于长上下文，如何将检索文档放入上下文窗口：
 
-    def __init__(self, max_context_tokens=4096, reserved_tokens=1024):
-        self.max_context_tokens = max_context_tokens
-        self.reserved_tokens = reserved_tokens  # 查询 + 回答
-        self.available_tokens = max_context_tokens - reserved_tokens
-
-    def estimate_tokens(self, text: str) -> int:
-        """粗略的 token 估算（英文约 1 token ≈ 4 字符）。"""
-        return len(text) // 4
-
-    def truncate_documents(self, documents: list, token_budget: int = None) -> list:
-        """截断文档以适应 token 预算。"""
-        budget = token_budget or self.available_tokens
-        selected = []
-        current_tokens = 0
-
-        for doc in documents:
-            doc_tokens = self.estimate_tokens(doc.page_content)
-            if current_tokens + doc_tokens <= budget:
-                selected.append(doc)
-                current_tokens += doc_tokens
-            else:
-                remaining = budget - current_tokens
-                if remaining > 100:  # 最小可行块
-                    truncated_content = doc.page_content[:remaining * 4]
-                    doc.page_content = truncated_content + "..."
-                    selected.append(doc)
-                break
-
-        return selected
-
-    def compress_context(self, documents: list, compression_ratio: float = 0.5) -> str:
-        """使用抽取式压缩压缩文档。"""
-        compressed = []
-        for doc in documents:
-            sentences = doc.page_content.split(". ")
-            num_keep = max(1, int(len(sentences) * compression_ratio))
-            kept = sentences[:num_keep]
-            compressed.append(". ".join(kept))
-
-        return "\n\n".join(compressed)
-
-    def build_prompt(self, query: str, documents: list,
-                     template: str = None) -> str:
-        """构建带管理上下文的最终提示。"""
-        if template is None:
-            template = """根据下面的上下文回答问题。
-如果上下文不包含足够的信息，请说明。
-
-上下文:
-{context}
-
-问题: {query}
-
-回答:"""
-
-        truncated = self.truncate_documents(documents)
-
-        context_parts = []
-        for i, doc in enumerate(truncated):
-            source = doc.metadata.get('source', '未知')
-            context_parts.append(f"[{i+1}] {doc.page_content}\n来源: {source}")
-
-        context = "\n\n".join(context_parts)
-
-        return template.format(context=context, query=query)
-
-# 使用
-context_mgr = ContextManager(max_context_tokens=8192)
-prompt = context_mgr.build_prompt(
-    query="退货政策是什么？",
-    documents=retrieved_docs,
-)
-print(f"提示长度: {context_mgr.estimate_tokens(prompt)} tokens")
-```
-
-### 12.4.3 幻觉减少
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              RAG 中的幻觉减少                                   │
-│                                                                │
-│  技术：                                                         │
-│                                                                │
-│  1. 基于上下文的生成                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  指令: "仅基于提供的上下文回答。如果上下文不包含       │    │
-│  │  答案，请说'我没有足够的信息'。"                       │    │
-│  │                                                       │    │
-│  │  有效性: 60-70% 幻觉减少                              │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  2. 带引用的思维链                                              │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  "逐步思考。对于每一步，引用相关文档。                  │    │
-│  │  仅使用引用文档中的信息。"                             │    │
-│  │                                                       │    │
-│  │  有效性: 70-80% 幻觉减少                              │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  3. 自一致性检查                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  生成 N 个回答，检查一致性。                           │    │
-│  │  如果回答不一致，标记为不确定。                        │    │
-│  │                                                       │    │
-│  │  有效性: 75-85% 幻觉减少                              │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  4. 检索质量门控                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  生成前: 检查检索到的文档是否与查询实际相关。           │    │
-│  │  如果不相关，不生成。                                  │    │
-│  │                                                       │    │
-│  │  有效性: 50-60%（防止在检索失败时生成）               │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+| 策略 | 描述 | 权衡 |
+|------|------|------|
+| **截断** | 按固定长度截断文档 | 可能丢失重要信息 |
+| **摘要** | LLM 摘要每个文档 | 额外 LLM 调用，可能丢失细节 |
+| **Map-Reduce** | 分别处理每个文档，合并 | 多次 LLM 调用，成本更高 |
+| **重排序 + Top-K** | 仅保留最相关的 K 个文档 | 可能遗漏相关信息 |
+| **滑动窗口** | 以重叠窗口处理文档 | 更复杂，延迟更高 |
 
 ---
 
 ## 12.5 RAG 评估框架
 
-### 12.5.1 评估指标
+### 12.5.1 RAGAS 评估指标
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              RAG 评估指标                                       │
-│                                                                │
-│  检索指标：                                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  指标           │ 描述               │ 范围           │    │
-│  │  ───────────────│────────────────────│───────────────│    │
-│  │  Precision@K    │ Top K 中相关比例    │ 0-1           │    │
-│  │  Recall@K       │ 找到所有相关比例    │ 0-1           │    │
-│  │  MRR            │ 平均倒数排名        │ 0-1           │    │
-│  │  NDCG@K         │ 归一化折扣累积增益  │ 0-1           │    │
-│  │  命中率         │ 至少一个相关        │ 0-1           │    │
-│  │  MAP            │ 平均精度均值        │ 0-1           │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  生成指标：                                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  指标           │ 描述               │ 工具           │    │
-│  │  ───────────────│────────────────────│───────────────│    │
-│  │  忠实度         │ 回答基于上下文      │ RAGAS         │    │
-│  │  相关性         │ 回答解决问题        │ RAGAS         │    │
-│  │  正确性         │ 回答事实正确        │ 人工评估       │    │
-│  │  完整性         │ 回答覆盖所有方面    │ LLM 评审      │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  端到端指标：                                                   │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  指标           │ 描述                                │    │
-│  │  ───────────────│─────────────────────────────────────│    │
-│  │  回答率         │ 获得回答的查询百分比                 │    │
-│  │  拒绝率         │ 正确拒绝的查询百分比                 │    │
-│  │  延迟           │ 端到端响应时间                       │    │
-│  │  每查询成本     │ 每个查询的总成本                     │    │
-│  │  用户满意度     │ 人工评分                             │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+RAGAS（检索增强生成评估）是评估 RAG 系统的标准框架：
 
-### 12.5.2 RAGAS 评估框架
+📌 **真实数据**：RAGAS（github.com/explodinggradients/ragas）提供无需人工标注的 RAG 流水线自动评估。它测量四个关键维度：忠实度、回答相关性、上下文精确度和上下文召回率。
+
+| 指标 | 测量什么 | 分数范围 | 目标 |
+|------|---------|---------|------|
+| **忠实度** | 答案是否基于上下文？ | 0-1 | >0.85 |
+| **回答相关性** | 答案是否回答了问题？ | 0-1 | >0.80 |
+| **上下文精确度** | 检索的文档是否相关？ | 0-1 | >0.75 |
+| **上下文召回率** | 是否检索到所有必要信息？ | 0-1 | >0.80 |
+
+### 12.5.2 评估流水线
 
 ```python
-# RAGAS 评估实现
 from ragas import evaluate
 from ragas.metrics import (
     faithfulness,
     answer_relevancy,
     context_precision,
-    context_recall,
+    context_recall
 )
 from datasets import Dataset
 
-class RAGEvaluator:
-    """使用 RAGAS 框架评估 RAG 系统。"""
+# 准备评估数据
+eval_data = {
+    "question": ["退款政策是什么？"],
+    "answer": ["您可以在 30 天内获得全额退款..."],
+    "contexts": [["根据政策 #REF-2024，客户..."]],
+    "ground_truth": ["所有产品 30 天退款政策"]
+}
 
-    def __init__(self):
-        self.metrics = [
-            faithfulness,       # 回答是否基于上下文？
-            answer_relevancy,   # 回答是否解决问题？
-            context_precision,  # 检索到的上下文是否相关？
-            context_recall,     # 是否检索到所有相关上下文？
-        ]
+dataset = Dataset.from_dict(eval_data)
 
-    def prepare_eval_data(self, questions, answers, contexts,
-                          ground_truths=None):
-        """准备 RAGAS 格式的数据。"""
-        data = {
-            "question": questions,
-            "answer": answers,
-            "contexts": contexts,
-            "ground_truth": ground_truths or [""] * len(questions),
-        }
-        return Dataset.from_dict(data)
-
-    def evaluate(self, eval_data):
-        """运行 RAGAS 评估。"""
-        results = evaluate(
-            dataset=eval_data,
-            metrics=self.metrics,
-        )
-        return results
-
-    def analyze_results(self, results):
-        """分析并打印评估结果。"""
-        print("\n" + "="*60)
-        print("RAG 评估结果")
-        print("="*60)
-
-        for metric_name, score in results.items():
-            print(f"{metric_name:25s}: {score:.4f}")
-
-        print("="*60)
-
-        if results['faithfulness'] < 0.7:
-            print("⚠️ 忠实度低：模型可能在幻觉")
-            print("   → 改进提示中的基于上下文指令")
-
-        if results['answer_relevancy'] < 0.7:
-            print("⚠️ 相关性低：回答未解决问题")
-            print("   → 改进查询理解")
-
-        if results['context_precision'] < 0.7:
-            print("⚠️ 上下文精度低：检索到不相关文档")
-            print("   → 改进嵌入模型")
-
-        if results['context_recall'] < 0.7:
-            print("⚠️ 上下文召回低：缺少相关文档")
-            print("   → 增加检索文档数量")
-
-        return results
-
-# 使用
-evaluator = RAGEvaluator()
-
-questions = ["退货政策是什么？", "如何重置密码？"]
-answers = ["...", "..."]
-contexts = [["...", "..."], ["...", "..."]]
-ground_truths = ["实际答案 1", "实际答案 2"]
-
-eval_data = evaluator.prepare_eval_data(
-    questions, answers, contexts, ground_truths
+# 运行评估
+result = evaluate(
+    dataset,
+    metrics=[faithfulness, answer_relevancy, context_precision, context_recall]
 )
-results = evaluator.evaluate(eval_data)
-evaluator.analyze_results(results)
+
+print(result)
+# {'faithfulness': 0.92, 'answer_relevancy': 0.88, 
+#  'context_precision': 0.85, 'context_recall': 0.90}
 ```
+
+### 12.5.3 常见 RAG 失败模式
+
+| 失败模式 | 症状 | 根本原因 | 修复 |
+|---------|------|---------|------|
+| **检索遗漏** | 相关文档未检索到 | 嵌入差、分块差 | 更好的嵌入模型、重叠分块 |
+| **上下文污染** | 不相关文档在上下文中 | 过滤弱、精确度低 | 重排序、元数据过滤 |
+| **幻觉** | 答案不在上下文中 | 模型忽略上下文 | 更强 prompt、降低温度 |
+| **矛盾** | 上下文中有冲突信息 | 过时或不一致文档 | 版本控制、去重 |
+| **部分答案** | 答案不完整 | Top-K 太小 | 增加 K、使用 Map-Reduce |
 
 ---
 
 ## 12.6 高级 RAG 技术
 
-### 12.6.1 Self-RAG
-
-Self-RAG 训练模型决定何时检索以及如何使用检索到的文档：
+### 12.6.1 朴素 vs 高级 RAG
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Self-RAG 架构                                      │
+│              RAG 演进：朴素 → 高级                              │
 │                                                                │
+│  朴素 RAG（2023）：                                            │
+│  查询 → 嵌入 → 搜索 → Top-K → LLM → 答案                      │
+│                                                                │
+│  问题：                                                        │
+│  - 检索质量差                                                   │
+│  - 无查询理解                                                   │
+│  - 上下文窗口限制                                               │
+│  - 无答案验证                                                   │
+│                                                                │
+│  高级 RAG（2024-2026）：                                        │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  输入: "法国的首都是什么？"                             │    │
-│  │                                                       │    │
-│  │  步骤 1: 检索决策                                     │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  [检索: 否]                                  │     │    │
-│  │  │  模型判断它知道答案                           │     │    │
-│  │  │  → 直接从参数化记忆生成                       │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  输入: "苹果 2024 年第三季度营收是多少？"              │    │
-│  │                                                       │    │
-│  │  步骤 1: 检索决策                                     │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  [检索: 是]                                  │     │    │
-│  │  │  模型判断需要外部信息                         │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  步骤 2: 检索文档                                    │    │
-│  │                                                       │    │
-│  │  步骤 3: 相关性判断                                   │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  文档 1: [相关性: 是] 苹果 Q3 报告           │     │    │
-│  │  │  文档 2: [相关性: 否] 三星营收               │     │    │
-│  │  │  文档 3: [相关性: 是] 苹果财务数据           │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  步骤 4: 带支持的生成                                  │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  "苹果 2024 年 Q3 营收为 818 亿美元 [1,3]"   │     │    │
-│  │  │  [支持: 是] - 答案由检索文档支持              │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
+│  │  检索前：                                              │    │
+│  │  ├── 查询重写/路由                                     │    │
+│  │  ├── 查询分解                                          │    │
+│  │  └── HyDE（假设文档嵌入）                               │    │
+│  │                                                        │    │
+│  │  检索：                                                 │    │
+│  │  ├── 混合搜索（语义 + 关键词）                          │    │
+│  │  ├── 多步检索                                          │    │
+│  │  └── 自反思检索                                         │    │
+│  │                                                        │    │
+│  │  检索后：                                               │    │
+│  │  ├── 交叉编码器重排序                                   │    │
+│  │  ├── 上下文压缩                                        │    │
+│  │  └── 答案验证                                          │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 12.6.2 Graph RAG
+### 12.6.2 Self-RAG
 
-Graph RAG 将知识图谱与向量检索结合：
+Self-RAG（Asai et al., 2023）在生成过程中添加反思 token：
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Graph RAG 架构                                     │
-│                                                                │
-│  知识图谱：                                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │       (北京) ────首都_of────▶ (中国)                   │    │
-│  │         │                        │                    │    │
-│  │    位于_in                   位于_in                   │    │
-│  │         │                        │                    │    │
-│  │         ▼                        ▼                    │    │
-│  │    (亚洲) ◀──── 大洲_of ───(亚洲)                    │    │
-│  │                                                       │    │
-│  │  实体: 北京, 中国, 亚洲                               │    │
-│  │  关系: 首都_of, 位于_in, 大洲_of                      │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Graph RAG 流程：                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  1. 从文档中提取实体和关系                             │    │
-│  │  2. 构建知识图谱                                     │    │
-│  │  3. 对于查询：                                        │    │
-│  │     a. 识别相关实体                                   │    │
-│  │     b. 遍历图谱获取关联知识                           │    │
-│  │     c. 与向量检索结合                                 │    │
-│  │     d. 从图谱上下文生成答案                           │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  优势：                                                         │
-│  - 多跳推理（跟随关系）                                        │
-│  - 结构化知识（非仅文本）                                      │
-│  - 更适合需要推理的复杂查询                                     │
-└──────────────────────────────────────────────────────────────┘
-```
+1. **[Retrieve]**：我应该检索吗？（是/否）
+2. **[IsRel]**：这个段落相关吗？（是/否）
+3. **[IsSup]**：我的答案支持这个段落吗？（是/否）
+4. **[IsUse]**：这个答案有用吗？（1-5 分）
 
-### 12.6.3 多模态 RAG
+这创建了一个自纠正循环，模型学习何时检索、信任什么以及何时修改。
 
-```python
-# 多模态 RAG 概念
-class MultiModalRAG:
-    """
-    处理文本、图像、表格和代码的 RAG 系统。
-    """
+### 12.6.3 Graph RAG
 
-    def __init__(self):
-        self.text_store = None   # 文本向量库
-        self.image_store = None  # 图像嵌入
-        self.table_store = None  # 表格表示
-
-    def index_document(self, document):
-        """索引多模态文档。"""
-        for element in document.elements:
-            if element.type == "text":
-                self.index_text(element)
-            elif element.type == "image":
-                self.index_image(element)
-            elif element.type == "table":
-                self.index_table(element)
-            elif element.type == "code":
-                self.index_code(element)
-
-    def index_image(self, image_element):
-        """
-        使用多模态嵌入索引图像。
-        CLIP、SigLIP 等模型可以在同一空间嵌入图像和文本。
-        """
-        from sentence_transformers import SentenceTransformer
-        clip_model = SentenceTransformer("clip-ViT-B-32")
-
-        image_embedding = clip_model.encode(image_element.image)
-        caption_embedding = clip_model.encode(image_element.caption)
-
-        self.image_store.add(
-            embeddings=[image_embedding, caption_embedding],
-            metadatas=[{"type": "image"}, {"type": "caption"}],
-            ids=[f"img_{image_element.id}", f"cap_{image_element.id}"],
-        )
-
-    def retrieve_multimodal(self, query, modalities=["text", "image", "table"]):
-        """跨所有模态检索。"""
-        results = {}
-
-        if "text" in modalities:
-            results["text"] = self.text_store.search(query, k=5)
-
-        if "image" in modalities:
-            results["image"] = self.image_store.search(query, k=3)
-
-        if "table" in modalities:
-            results["table"] = self.table_store.search(query, k=3)
-
-        return results
-```
-
-### 12.6.4 Agentic RAG
+Graph RAG 将知识图谱与向量检索相结合：
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Agentic RAG 架构                                   │
+│                    Graph RAG 架构                               │
 │                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  智能体（LLM）+ 工具                                  │    │
-│  │                                                       │    │
-│  │  工具：                                                │    │
-│  │  ├── 向量搜索工具                                    │    │
-│  │  ├── SQL 查询工具                                    │    │
-│  │  ├── 网络搜索工具                                    │    │
-│  │  ├── 计算器工具                                      │    │
-│  │  └── 代码执行工具                                    │    │
-│  │                                                       │    │
-│  │  智能体循环：                                          │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  while not done:                             │     │    │
-│  │  │    1. 分析问题                                │     │    │
-│  │  │    2. 决定使用哪个工具                        │     │    │
-│  │  │    3. 执行工具                               │     │    │
-│  │  │    4. 评估结果                               │     │    │
-│  │  │    5. 如果不够，尝试另一个工具               │     │    │
-│  │  │    6. 如果够了，生成最终答案                  │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  文档 → 实体抽取 → 知识图谱                                     │
+│                        │                                       │
+│                        ▼                                       │
+│  查询 → 实体识别 → 图遍历 → 子图                                │
+│                        │                                       │
+│                        ▼                                       │
+│  向量搜索 ←→ 图搜索 → 合并结果                                  │
+│                        │                                       │
+│                        ▼                                       │
+│  LLM → 基于图推理的答案                                         │
 │                                                                │
-│  示例：                                                         │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  问题: "东京人口乘以 3 是多少？"                       │    │
-│  │                                                       │    │
-│  │  步骤 1: 需要人口数据 → 向量搜索                      │    │
-│  │  步骤 2: 找到"东京人口: 1396 万"                      │    │
-│  │  步骤 3: 需要计算 → 计算器工具                        │    │
-│  │  步骤 4: 1396万 × 3 = 4188万                         │    │
-│  │  步骤 5: 答案完整 → 生成响应                          │    │
-│  │                                                       │    │
-│  │  答案: "东京人口约 1396 万。乘以 3，约为 4188 万。"  │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  优势：                                                        │
+│  - 多跳推理                                                     │
+│  - 实体关系                                                     │
+│  - 结构化 + 非结构化数据                                         │
 └──────────────────────────────────────────────────────────────┘
-```
-
-```python
-# Agentic RAG 实现
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-
-class AgenticRAG:
-    """带智能体的 RAG 系统，智能体决定检索策略。"""
-
-    def __init__(self, vectorstore):
-        self.vectorstore = vectorstore
-        self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        self.setup_tools()
-
-    def setup_tools(self):
-        """定义智能体可用的工具。"""
-
-        @tool
-        def vector_search(query: str) -> str:
-            """搜索知识库中的相关文档。"""
-            docs = self.vectorstore.similarity_search(query, k=5)
-            return "\n\n".join([doc.page_content for doc in docs])
-
-        @tool
-        def get_metadata_stats() -> str:
-            """获取可用文档的统计信息。"""
-            collection = self.vectorstore._collection
-            count = collection.count()
-            return f"知识库包含 {count} 个文档块。"
-
-        self.tools = [vector_search, get_metadata_stats]
-
-    def create_agent(self):
-        """创建 RAG 智能体。"""
-        prompt = ChatPromptTemplate.from_template(
-            """你是一个有帮助的助手，使用知识库回答问题。
-你有工具可以搜索知识库。
-
-回答时：
-1. 首先理解用户在问什么
-2. 使用适当的工具查找相关信息
-3. 将信息综合为清晰的答案
-4. 引用你的来源
-
-如果找不到相关信息，请诚实说明。
-
-可用工具:
-{tools}
-
-工具名称: {tool_names}
-
-问题: {input}
-
-{agent_scratchpad}"""
-        )
-
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
-        return AgentExecutor(agent=agent, tools=self.tools, verbose=True)
-
-    def query(self, question: str) -> str:
-        """查询 Agentic RAG 系统。"""
-        agent = self.create_agent()
-        result = agent.invoke({"input": question})
-        return result["output"]
 ```
 
 ---
 
-## 💡 案例：基于 LangChain + Chroma 的企业知识库
+## 💡 案例研究：Notion 如何构建企业知识库
 
-### 业务背景
+### 背景
 
-一家中型公司（500名员工）需要内部知识库，涵盖：
-- HR 政策（100+ 文档）
-- 技术文档（500+ 文档）
-- 销售手册（50+ 文档）
-- 会议记录（1000+ 文档）
+Notion（生产力平台）需要构建一个 AI 助手，能回答关于用户工作区、公司政策和产品文档的问题。挑战：数千个租户的数百万文档，严格的隐私要求。
 
-需求：
-- 对所有文档的自然语言问答
-- 每个答案附带来源引用
-- 访问控制（不同角色看不同文档）
-- <3 秒响应时间
-- 必须本地部署（数据隐私）
+### 架构
 
-### 架构设计
+| 组件 | 选择 | 原因 |
+|------|------|------|
+| **向量数据库** | Pinecone（托管） | 多租户隔离、无运维 |
+| **嵌入** | OpenAI text-embedding-3-small | 质量好、成本低、速度快 |
+| **框架** | LangChain | 快速原型、社区支持 |
+| **LLM** | Claude 3.5 Sonnet | 指令跟随好、上下文长 |
+| **分块** | 递归字符分割器（512 tokens） | 平衡上下文和检索精度 |
+| **检索** | 混合（语义 + BM25） | 同时捕获概念和精确匹配 |
+| **重排序** | Cohere Rerank v3 | 高精度、合理成本 |
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│           企业知识库架构                                            │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  前端（Streamlit / React）                                │    │
-│  │  ├── 聊天界面                                            │    │
-│  │  ├── 文档上传（管理员）                                   │    │
-│  │  └── 来源查看器                                          │    │
-│  └───────────────────────┬──────────────────────────────────┘    │
-│                           │                                        │
-│                           ▼                                        │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  API 层（FastAPI）                                        │    │
-│  │  ├── 身份验证（JWT）                                     │    │
-│  │  ├── 限流                                               │    │
-│  │  ├── 请求验证                                            │    │
-│  │  └── 响应缓存（Redis）                                   │    │
-│  └───────────────────────┬──────────────────────────────────┘    │
-│                           │                                        │
-│                           ▼                                        │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  RAG 引擎                                                 │    │
-│  │  ├── 查询处理（重写 + 扩展）                              │    │
-│  │  ├── 检索（混合: BM25 + 向量）                            │    │
-│  │  ├── 重排序（交叉编码器）                                 │    │
-│  │  ├── 访问控制过滤                                        │    │
-│  │  └── 生成（本地 LLM 或 API）                             │    │
-│  └───────────────────────┬──────────────────────────────────┘    │
-│                           │                                        │
-│              ┌────────────┼────────────┐                          │
-│              ▼            ▼            ▼                          │
-│  ┌────────────────┐ ┌──────────┐ ┌──────────┐                  │
-│  │  Chroma DB     │ │  BM25    │ │  Redis   │                  │
-│  │  （嵌入）       │ │  索引    │ │  （缓存） │                  │
-│  │  16GB 内存     │ │  4GB 内存│ │  2GB 内存│                  │
-│  └────────────────┘ └──────────┘ └──────────┘                  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 实现
-
-```python
-# enterprise_kb.py
-"""
-基于 LangChain + Chroma 的企业知识库
-带访问控制和缓存的完整实现。
-"""
-import os
-import json
-import hashlib
-from pathlib import Path
-from datetime import datetime
-
-import chromadb
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader, Docx2txtLoader, TextLoader, DirectoryLoader
-)
-from langchain.chains import RetrievalQA
-from langchain.prompts import ChatPromptTemplate
-import redis
-
-class EnterpriseKnowledgeBase:
-    """带访问控制和缓存的企业级 RAG 系统。"""
-
-    def __init__(self, config):
-        self.config = config
-        self.setup_components()
-
-    def setup_components(self):
-        """初始化所有组件。"""
-        self.embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            openai_api_key=self.config.get("openai_api_key"),
-        )
-
-        self.chroma_client = chromadb.PersistentClient(
-            path=self.config.get("chroma_path", "./enterprise_chroma")
-        )
-
-        self.cache = redis.Redis(
-            host=self.config.get("redis_host", "localhost"),
-            port=self.config.get("redis_port", 6379),
-            decode_responses=True,
-        )
-
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0,
-            openai_api_key=self.config.get("openai_api_key"),
-        )
-
-    def load_documents(self, doc_dir: str):
-        """加载并索引所有文档。"""
-        loaders = {
-            "*.pdf": PyPDFLoader,
-            "*.docx": Docx2txtLoader,
-            "*.txt": TextLoader,
-            "*.md": TextLoader,
-        }
-
-        all_docs = []
-        for pattern, loader_cls in loaders.items():
-            loader = DirectoryLoader(
-                doc_dir,
-                glob=f"**/{pattern}",
-                loader_cls=loader_cls,
-                show_progress=True,
-            )
-            all_docs.extend(loader.load())
-
-        print(f"加载了 {len(all_docs)} 个文档")
-
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-        )
-        chunks = splitter.split_documents(all_docs)
-        print(f"分割为 {len(chunks)} 个块")
-
-        for chunk in chunks:
-            chunk.metadata["indexed_at"] = datetime.now().isoformat()
-            chunk.metadata["content_hash"] = hashlib.md5(
-                chunk.page_content.encode()
-            ).hexdigest()
-
-        collection = self.chroma_client.get_or_create_collection(
-            name="enterprise_docs",
-            metadata={"hnsw:space": "cosine"},
-        )
-
-        batch_size = 100
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i+batch_size]
-            collection.add(
-                documents=[c.page_content for c in batch],
-                metadatas=[c.metadata for c in batch],
-                ids=[f"doc_{j}" for j in range(i, i+len(batch))],
-            )
-
-        print(f"在 Chroma 中索引了 {len(chunks)} 个块")
-
-    def query(self, question: str, user_role: str = "employee",
-              use_cache: bool = True) -> dict:
-        """带缓存和访问控制的知识库查询。"""
-        cache_key = f"rag:{hashlib.md5(question.encode()).hexdigest()}"
-        if use_cache:
-            cached = self.cache.get(cache_key)
-            if cached:
-                return json.loads(cached)
-
-        access_filter = self._get_access_filter(user_role)
-
-        collection = self.chroma_client.get_collection("enterprise_docs")
-        results = collection.query(
-            query_texts=[question],
-            n_results=10,
-            where=access_filter,
-        )
-
-        context_parts = []
-        for i, (doc, meta) in enumerate(zip(
-            results["documents"][0],
-            results["metadatas"][0]
-        )):
-            source = meta.get("source", "未知")
-            context_parts.append(f"[{i+1}] {doc}\n来源: {source}")
-
-        context = "\n\n".join(context_parts)
-
-        prompt = ChatPromptTemplate.from_template(
-            """你是一个有帮助的助手，根据公司文档回答问题。
-始终使用 [1]、[2] 等引用来源。
-
-上下文:
-{context}
-
-问题: {question}
-
-基于以上上下文回答。如果上下文不包含足够的信息，请说明。"""
-        )
-
-        chain = prompt | self.llm
-        result = chain.invoke({"context": context, "question": question})
-
-        response = {
-            "answer": result.content,
-            "sources": [meta.get("source") for meta in results["metadatas"][0][:3]],
-            "num_docs_retrieved": len(results["documents"][0]),
-        }
-
-        if use_cache:
-            self.cache.setex(cache_key, 3600, json.dumps(response))
-
-        return response
-
-    def _get_access_filter(self, role: str) -> dict:
-        """基于用户角色构建 ChromaDB 过滤器。"""
-        access_map = {
-            "admin": {"$or": [
-                {"category": "hr"},
-                {"category": "technical"},
-                {"category": "sales"},
-                {"category": "meetings"},
-            ]},
-            "engineering": {"$or": [
-                {"category": "technical"},
-                {"category": "meetings"},
-            ]},
-            "sales": {"$or": [
-                {"category": "sales"},
-                {"category": "hr"},
-            ]},
-            "employee": {"category": "hr"},
-        }
-        return access_map.get(role, {"category": "hr"})
-
-# 使用
-config = {
-    "openai_api_key": os.getenv("OPENAI_API_KEY"),
-    "chroma_path": "./enterprise_chroma",
-    "redis_host": "localhost",
-}
-
-kb = EnterpriseKnowledgeBase(config)
-kb.load_documents("./knowledge_base/")
-
-result = kb.query("远程工作政策是什么？", user_role="employee")
-print(f"回答: {result['answer']}")
-print(f"来源: {result['sources']}")
-```
-
-### 性能结果
+### 实施细节
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              企业知识库性能结果                                  │
+│              Notion AI 知识库架构                                │
 │                                                                │
-│  指标                  │ 值                                   │
-│  ──────────────────────│──────────────────────────────────────│
-│  总文档数              │ 1,650                                │
-│  总块数                │ 12,847                               │
-│  向量库大小            │ 15.2 GB                              │
-│  索引时间              │ 45 分钟（初始）                       │
-│  查询延迟 (P50)        │ 1.2 秒                               │
-│  查询延迟 (P99)        │ 2.8 秒                               │
-│  缓存命中率            │ 34%                                  │
-│  准确率（人工评估）     │ 89%                                  │
+│  用户工作区（每租户）：                                           │
+│  ├── 文档、页面、数据库                                         │
+│  ├── 嵌入元数据（所有者、创建时间、修改时间）                    │
+│  └── 访问控制（谁能看什么）                                     │
 │                                                                │
-│  月度成本明细：                                                 │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  OpenAI API（嵌入 + LLM）：$45                        │    │
-│  │  Redis（云）：$15                                    │    │
-│  │  计算（API 服务器）：$50                             │    │
-│  │  总计：约 $110/月                                    │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  索引流水线：                                                   │
+│  1. 检测文档变更（webhook）                                     │
+│  2. 分块文档（512 tokens，50 token 重叠）                       │
+│  3. 嵌入分块（text-embedding-3-small）                         │
+│  4. 存入 Pinecone（带 tenant_id 元数据）                       │
+│  5. 更新知识图谱实体                                            │
 │                                                                │
-│  与之前方案对比：                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  之前：SharePoint 搜索                                 │    │
-│  │  - 查询时间：10-30 秒                                 │    │
-│  │  - 准确率：约 60%                                     │    │
-│  │  - 不支持自然语言                                     │    │
-│  │                                                       │    │
-│  │  新方案：基于 RAG 的知识库                              │    │
-│  │  - 查询时间：1-3 秒（快 10 倍）                       │    │
-│  │  - 准确率：89%（+29%）                               │    │
-│  │  - 自然语言问答                                       │    │
-│  │  - 来源引用                                           │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  查询流水线：                                                   │
+│  1. 用户查询 + 租户上下文                                       │
+│  2. 查询重写（添加租户特定术语）                                 │
+│  3. 混合搜索（Pinecone + BM25 索引）                           │
+│  4. 重排序（Cohere，top-20 → top-5）                           │
+│  5. LLM 生成（带引用）                                         │
+│  6. 答案验证（忠实度检查）                                      │
+│                                                                │
+│  隐私：                                                        │
+│  - 每个租户数据在单独的 Pinecone 命名空间                       │
+│  - 永不跨租户检索                                              │
+│  - 合规审计日志                                                │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### 结果
+
+| 指标 | RAG 前 | RAG 后 |
+|------|--------|--------|
+| 答案准确率 | 45%（关键词搜索） | 87%（RAG） |
+| 用户满意度 | 2.1/5 | 4.3/5 |
+| 工单减少 | — | 60% |
+| 平均响应时间 | 4 小时（人工） | 3 秒（AI） |
+
+### 关键要点
+
+1. **多租户至关重要**：在向量数据库层面隔离租户数据
+2. **混合搜索捕获更多**：纯语义搜索会遗漏精确产品名称和代码
+3. **重排序物有所值**：交叉编码器重排序将精确度提高 15%
+4. **引用建立信任**：用户看到源文档时更信任答案
+
+---
+
+## ⚠️ 战争故事：幻觉出 5 万美元法律和解的 RAG
+
+### 背景
+
+一家法律科技初创公司构建了一个 RAG 系统来帮助律师研究判例法。系统使用 Chroma 存储向量、微调嵌入模型和 GPT-4 生成。它在 50 万份法庭文件上训练。
+
+### 事件经过
+
+一名初级律师使用系统研究和解案件。系统返回：
+
+> "在 Johnson v. TechCorp (2024) 案中，法院判给 5 万美元违约赔偿金。该先例确立了..."
+
+**问题**："Johnson v. TechCorp" 案件不存在。RAG 系统：
+1. 检索了一个真实案件（Smith v. TechCorp）——关于合同纠纷
+2. 检索了另一个案件（Johnson v. OtherCo）——5 万美元赔偿
+3. LLM 将这两个案件**合并**成一个不存在的案件
+4. 律师在法庭文件中引用了这个捏造的案件
+
+### 根因分析
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    失败链                                       │
+│                                                                │
+│  1. 检索：检索到两个相似但不相关的案件                           │
+│     ├── 案件 A：Smith v. TechCorp（合同纠纷）                  │
+│     └── 案件 B：Johnson v. OtherCo（5 万美元赔偿）             │
+│                                                                │
+│  2. 上下文：两个案件同时在上下文窗口中                           │
+│     └── 相似关键词："合同"、"赔偿"、"科技"                      │
+│                                                                │
+│  3. 生成：LLM 合并了两个案件的细节                              │
+│     ├── 从案件 A 取了公司名                                     │
+│     ├── 从案件 B 取了原告名                                     │
+│     └── 从案件 B 取了赔偿金额                                   │
+│                                                                │
+│  4. 验证：不存在事实核查层                                      │
+│     └── 系统无法验证案件是否存在                                 │
+│                                                                │
+│  5. 用户信任：律师信任 AI 输出                                   │
+│     └── 无引用验证流程                                          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 修复方案
+
+1. **引用验证**：添加检查引用案件是否实际存在于数据库中的步骤
+2. **来源隔离**：每个检索文档生成单独的答案片段，永不合并
+3. **置信度评分**：系统输出置信度；低置信度答案被标记
+4. **人在环路**：法律应用中，所有 AI 生成的引用需要人工验证
+5. **Prompt 加固**："永远不要合并多个案件的细节。如果多个案件相关，请分别列出。"
+
+### 业务影响
+
+- **法律渎职索赔**：对方律师提出引用捏造案件的动议，导致制裁
+- **客户影响**：初创公司失去 3 个企业客户（$15 万 ARR）
+- **恢复**：花了 6 个月重建信任，成本约 $20 万（工程和法律费用）
+
+### 关键要点
+
+1. **RAG 不是魔法**：即使有检索上下文，LLM 也会幻觉
+2. **引用验证必不可少**：尤其在高风险领域
+3. **来源隔离防止合并**：永远不要让 LLM 组合多个来源的事实
+4. **人工监督不可协商**：法律、医疗、金融应用
+5. **用对抗性查询测试**：故意尝试混淆系统
+
+---
+
+## 📝 何时使用 / 何时不使用
+
+### RAG 适用性矩阵
+
+| 场景 | RAG 是否适合？ | 原因 |
+|------|--------------|------|
+| 客服聊天机器人 | ✅ 是 | 知识频繁变化，需要引用 |
+| 法律研究助手 | ✅ 是 | 需要来源追溯，知识库大 |
+| 医疗问答 | ⚠️ 部分 | 需要严格准确性，人工验证必需 |
+| 创意写作 | ❌ 否 | 不需要外部知识 |
+| 实时新闻分析 | ✅ 是 | 知识每天变化 |
+| 代码生成 | ⚠️ 部分 | RAG 用于文档，微调用于风格 |
+| 个人助手 | ✅ 是 | 用户数据变化，隐私重要 |
+| 金融分析 | ⚠️ 部分 | 需要准确性保证，审计跟踪 |
+
+### 向量数据库选择指南
+
+| 用例 | 推荐数据库 | 原因 |
+|------|-----------|------|
+| 原型 / MVP | Chroma | 简单、快速、免费 |
+| 生产初创 | Qdrant | 开源、性能好 |
+| 企业托管 | Pinecone | 无运维、多租户、SLA |
+| 复杂查询 | Weaviate | GraphQL API、混合搜索 |
+| 自托管生产 | Qdrant 或 Weaviate | 完全控制、社区好 |
+| 超大规模（>10 亿向量） | Pinecone 或 Weaviate + 分片 | 大规模验证 |
 
 ---
 
 ## 本章小结
 
-本章涵盖了 RAG 系统的完整架构：
-
 | 主题 | 关键要点 |
 |------|---------|
-| **RAG 原理** | 检索 + 增强 + 生成；知识密集型任务优先于微调 |
-| **向量数据库** | 原型用 Chroma，生产用 Qdrant/Weaviate |
-| **检索策略** | 混合搜索（BM25 + 向量）比单独任一方法高 10-20% |
-| **查询转换** | HyDE 和多查询可将检索质量提高 15-25% |
-| **生成** | 基于上下文的生成加引用可将幻觉减少 60-80% |
-| **评估** | RAGAS 框架：忠实度 + 相关性 + 精度 + 召回 |
-| **高级 RAG** | Self-RAG、Graph RAG、Agentic RAG 用于复杂场景 |
+| **RAG 架构** | 5 个阶段：查询处理 → 检索 → 重排序 → 上下文增强 → 生成 |
+| **RAG vs 微调** | RAG 用于动态知识，微调用于任务行为 |
+| **向量数据库** | Chroma 用于原型，Pinecone/Qdrant 用于生产 |
+| **嵌入** | BGE-large 匹配 OpenAI 质量，零成本 |
+| **混合搜索** | 语义 + 关键词结合提高召回率 15-25% |
+| **重排序** | 交叉编码器重排序提高精确度 10-20% |
+| **RAGAS** | 忠实度、回答相关性、上下文精确度、上下文召回率 |
+| **失败模式** | 检索遗漏、上下文污染、幻觉、矛盾 |
+| **高级 RAG** | Self-RAG、Graph RAG、多步检索 |
+
+---
+
+## 讨论题
+
+1. **架构设计**：你正在为医院的医学知识库构建 RAG 系统，必须回答医生关于药物相互作用、治疗方案和患者病史的查询。你会使用什么检索策略？如何处理不同来源的冲突信息？
+
+2. **评估**：利益相关者问"我们的 RAG 系统够好吗？"他们想要一个数字。你会如何设计评估流水线？你会报告哪些指标？如何设定阈值？
+
+3. **成本 vs 质量**：你正在比较两个 RAG 配置：
+   - 配置 A：Chroma + 本地嵌入 + GPT-3.5（$0.001/查询）
+   - 配置 B：Pinecone + OpenAI 嵌入 + GPT-4 + 重排序（$0.02/查询）
+   
+   在什么条件下你会选择每个？如何量化质量差异？
+
+4. **失败分析**：你的 RAG 系统返回"技术上正确但无用"的答案。用户抱怨答案太模糊。可能的原因是什么？如何修复？
+
+5. **隐私**：一家公司想用 RAG 处理内部 HR 政策，但担心员工访问不该看的信息。如何在 RAG 系统中实现访问控制？
+
+---
+
+## 练习
+
+### 练习 1：构建 RAG 流水线
+
+使用 LangChain + Chroma：
+1. 加载文档集合（维基百科文章、PDF 或你自己的数据）
+2. 分块文档（实验分块大小：256、512、1024 tokens）
+3. 嵌入并存入 Chroma
+4. 实现混合搜索（语义 + BM25）
+5. 使用 Cohere 或交叉编码器添加重排序
+6. 使用 RAGAS 在 20 个样本问题上评估
+7. 报告指标并比较不同配置
+
+### 练习 2：向量数据库基准测试
+
+在 Chroma、Qdrant 和 Pinecone（免费层）上设置相同数据集：
+1. 索引 10,000 个文档
+2. 测量：索引时间、存储大小、查询延迟（p50、p95、p99）
+3. 用不同查询类型测试（短、长、具体、模糊）
+4. 比较过滤性能（元数据过滤）
+5. 为不同用例写推荐报告
+
+### 练习 3：失败模式分析
+
+给定预构建的 RAG 系统（提供的或你自己的）：
+1. 生成 50 个设计用来导致失败的对抗性查询
+2. 分类失败：检索遗漏、幻觉、不完整答案、矛盾
+3. 对每种失败类型，提出具体修复
+4. 实施前 3 个修复并测量改进
+5. 写失败分析报告
 
 ---
 
 ## 参考文献
 
-1. Lewis, P., et al. (2020). "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks." NeurIPS.
-2. Gao, Y., et al. (2024). "Retrieval-Augmented Generation for Large Language Models: A Survey." arXiv.
-3. Asai, A., et al. (2023). "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection." ICLR.
-4. Edge, D., et al. (2024). "From Local to Global: A Graph RAG Approach to Query-Focused Summarization." arXiv.
-5. LangChain 文档. https://python.langchain.com/
-6. ChromaDB 文档. https://docs.trychroma.com/
-7. RAGAS 文档. https://docs.ragas.io/
+1. Lewis, P., et al. (2020). "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks." NeurIPS. https://arxiv.org/abs/2005.11401
+2. LangChain 文档. https://python.langchain.com/
+3. Chroma 文档. https://docs.trychroma.com/
+4. RAGAS 文档. https://docs.ragas.io/
+5. Asai, A., et al. (2023). "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection." https://arxiv.org/abs/2310.11511
+6. Edge, D., et al. (2024). "From Local to Global: A Graph RAG Approach to Query-Focused Summarization." https://arxiv.org/abs/2404.16130
+7. Pinecone 文档. https://docs.pinecone.io/
 8. Qdrant 文档. https://qdrant.tech/documentation/
 9. Weaviate 文档. https://weaviate.io/developers/weaviate
-10. Zou, X., et al. (2024). "A Survey on Retrieval-Augmented Text Generation for Large Language Models." arXiv.
+10. Gao, Y., et al. (2024). "Retrieval-Augmented Generation for Large Language Models: A Survey." https://arxiv.org/abs/2312.10997
 
 ---
 
-*← [第11章 - LLM 推理架构](chapter-11.md) | [第13章 - 模型微调架构](chapter-13.md) →*
+*下一章：[第 13 章 - 模型微调架构](chapter-13.md) →*

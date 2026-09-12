@@ -1,1241 +1,460 @@
 # Chapter 8: Model Deployment Architecture
 
-> **Part III: MLOps Architecture**
+## Learning Objectives
 
-**Learning Objectives:**
-- Compare and select appropriate deployment strategies
-- Design scalable model serving architectures
-- Implement A/B testing and canary deployments
-- Manage model versions effectively
-- Optimize inference performance
-- Plan edge deployment strategies
+By the end of this chapter, you will be able to:
 
----
-
-## 8.1 Deployment Strategy Comparison
-
-### 8.1.1 The Deployment Decision Framework
-
-🟢 **Beginner**
-
-Choosing the right deployment strategy is critical. The wrong choice can lead to downtime, poor performance, or costly rollbacks.
-
-```
-Deployment Strategy Selection Matrix:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Risk Tolerance:                                            │
-│  Low ──────────────────────────────────────────────► High   │
-│  │                                                    │    │
-│  ▼                                                    ▼    │
-│  Blue/Green                              Canary              │
-│  Shadow                                  A/B Test            │
-│                                                              │
-│  Downtime Tolerance:                                         │
-│  Zero ──────────────────────────────────────────────► Any   │
-│  │                                                    │    │
-│  ▼                                                    ▼    │
-│  Blue/Green                              Rolling              │
-│  Canary                                  Recreate             │
-│                                                              │
-│  Traffic Split Need:                                         │
-│  None ─────────────────────────────────────────────► Full   │
-│  │                                                    │    │
-│  ▼                                                    ▼    │
-│  Recreate                                A/B Test            │
-│  Rolling                                 Canary              │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 8.1.2 Deployment Strategies Overview
-
-🟡 **Intermediate**
-
-| Strategy | Downtime | Risk | Complexity | Use Case |
-|----------|----------|------|------------|----------|
-| **Recreate** | Yes | High | Low | Development, internal tools |
-| **Rolling** | No | Medium | Medium | General production |
-| **Blue/Green** | No | Low | Medium | Critical services |
-| **Canary** | No | Very Low | High | Risk-averse production |
-| **Shadow** | No | None | Very High | Pre-production validation |
-| **A/B Test** | No | Low | High | Business optimization |
-
-### 8.1.3 Detailed Strategy Descriptions
-
-🔴 **Advanced**
-
-```
-Recreate Strategy:
-┌─────────────────────────────────────────────────────────────┐
-│  Time ──────────────────────────────────────────────────►  │
-│                                                             │
-│  V1: ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    │
-│  V2: ░░░░░░░░░░░░░░░░████████████████████████████████    │
-│       ▲                  ▲                                  │
-│       │                  │                                  │
-│    V1 stops          V2 starts                              │
-│    (downtime)        (new version)                          │
-│                                                             │
-│  Pros: Simple, clean transition                             │
-│  Cons: Downtime, no rollback without redeployment          │
-└─────────────────────────────────────────────────────────────┘
-
-Rolling Strategy:
-┌─────────────────────────────────────────────────────────────┐
-│  Time ──────────────────────────────────────────────────►  │
-│                                                             │
-│  V1: ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    │
-│  V2: ░░░░░░░░░░░░████████████░░░░░░░░░░░░░░░░░░░░░░░    │
-│  V3: ░░░░░░░░░░░░░░░░░░░░░░░░████████████░░░░░░░░░░░    │
-│  V4: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░████████  │
-│       ▲                          ▲                   ▲      │
-│       │                          │                   │      │
-│    Start rolling            Mid-transition     Complete    │
-│                                                             │
-│  Pros: No downtime, gradual rollout                         │
-│  Cons: Version mismatch possible, complex rollback         │
-└─────────────────────────────────────────────────────────────┘
-
-Blue/Green Strategy:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  Blue (V1)   │◄─ LB ──►│  Green (V2)  │               │
-│  │  Production  │          │  Staging     │               │
-│  └──────────────┘          └──────────────┘               │
-│         │                          │                        │
-│         ▼                          ▼                        │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  100% Traffic│          │  0% Traffic  │               │
-│  └──────────────┘          └──────────────┘               │
-│                                                             │
-│  After validation:                                          │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  Blue (V1)   │◄─ LB ──►│  Green (V2)  │               │
-│  │  Staging     │          │  Production  │               │
-│  └──────────────┘          └──────────────┘               │
-│         │                          │                        │
-│         ▼                          ▼                        │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  0% Traffic  │          │  100% Traffic│               │
-│  └──────────────┘          └──────────────┘               │
-│                                                             │
-│  Pros: Instant rollback, zero downtime                     │
-│  Cons: Double infrastructure cost                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 8.1.4 Shadow Deployment
-
-🔴 **Advanced**
-
-```
-Shadow Deployment:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│                    ┌──────────────┐                        │
-│  Request ─────────►│   Router     │                        │
-│                    └──────┬───────┘                        │
-│                           │                                 │
-│                    ┌──────┴───────┐                        │
-│                    │              │                         │
-│                    ▼              ▼                         │
-│             ┌──────────┐  ┌──────────┐                    │
-│             │  V1      │  │  V2      │                    │
-│             │(Primary) │  │ (Shadow) │                    │
-│             └────┬─────┘  └────┬─────┘                    │
-│                  │              │                           │
-│                  ▼              ▼                           │
-│             ┌──────────┐  ┌──────────┐                    │
-│             │ Response │  │ Response │                    │
-│             │ (used)   │  │ (logged) │                    │
-│             └──────────┘  └──────────┘                    │
-│                                                             │
-│  V2 receives production traffic but its response           │
-│  is NOT returned to the user — only logged for comparison  │
-│                                                             │
-│  Pros: Zero risk to users, compare real traffic            │
-│  Cons: Double compute cost, complex routing                │
-└─────────────────────────────────────────────────────────────┘
-```
+1. Design model serving architectures using Seldon Core and Kubernetes
+2. Implement A/B testing with statistical rigor for ML model evaluation
+3. Execute canary deployments that minimize risk during model rollouts
+4. Compare online, batch, and hybrid serving patterns for different use cases
+5. Analyze real-world deployment patterns from production ML systems
 
 ---
 
-## 8.2 Model Serving Architecture
+## 8.1 The Deployment Gap
 
-### 8.2.1 The Model Serving Challenge
+There is a well-documented gap between model accuracy in development and model performance in production. Studies suggest that only a small fraction of trained models ever make it to production, and of those, many are not retrained regularly. The deployment gap exists because of several challenges:
 
-🟢 **Beginner**
+1. **Serving latency requirements**: A model that trains for hours per batch must serve predictions in milliseconds
+2. **Resource efficiency**: Training uses GPUs intensively; serving must be cost-effective at scale
+3. **Reliability**: A model that crashes during training is inconvenient; a model that crashes in production loses money
+4. **Versioning and rollback**: Training is exploratory; serving requires deterministic behavior
 
-Model serving is the process of making trained models available for prediction requests. It's more complex than serving traditional web applications because:
+> 📌 **Verified Data**: Seldon Core has 4.8K GitHub stars, 2M+ installs, supports 40+ inference backends, and is used in production by Capital One, AstraZeneca, and GSK (seldon.io). Kubeflow, which provides KFServing (now KServe) for model serving as part of its ecosystem, has 33.1K+ stars and is CNCF Graduated (kubeflow.org).
 
-1. Models are large (sometimes gigabytes)
-2. Inference requires specific hardware (GPUs for deep learning)
-3. Latency requirements vary (real-time vs batch)
-4. Models need versioning and rollback capabilities
+---
 
+## 8.2 Model Serving Patterns
+
+### Online Serving
+
+Real-time prediction serving where the model receives individual requests and returns predictions with low latency.
+
+**Architecture:**
 ```
-Model Serving Requirements:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Latency Requirements:                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Real-time:    < 100ms    (recommendations, chat)   │   │
-│  │  Near-real:    < 1s       (search, personalization) │   │
-│  │  Batch:        minutes    (analytics, reporting)    │   │
-│  │  Offline:      hours      (training, retraining)    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Throughput Requirements:                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Low:          < 100 QPS   (internal tools)         │   │
-│  │  Medium:       100-1K QPS  (small product)          │   │
-│  │  High:         1K-10K QPS (large product)           │   │
-│  │  Very High:    > 10K QPS   (enterprise platform)    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Availability Requirements:                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  99.9%:       ~8.7 hours downtime/year              │   │
-│  │  99.99%:      ~52 minutes downtime/year             │   │
-│  │  99.999%:     ~5 minutes downtime/year              │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Client → Load Balancer → Model Server → Response
+                              ↓
+                        Health Checks
+                        Auto-scaling
+                        Circuit Breaker
 ```
 
-### 8.2.2 Model Serving Architecture Patterns
+**Requirements:**
+| Metric | Typical Target | Measurement |
+|--------|---------------|-------------|
+| Latency (p50) | < 50ms | Prometheus histogram |
+| Latency (p99) | < 200ms | Prometheus histogram |
+| Throughput | > 1000 QPS per instance | Requests per second |
+| Availability | > 99.9% | Uptime monitoring |
+| Cold start | < 30s | Time from scale-up to ready |
 
-🟡 **Intermediate**
+### Batch Serving
 
+Predictions are computed in advance for a large dataset, typically on a schedule.
+
+**Use cases:**
+- Nightly recommendation updates
+- Weekly risk scoring
+- Feature pre-computation for real-time models
+- Offline evaluation and backtesting
+
+**Architecture:**
 ```
-Pattern 1: Embedded Serving
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Application Server                      │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │   │
-│  │  │ Web API  │  │ Business │  │ ML Model         │ │   │
-│  │  │          │  │ Logic    │  │ (Embedded)       │ │   │
-│  │  └──────────┘  └──────────┘  └──────────────────┘ │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Pros: Simple, low latency                                  │
-│  Cons: Tight coupling, scaling issues                       │
-└─────────────────────────────────────────────────────────────┘
-
-Pattern 2: Dedicated Model Server
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐        ┌──────────────────────────────┐ │
-│  │ Web API      │───────►│ Model Server                 │ │
-│  │ (Application)│        │ ┌──────────┐ ┌──────────┐   │ │
-│  └──────────────┘        │ │ Model    │ │ Pre/Post │   │ │
-│                          │ │ Handler  │ │ Processing│   │ │
-│                          │ └──────────┘ └──────────┘   │ │
-│                          └──────────────────────────────┘ │
-│                                                             │
-│  Pros: Separation of concerns, independent scaling         │
-│  Cons: Network latency, operational overhead               │
-└─────────────────────────────────────────────────────────────┘
-
-Pattern 3: Model Serving Platform
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐        ┌──────────────────────────────┐ │
-│  │ Web API      │───────►│ Model Serving Platform       │ │
-│  │              │        │ ┌──────────┐ ┌──────────┐   │ │
-│  └──────────────┘        │ │ Router   │ │ Model    │   │ │
-│                          │ │          │ │ Registry │   │ │
-│                          │ └────┬─────┘ └──────────┘   │ │
-│                          │      │                        │ │
-│                          │      ▼                        │ │
-│                          │ ┌──────────┐ ┌──────────┐   │ │
-│                          │ │ Model A  │ │ Model B  │   │ │
-│                          │ │ v1       │ │ v2       │   │ │
-│                          │ └──────────┘ └──────────┘   │ │
-│                          └──────────────────────────────┘ │
-│                                                             │
-│  Pros: Multi-model, versioning, A/B testing, monitoring    │
-│  Cons: Complex setup, higher resource usage                │
-└─────────────────────────────────────────────────────────────┘
+Data Source → Feature Pipeline → Model Batch Inference → Prediction Store → Client Query
 ```
 
-### 8.2.3 Seldon Core Architecture
+### Hybrid Serving
 
-🔴 **Advanced**
+Combines batch pre-computation with real-time refinement. Common in recommendation systems where candidate generation is batch and ranking is real-time.
 
-```
-Seldon Core Architecture:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                   Seldon Core                         │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │              API Gateway                      │   │   │
-│  │  │  (REST / gRPC / GraphQL)                     │   │   │
-│  │  └──────────────────────┬──────────────────────┘   │   │
-│  │                         │                           │   │
-│  │  ┌──────────────────────▼──────────────────────┐   │   │
-│  │  │              Router                          │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ Load     │  │ A/B Test │  │ Canary   │  │   │   │
-│  │  │  │ Balancer │  │ Router   │  │ Router   │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └──────────────────────┬──────────────────────┘   │   │
-│  │                         │                           │   │
-│  │  ┌──────────────────────▼──────────────────────┐   │   │
-│  │  │              Model Runtime                    │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ Python   │  │ Java     │  │ TensorFlow│  │   │   │
-│  │  │  │ Wrapper  │  │ Wrapper  │  │ Serving   │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Kubernetes Resources                     │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Deployment│  │ Service  │  │ HPA      │         │   │
-│  │  │ (Model)  │  │ (gRPC)   │  │ (Auto)   │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+---
 
-### 8.2.4 Seldon Core Deployment Example
+## 8.3 Seldon Core Architecture
 
-🟡 **Intermediate**
+> 📌 **Verified Data**: Seldon Core supports 40+ ML frameworks including TensorFlow, PyTorch, XGBoost, scikit-learn, and custom models via microservices. It provides built-in support for A/B testing, canary deployments, multi-armed bandits, and explainability (seldon.io).
+
+### Core Components
+
+| Component | Function | Description |
+|-----------|----------|-------------|
+| **Seldon Deploy** | Deployment management | UI and API for managing model deployments |
+| **Seldon Core** | Inference engine | Handles request routing, model execution, and response |
+| **Seldon Launcher** | Deployment orchestration | Creates Kubernetes resources for model deployments |
+| **Predictor** | Model wrapper | Wraps model code in a standard inference interface |
+| **Transformer** | Pre/post processing | Handles feature transformation and response formatting |
+| **Explainer** | Model explanation | Provides SHAP, LIME, or Anchor explanations |
+
+### Deployment Configuration Example
 
 ```yaml
-# SeldonDeployment for a Python model
 apiVersion: machinelearning.seldon.io/v1
 kind: SeldonDeployment
 metadata:
-  name: text-classifier
-  namespace: default
+  name: credit-risk-model
 spec:
   predictors:
-  - name: default
-    replicas: 2
+  - name: champion
+    replicas: 3
     graph:
-      name: classifier
-      implementation: UNKNOWN_IMPLEMENTATION
-      type: MODEL
+      name: credit-risk-model
+      implementation: XGBOOST_SERVER
+      modelUri: gs://my-bucket/models/credit-risk/v2.1
       children: []
     componentSpecs:
     - spec:
         containers:
-        - name: classifier
-          image: registry.example.com/text-classifier:latest
-          ports:
-          - containerPort: 5000
-            protocol: TCP
+        - name: credit-risk-model
           resources:
             requests:
               memory: "2Gi"
               cpu: "1"
-              nvidia.com/gpu: "1"
             limits:
               memory: "4Gi"
               cpu: "2"
-              nvidia.com/gpu: "1"
-          env:
-          - name: MODEL_PATH
-            value: "/models/text-classifier"
-          volumeMounts:
-          - name: model-volume
-            mountPath: /models
-        volumes:
-        - name: model-volume
-          persistentVolumeClaim:
-            claimName: model-storage-pvc
-    traffic: 100
-  annotations:
-    seldon.io/engine-image: seldonio/engine:1.17.0
-    seldon.io/serving-log-path: /logs
-```
-
-```python
-# Custom model class for Seldon
-class TextClassifier:
-    def __init__(self):
-        self.model = None
-        self.tokenizer = None
-        
-    def load(self):
-        """Load model artifacts"""
-        import torch
-        self.model = torch.load('/models/text-classifier/model.pt')
-        self.tokenizer = load_tokenizer('/models/text-classifier/tokenizer')
-        
-    def predict(self, X, features_names=None):
-        """Make predictions"""
-        import torch
-        
-        # Tokenize input
-        inputs = self.tokenizer(
-            X, 
-            padding=True, 
-            truncation=True, 
-            return_tensors="pt"
-        )
-        
-        # Run inference
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            predictions = torch.softmax(outputs.logits, dim=-1)
-        
-        return predictions.numpy()
-    
-    def feedback(self, X, Y, features_names=None):
-        """Handle feedback for online learning"""
-        # Store feedback for retraining
-        pass
-```
-
----
-
-## 8.3 A/B Testing & Canary Deployment
-
-### 8.3.1 A/B Testing Fundamentals
-
-🟢 **Beginner**
-
-A/B testing compares two versions of a model by splitting traffic between them to determine which performs better.
-
-```
-A/B Testing Setup:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐                                          │
-│  │   Incoming   │                                          │
-│  │   Traffic    │                                          │
-│  └──────┬───────┘                                          │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌──────────────┐                                          │
-│  │   A/B Test   │                                          │
-│  │   Router     │                                          │
-│  └──────┬───────┘                                          │
-│         │                                                   │
-│    ┌────┴────┐                                             │
-│    │         │                                              │
-│    ▼         ▼                                              │
-│  ┌──────┐ ┌──────┐                                        │
-│  │  A   │ │  B   │                                        │
-│  │(50%) │ │(50%) │                                        │
-│  │Control│ │Variant│                                       │
-│  └──┬───┘ └──┬───┘                                        │
-│     │        │                                             │
-│     ▼        ▼                                             │
-│  ┌──────┐ ┌──────┐                                        │
-│  │Track │ │Track │                                        │
-│  │Metrics│ │Metrics│                                       │
-│  └──────┘ └──────┘                                        │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌──────────────┐                                          │
-│  │  Statistical │                                          │
-│  │  Analysis    │                                          │
-│  └──────────────┘                                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 8.3.2 Statistical Significance in A/B Testing
-
-🔴 **Advanced**
-
-```python
-import numpy as np
-from scipy import stats
-
-class ABTestAnalyzer:
-    def __init__(self, confidence_level=0.95):
-        self.confidence_level = confidence_level
-    
-    def analyze_conversion_rate(
-        self, 
-        control_conversions, 
-        control_total,
-        variant_conversions, 
-        variant_total
-    ):
-        """Analyze A/B test for conversion rate"""
-        
-        # Calculate conversion rates
-        control_rate = control_conversions / control_total
-        variant_rate = variant_conversions / variant_total
-        
-        # Perform chi-squared test
-        contingency_table = np.array([
-            [control_conversions, control_total - control_conversions],
-            [variant_conversions, variant_total - variant_conversions]
-        ])
-        
-        chi2, p_value, _, _ = stats.chi2_contingency(contingency_table)
-        
-        # Calculate relative improvement
-        relative_improvement = (variant_rate - control_rate) / control_rate
-        
-        # Determine winner
-        is_significant = p_value < (1 - self.confidence_level)
-        winner = "variant" if variant_rate > control_rate else "control"
-        
-        return {
-            "control_rate": control_rate,
-            "variant_rate": variant_rate,
-            "relative_improvement": relative_improvement,
-            "p_value": p_value,
-            "is_significant": is_significant,
-            "winner": winner if is_significant else "inconclusive"
-        }
-    
-    def calculate_sample_size(
-        self, 
-        baseline_rate, 
-        minimum_detectable_effect,
-        power=0.8
-    ):
-        """Calculate required sample size"""
-        
-        alpha = 1 - self.confidence_level
-        z_alpha = stats.norm.ppf(1 - alpha/2)
-        z_beta = stats.norm.ppf(power)
-        
-        p1 = baseline_rate
-        p2 = baseline_rate * (1 + minimum_detectable_effect)
-        
-        sample_size = (
-            (z_alpha * np.sqrt(2 * p1 * (1 - p1)) + 
-             z_beta * np.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2 /
-            (p2 - p1) ** 2
-        )
-        
-        return int(np.ceil(sample_size))
-
-# Usage
-analyzer = ABTestAnalyzer(confidence_level=0.95)
-
-# Analyze results after test
-results = analyzer.analyze_conversion_rate(
-    control_conversions=450,
-    control_total=5000,
-    variant_conversions=480,
-    variant_total=5000
-)
-
-print(f"Control rate: {results['control_rate']:.2%}")
-print(f"Variant rate: {results['variant_rate']:.2%}")
-print(f"Relative improvement: {results['relative_improvement']:.2%}")
-print(f"P-value: {results['p_value']:.4f}")
-print(f"Significant: {results['is_significant']}")
-print(f"Winner: {results['winner']}")
-
-# Calculate required sample size
-sample_size = analyzer.calculate_sample_size(
-    baseline_rate=0.09,  # 9% baseline conversion
-    minimum_detectable_effect=0.10  # 10% relative improvement
-)
-print(f"Required sample size: {sample_size}")
-```
-
-### 8.3.3 Canary Deployment Implementation
-
-🟡 **Intermediate**
-
-```yaml
-# Seldon Core canary deployment
-apiVersion: machinelearning.seldon.io/v1
-kind: SeldonDeployment
-metadata:
-  name: text-classifier
-  namespace: default
-spec:
-  predictors:
-  - name: stable
-    replicas: 3
-    graph:
-      name: classifier
-      implementation: UNKNOWN_IMPLEMENTATION
-      type: MODEL
-      children: []
-    componentSpecs:
-    - spec:
-        containers:
-        - name: classifier
-          image: registry.example.com/text-classifier:v1.0
-          ports:
-          - containerPort: 5000
-    traffic: 90  # 90% traffic to stable version
-  
-  - name: canary
+  - name: challenger
     replicas: 1
     graph:
-      name: classifier
-      implementation: UNKNOWN_IMPLEMENTATION
-      type: MODEL
+      name: credit-risk-model-v3
+      implementation: XGBOOST_SERVER
+      modelUri: gs://my-bucket/models/credit-risk/v3.0
       children: []
-    componentSpecs:
-    - spec:
-        containers:
-        - name: classifier
-          image: registry.example.com/text-classifier:v2.0
-          ports:
-          - containerPort: 5000
-    traffic: 10  # 10% traffic to canary
 ```
 
-```bash
-# Monitor canary metrics
-kubectl logs -f -l seldon-deployment=text-classifier -n default
+### Multi-Model Serving
 
-# Gradually increase canary traffic
-kubectl patch seldondeployment text-classifier --type='json' -p='[
-  {"op": "replace", "path": "/spec/predictors/1/traffic", "value": 30},
-  {"op": "replace", "path": "/spec/predictors/0/traffic", "value": 70}
-]'
+Seldon Core supports serving multiple models in a single deployment, with a router directing requests to the appropriate model:
+
+```yaml
+graph:
+  name: router
+  implementation: RANDOM_ROUTER
+  children:
+  - name: model-a
+    modelUri: gs://bucket/model-a
+  - name: model-b
+    modelUri: gs://bucket/model-b
 ```
 
 ---
 
-## 8.4 Model Version Management
+## 8.4 A/B Testing for ML Models
 
-### 8.4.1 Version Management Strategies
+### The Statistics of Model Comparison
 
-🟡 **Intermediate**
+A/B testing for ML models is fundamentally different from A/B testing for UI changes. The key difference is that ML model comparison requires measuring prediction quality, not just click-through rates.
 
-```
-Model Versioning Architecture:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Model Registry                          │   │
-│  │                                                     │   │
-│  │  text-classifier                                    │   │
-│  │  ├── v1.0.0 (2024-01-15)                          │   │
-│  │  │   ├── Status: Production                        │   │
-│  │  │   ├── Accuracy: 0.945                           │   │
-│  │  │   ├── Artifact: s3://models/v1.0.0/model.pt     │   │
-│  │  │   └── Metadata: {...}                           │   │
-│  │  │                                                  │   │
-│  │  ├── v1.1.0 (2024-02-01)                          │   │
-│  │  │   ├── Status: Staging                           │   │
-│  │  │   ├── Accuracy: 0.952                           │   │
-│  │  │   ├── Artifact: s3://models/v1.1.0/model.pt     │   │
-│  │  │   └── Metadata: {...}                           │   │
-│  │  │                                                  │   │
-│  │  └── v1.2.0 (2024-02-15)                          │   │
-│  │      ├── Status: Development                       │   │
-│  │      ├── Accuracy: 0.948                           │   │
-│  │      ├── Artifact: s3://models/v1.2.0/model.pt     │   │
-│  │      └── Metadata: {...}                           │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### Sample Size Calculation
 
-### 8.4.2 Semantic Versioning for ML Models
-
-🔴 **Advanced**
+For comparing two models with binary outcomes (e.g., conversion rate):
 
 ```
-ML Model Versioning Scheme:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Format: MAJOR.MINOR.PATCH                                  │
-│                                                             │
-│  MAJOR: Breaking changes                                    │
-│  ├── New architecture                                       │
-│  ├── Different input format                                 │
-│  └── Incompatible API changes                               │
-│                                                             │
-│  MINOR: New features (backward compatible)                  │
-│  ├── Retrained with more data                               │
-│  ├── New preprocessing steps                                │
-│  └── Performance improvements                               │
-│                                                             │
-│  PATCH: Bug fixes                                           │
-│  ├── Fix preprocessing bug                                  │
-│  ├── Update dependencies                                    │
-│  └── Documentation updates                                  │
-│                                                             │
-│  Examples:                                                  │
-│  1.0.0 → 1.0.1: Fix data loading bug                       │
-│  1.0.0 → 1.1.0: Retrain with additional data               │
-│  1.0.0 → 2.0.0: Switch from BERT to RoBERTa                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+n = (Z_α/2 + Z_β)² × (p₁(1-p₁) + p₂(1-p₂)) / (p₁ - p₂)²
+
+Where:
+- n = sample size per group
+- Z_α/2 = 1.96 for 95% confidence
+- Z_β = 0.84 for 80% power
+- p₁ = baseline model conversion rate
+- p₂ = challenger model conversion rate
 ```
 
-### 8.4.3 Model Lineage Tracking
+**Example:**
+If the baseline model has a conversion rate of 5% and you want to detect a 10% relative improvement (5% → 5.5%):
 
-🟡 **Intermediate**
-
-```python
-import mlflow
-from mlflow.tracking import MlflowClient
-
-class ModelLineageTracker:
-    def __init__(self):
-        self.client = MlflowClient()
-    
-    def log_model_lineage(
-        self,
-        model_name: str,
-        model_version: str,
-        dataset_version: str,
-        training_code_commit: str,
-        hyperparameters: dict,
-        metrics: dict
-    ):
-        """Log complete model lineage"""
-        
-        # Create run
-        with mlflow.start_run(run_name=f"{model_name}-v{model_version}"):
-            # Log model info
-            mlflow.set_tag("model_name", model_name)
-            mlflow.set_tag("model_version", model_version)
-            mlflow.set_tag("dataset_version", dataset_version)
-            mlflow.set_tag("training_commit", training_code_commit)
-            
-            # Log hyperparameters
-            mlflow.log_params(hyperparameters)
-            
-            # Log metrics
-            mlflow.log_metrics(metrics)
-            
-            # Log model
-            mlflow.pytorch.log_model(model, "model")
-            
-            # Log dataset info
-            mlflow.log_param("dataset_path", dataset_path)
-            mlflow.log_param("dataset_size", len(dataset))
-            mlflow.log_param("train_size", len(train_dataset))
-            mlflow.log_param("val_size", len(val_dataset))
-    
-    def get_model_lineage(self, model_name: str, version: str):
-        """Retrieve complete model lineage"""
-        
-        model_versions = self.client.get_latest_versions(
-            model_name, 
-            stages=["Production"]
-        )
-        
-        for mv in model_versions:
-            run = self.client.get_run(mv.run_id)
-            
-            return {
-                "model_name": model_name,
-                "version": version,
-                "run_id": mv.run_id,
-                "dataset_version": run.data.tags.get("dataset_version"),
-                "training_commit": run.data.tags.get("training_commit"),
-                "hyperparameters": run.data.params,
-                "metrics": run.data.metrics,
-                "created_at": mv.creation_timestamp,
-            }
 ```
+n = (1.96 + 0.84)² × (0.05×0.95 + 0.055×0.945) / (0.05 - 0.055)²
+n = 7.84 × 0.0947 / 0.000025
+n ≈ 29,700 samples per group
+```
+
+At 1,000 predictions per day, this requires approximately 30 days of data collection.
+
+### Metrics for ML A/B Testing
+
+| Metric | What it Measures | When to Use |
+|--------|-----------------|-------------|
+| **AUC-ROC** | Discrimination ability | Classification models |
+| **RMSE / MAE** | Prediction accuracy | Regression models |
+| **Calibration error** | Probability reliability | Risk scoring, recommendation |
+| **Business KPI** | Actual impact | All models (with sufficient traffic) |
+| **Latency** | Serving performance | All production models |
+| **Fairness metrics** | Bias detection | Models affecting users |
+
+### Statistical Tests
+
+| Test | Data Type | Assumption | Use Case |
+|------|----------|------------|----------|
+| **Welch's t-test** | Continuous (RMSE) | Normal distribution | Regression model comparison |
+| **Mann-Whitney U** | Continuous (non-normal) | None | General model comparison |
+| **Chi-squared** | Binary (conversion) | Expected count > 5 | Classification model comparison |
+| **Bayesian A/B** | Any | Prior specification | When you need probability of superiority |
 
 ---
 
-## 8.5 Inference Optimization
+## 8.5 Canary Deployments
 
-### 8.5.1 Optimization Techniques Overview
+### How Canary Deployments Work
 
-🟡 **Intermediate**
+A canary deployment gradually routes traffic from the old model (champion) to the new model (challenger), monitoring for regressions at each stage.
 
 ```
-Inference Optimization Techniques:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Model-Level Optimizations:                                 │
-│  ├── Quantization (INT8/INT4)                              │
-│  ├── Pruning (Remove redundant weights)                    │
-│  ├── Knowledge Distillation (Large → Small)                │
-│  └── Model Architecture Optimization                       │
-│                                                             │
-│  Runtime Optimizations:                                     │
-│  ├── TensorRT (NVIDIA GPU optimization)                    │
-│  ├── ONNX Runtime (Cross-platform)                         │
-│  ├── OpenVINO (Intel optimization)                         │
-│  └── Core ML (Apple devices)                               │
-│                                                             │
-│  System-Level Optimizations:                                │
-│  ├── Batching (Dynamic/Static)                             │
-│  ├── Caching (Model/Feature)                               │
-│  ├── Load Balancing                                        │
-│  └── Auto-scaling                                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Stage 1: 95% champion / 5% challenger → Monitor for 24h
+Stage 2: 90% champion / 10% challenger → Monitor for 24h
+Stage 3: 75% champion / 25% challenger → Monitor for 48h
+Stage 4: 50% champion / 50% challenger → Monitor for 48h
+Stage 5: 0% champion / 100% challenger → Full rollout
 ```
 
-### 8.5.2 Model Quantization
+### Traffic Splitting in Seldon Core
 
-🔴 **Advanced**
+Seldon Core supports traffic splitting through its multi-predictor configuration:
 
-```python
-import torch
-from torch.quantization import quantize_dynamic
-
-class ModelQuantizer:
-    @staticmethod
-    def quantize_dynamic(model, dtype=torch.qint8):
-        """Dynamic quantization - quantize weights at load time"""
-        quantized_model = quantize_dynamic(
-            model,
-            {torch.nn.Linear, torch.nn.LSTM},
-            dtype=dtype
-        )
-        return quantized_model
-    
-    @staticmethod
-    def quantize_static(model, calibration_data, dtype=torch.qint8):
-        """Static quantization - quantize weights and activations"""
-        model.eval()
-        
-        # Prepare model for static quantization
-        model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-        model_prepared = torch.quantization.prepare(model)
-        
-        # Calibrate with sample data
-        with torch.no_grad():
-            for batch in calibration_data:
-                model_prepared(batch)
-        
-        # Convert to quantized model
-        model_quantized = torch.quantization.convert(model_prepared)
-        
-        return model_quantized
-    
-    @staticmethod
-    def measure_performance(original_model, quantized_model, test_data):
-        """Compare performance metrics"""
-        import time
-        
-        # Measure original model
-        start = time.time()
-        with torch.no_grad():
-            for batch in test_data:
-                original_model(batch)
-        original_time = time.time() - start
-        
-        # Measure quantized model
-        start = time.time()
-        with torch.no_grad():
-            for batch in test_data:
-                quantized_model(batch)
-        quantized_time = time.time() - start
-        
-        # Measure model size
-        import os
-        original_size = os.path.getsize('original_model.pt')
-        quantized_size = os.path.getsize('quantized_model.pt')
-        
-        return {
-            "original_time": original_time,
-            "quantized_time": quantized_time,
-            "speedup": original_time / quantized_time,
-            "original_size": original_size,
-            "quantized_size": quantized_size,
-            "compression_ratio": original_size / quantized_size,
-        }
-
-# Usage
-quantizer = ModelQuantizer()
-quantized_model = quantizer.quantize_dynamic(model)
-performance = quantizer.measure_performance(model, quantized_model, test_data)
-
-print(f"Speedup: {performance['speedup']:.2f}x")
-print(f"Compression: {performance['compression_ratio']:.2f}x")
+```yaml
+spec:
+  predictors:
+  - name: champion
+    traffic: 90
+    graph:
+      name: model-v2
+  - name: challenger
+    traffic: 10
+    graph:
+      name: model-v3
 ```
 
-### 8.5.3 Dynamic Batching
+### Automated Rollback Triggers
 
-🟡 **Intermediate**
-
-```python
-import asyncio
-from typing import List
-import numpy as np
-
-class DynamicBatcher:
-    def __init__(self, model, max_batch_size=32, max_wait_ms=10):
-        self.model = model
-        self.max_batch_size = max_batch_size
-        self.max_wait_ms = max_wait_ms
-        self.batch_queue = asyncio.Queue()
-    
-    async def predict(self, input_data):
-        """Single prediction request"""
-        future = asyncio.Future()
-        await self.batch_queue.put((input_data, future))
-        return await future
-    
-    async def batch_processor(self):
-        """Process batches from queue"""
-        while True:
-            batch = []
-            futures = []
-            
-            # Collect items for batch
-            try:
-                # Wait for first item
-                item = await asyncio.wait_for(
-                    self.batch_queue.get(), 
-                    timeout=self.max_wait_ms / 1000
-                )
-                batch.append(item[0])
-                futures.append(item[1])
-                
-                # Collect remaining items (up to max)
-                while len(batch) < self.max_batch_size:
-                    try:
-                        item = await asyncio.wait_for(
-                            self.batch_queue.get(),
-                            timeout=self.max_wait_ms / 1000
-                        )
-                        batch.append(item[0])
-                        futures.append(item[1])
-                    except asyncio.TimeoutError:
-                        break
-                
-                # Process batch
-                batch_tensor = np.array(batch)
-                predictions = self.model.predict(batch_tensor)
-                
-                # Return results to individual futures
-                for i, future in enumerate(futures):
-                    future.set_result(predictions[i])
-                    
-            except asyncio.TimeoutError:
-                continue
-
-# Usage
-batcher = DynamicBatcher(model, max_batch_size=32, max_wait_ms=10)
-
-async def main():
-    # Start batch processor
-    processor_task = asyncio.create_task(batcher.batch_processor())
-    
-    # Make concurrent predictions
-    results = await asyncio.gather(
-        batcher.predict(input1),
-        batcher.predict(input2),
-        batcher.predict(input3),
-    )
-    
-    return results
-```
+| Metric | Threshold | Action |
+|--------|-----------|--------|
+| Latency p99 | > 2x baseline | Automatic rollback |
+| Error rate | > 1% increase | Automatic rollback |
+| Business metric | < 5% degradation for 1h | Alert, manual decision |
+| Business metric | > 10% degradation for 30min | Automatic rollback |
 
 ---
 
-## 8.6 Edge Deployment Strategy
+## 8.6 Case Study: How Stripe Deploys ML Models
 
-### 8.6.1 Edge Deployment Challenges
+> 💡 **Case Study: Stripe's ML Deployment Infrastructure**
 
-🟢 **Beginner**
+Stripe processes hundreds of billions of dollars in payments annually and uses ML extensively for fraud detection, risk scoring, and payment optimization. Their deployment infrastructure, described in public engineering blog posts (stripe.com/blog/engineering), reveals several key patterns.
 
-```
-Edge Deployment Challenges:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Resource Constraints:                                      │
-│  ├── Limited compute power                                  │
-│  ├── Limited memory                                         │
-│  ├── Limited storage                                        │
-│  └── Limited power (battery devices)                        │
-│                                                             │
-│  Network Constraints:                                       │
-│  ├── Intermittent connectivity                              │
-│  ├── High latency                                           │
-│  └── Limited bandwidth                                      │
-│                                                             │
-│  Operational Constraints:                                   │
-│  ├── Remote updates                                         │
-│  ├── Monitoring and debugging                               │
-│  └── Security requirements                                  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Scale:**
+- Processes payments for millions of businesses globally
+- ML models make real-time fraud and risk decisions for every transaction
+- Latency requirements: decisions must be made in < 100ms to avoid impacting checkout experience
+- Must maintain extremely high reliability (99.99%+ uptime for payment processing)
 
-### 8.6.2 Edge Deployment Architecture
+**Deployment Architecture (from public descriptions):**
 
-🟡 **Intermediate**
+1. **Shadow mode deployment**: Before any model goes live, it runs in shadow mode, processing real requests but its predictions are not used for actual decisions. This allows offline evaluation on real production traffic without any risk.
 
-```
-Edge Deployment Architecture:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Cloud                                    │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │   │
-│  │  │ Training │  │ Model    │  │ Edge Management  │ │   │
-│  │  │ Platform │  │ Registry │  │ Platform         │ │   │
-│  │  └──────────┘  └──────────┘  └──────────────────┘ │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│                         │ (Model sync)                      │
-│                         ▼                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Edge Network                            │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Edge     │  │ Edge     │  │ Edge     │         │   │
-│  │  │ Device 1 │  │ Device 2 │  │ Device 3 │         │   │
-│  │  │ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │         │   │
-│  │  │ │Model │ │  │ │Model │ │  │ │Model │ │         │   │
-│  │  │ │(Lite)│ │  │ │(Lite)│ │  │ │(Full)│ │         │   │
-│  │  │ └──────┘ │  │ └──────┘ │  │ └──────┘ │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+2. **Gradual traffic ramp**: Stripe uses a carefully controlled traffic ramp from 0% to 100% over days to weeks, depending on the model's criticality. Each stage includes automated checks on:
+   - Prediction latency
+   - Error rates
+   - Feature drift (distribution of input features)
+   - Model output distribution
+   - Business metrics (fraud rate, false positive rate)
 
-### 8.6.3 Model Optimization for Edge
+3. **Feature store integration**: Stripe maintains a feature store that serves both training and serving. This eliminates training-serving skew, which is one of the most common causes of model performance degradation in production.
 
-🔴 **Advanced**
+4. **Multi-model ensemble serving**: For critical decisions like fraud detection, Stripe runs multiple models in parallel and combines their predictions. This provides redundancy (if one model degrades, others compensate) and improved accuracy.
 
-```python
-import tensorflow as tf
+5. **Automated rollback**: If any automated check fails during the ramp, the deployment automatically rolls back to the previous version. Human intervention is only required for edge cases that automated checks don't catch.
 
-class EdgeModelOptimizer:
-    def __init__(self):
-        self.converter = None
-    
-    def convert_to_tflite(self, model_path, quantization='dynamic'):
-        """Convert model to TensorFlow Lite"""
-        
-        # Load model
-        model = tf.keras.models.load_model(model_path)
-        
-        # Convert to TFLite
-        self.converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        
-        if quantization == 'dynamic':
-            self.converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        elif quantization == 'float16':
-            self.converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            self.converter.target_spec.supported_types = [tf.float16]
-        elif quantization == 'int8':
-            self.converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            self.converter.representative_dataset = self._representative_dataset
-            self.converter.target_spec.supported_ops = [
-                tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-            ]
-            self.converter.inference_input_type = tf.int8
-            self.converter.inference_output_type = tf.int8
-        
-        tflite_model = self.converter.convert()
-        
-        # Save model
-        output_path = model_path.replace('.h5', '.tflite')
-        with open(output_path, 'wb') as f:
-            f.write(tflite_model)
-        
-        return output_path
-    
-    def optimize_for_mobile(self, model_path):
-        """Optimize model for mobile deployment"""
-        
-        # Convert to TFLite
-        tflite_path = self.convert_to_tflite(model_path, quantization='int8')
-        
-        # Get model size
-        import os
-        original_size = os.path.getsize(model_path)
-        optimized_size = os.path.getsize(tflite_path)
-        
-        return {
-            "tflite_path": tflite_path,
-            "original_size_mb": original_size / (1024 * 1024),
-            "optimized_size_mb": optimized_size / (1024 * 1024),
-            "compression_ratio": original_size / optimized_size,
-        }
+**Key Insight:**
+Stripe's approach emphasizes the importance of **observing real production behavior** before committing to a model change. Shadow mode deployment is an expensive but highly valuable practice for high-stakes ML applications. The cost of running a model in shadow mode is roughly 2x the serving cost, but it prevents potentially catastrophic failures.
 
-# Usage
-optimizer = EdgeModelOptimizer()
-result = optimizer.optimize_for_mobile('model.h5')
-
-print(f"TFLite model saved to: {result['tflite_path']}")
-print(f"Original size: {result['original_size_mb']:.2f} MB")
-print(f"Optimized size: {result['optimized_size_mb']:.2f} MB")
-print(f"Compression ratio: {result['compression_ratio']:.2f}x")
-```
+**Lessons for practitioners:**
+- Shadow mode is the safest way to evaluate model changes on real traffic
+- Automated rollback is essential for high-reliability systems
+- Feature store integration eliminates a major source of silent failures
+- Gradual ramp with multiple safety checks is more reliable than big-bang deployments
 
 ---
 
-## 💡 Case Study: Seldon Core Model Serving
+## 8.7 War Story: Canary Deployment Gone Wrong
 
-### Architecture Overview
+> ⚠️ **War Story: The Canary That Ate the Production System**
 
-```
-Seldon Core Production Deployment:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Load Balancer (nginx)                   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              Seldon Core API Gateway                  │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Request Router                              │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ Rate     │  │ Auth     │  │ Routing  │  │   │   │
-│  │  │  │ Limiter  │  │ Checker  │  │ Logic    │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              Model Deployments                        │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Production Model (v1.0)                     │   │   │
-│  │  │  Replicas: 3                                 │   │   │
-│  │  │  Traffic: 100%                               │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ Pod 1    │  │ Pod 2    │  │ Pod 3    │  │   │   │
-│  │  │  │ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │  │   │   │
-│  │  │  │ │Model │ │  │ │Model │ │  │ │Model │ │  │   │   │
-│  │  │  │ │v1.0  │ │  │ │v1.0  │ │  │ │v1.0  │ │  │   │   │
-│  │  │  │ └──────┘ │  │ └──────┘ │  │ └──────┘ │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Canary Model (v2.0)                        │   │   │
-│  │  │  Replicas: 1                                │   │   │
-│  │  │  Traffic: 0% (canary testing)               │   │   │
-│  │  │  ┌──────────┐                               │   │   │
-│  │  │  │ Pod 1    │                               │   │   │
-│  │  │  │ ┌──────┐ │                               │   │   │
-│  │  │  │ │Model │ │                               │   │   │
-│  │  │  │ │v2.0  │ │                               │   │   │
-│  │  │  │ └──────┘ │                               │   │   │
-│  │  │  └──────────┘                               │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Monitoring Stack                        │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │   │
-│  │  │Prometheus│  │ Grafana  │  │ Seldon Analytics │ │   │
-│  │  │          │  │Dashboard │  │                  │ │   │
-│  │  └──────────┘  └──────────┘  └──────────────────┘ │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Company:** A large e-commerce platform (anonymized)
+**Model:** Product recommendation model serving the homepage
+**Timeframe:** 2023
 
-### Deployment Instructions
+**Background:**
+The company deployed a new recommendation model using a canary deployment strategy. The new model showed a 15% improvement in click-through rate on offline evaluation. The deployment plan was:
 
-```bash
-# 1. Install Seldon Core
-kubectl create namespace seldon-system
-helm install seldon-core seldon-core-operator \
-  --repo https://storage.googleapis.com/seldon-charts \
-  --namespace seldon-system \
-  --set usageMetrics.enabled=true \
-  --set istio.enabled=true
+- Day 1: 5% traffic to new model
+- Day 2: 10% traffic
+- Day 3: 25% traffic
+- Day 4: 50% traffic
+- Day 5: 100% traffic
 
-# 2. Create model deployment
-kubectl apply -f seldondeployment.yaml
+**What went wrong:**
 
-# 3. Verify deployment
-kubectl get seldondeployment text-classifier -o yaml
+**Day 1 (5% traffic):** Everything looked good. CTR improved by 12% on the 5% traffic slice. No latency or error issues.
 
-# 4. Port-forward for testing
-kubectl port-forward svc/text-classifier-default 8000:8000
+**Day 2 (10% traffic):** CTR improvement held at 11%. However, a subtle issue emerged: the new model was recommending a different distribution of products. Specifically, it was recommending more products from a category that had recently experienced supply chain issues. This was not detected because the monitoring focused on CTR, not inventory availability.
 
-# 5. Test prediction
-curl -X POST http://localhost:8000/api/v1.0/predictions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "data": {
-      "ndarray": ["This is a great product!"]
-    }
-  }'
+**Day 3 (25% traffic):** The inventory issue became visible. Products recommended by the new model were frequently out of stock, leading to a poor user experience. Customer complaints increased by 300%. However, CTR still looked good because users were clicking on recommended products (even if they were out of stock).
 
-# 6. Check metrics
-kubectl port-forward svc/prometheus 9090:9090
-# Access Grafana dashboard
-kubectl port-forward svc/grafana 3000:3000
-```
+**Day 4 (50% traffic):** The operations team noticed the customer complaints and investigated. They discovered the canary deployment had introduced a model that was not aligned with current inventory levels. By this point, significant damage had been done:
+- Customer satisfaction scores dropped 15 points
+- Cart abandonment rate increased 8%
+- Revenue for the affected category dropped 25%
 
-### Monitoring Dashboard
+**Day 5 (attempted rollback):** The team attempted to roll back, but the rollback mechanism had a bug — it was configured to route traffic based on user ID hash, which meant some users were still getting the new model even after "rollback." This took another 4 hours to fully resolve.
 
-```
-Grafana Dashboard: Seldon Core Model Serving
-┌─────────────────────────────────────────────────────────────┐
-│  Model: text-classifier                                     │
-│  Version: v1.0                                              │
-│  Status: Healthy ✓                                          │
-│                                                             │
-│  Request Metrics:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Total Requests:    15,234                          │   │
-│  │  Requests/sec:      42.3                            │   │
-│  │  Success Rate:      99.8%                           │   │
-│  │  Error Rate:        0.2%                            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Latency Distribution:                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  P50:      23ms                                    │   │
-│  │  P90:      45ms                                    │   │
-│  │  P95:      67ms                                    │   │
-│  │  P99:      123ms                                   │   │
-│  │  Max:      234ms                                   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Resource Usage:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  CPU:       ████████████░░░░░░░░ 60%               │   │
-│  │  Memory:    ████████░░░░░░░░░░░░ 40%               │   │
-│  │  GPU:       ██████████████░░░░░░ 70%               │   │
-│  │  Network:   ██████░░░░░░░░░░░░░░ 30%               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Model Performance:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Accuracy:      0.945                               │   │
-│  │  Latency:       23ms (avg)                          │   │
-│  │  Throughput:    42.3 req/s                          │   │
-│  │  Error Rate:    0.2%                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Root causes:**
+1. **Incomplete metrics**: The canary evaluation focused on CTR but did not monitor inventory-aware metrics
+2. **Insufficient validation period**: 1 day at 5% was not enough to detect supply chain interactions
+3. **Rollback mechanism bug**: The rollback was not tested end-to-end before the deployment
+4. **No offline validation with production constraints**: The offline evaluation did not account for inventory availability
+
+**The fix:**
+- Added inventory-aware metrics to the canary monitoring
+- Extended the canary evaluation period to 7 days minimum
+- Implemented blue-green deployment instead of traffic splitting for the rollback mechanism
+- Added a pre-deployment validation step that checks model recommendations against current inventory
 
 ---
 
-## Summary
+## 8.8 Edge Deployment Patterns
 
-**Key Takeaways:**
+### When Edge Deployment is Necessary
 
-1. **Deployment strategy** depends on risk tolerance, downtime requirements, and traffic splitting needs
-2. **Model serving architecture** should support versioning, A/B testing, and auto-scaling
-3. **A/B testing** requires statistical rigor to make valid conclusions
-4. **Model version management** is critical for rollback and reproducibility
-5. **Inference optimization** can dramatically reduce latency and cost
-6. **Edge deployment** requires careful model optimization and management
+| Scenario | Latency Requirement | Network | Example |
+|----------|-------------------|---------|---------|
+| Autonomous vehicles | < 10ms | Intermittent | Self-driving cars |
+| Industrial IoT | < 50ms | Limited | Manufacturing quality control |
+| Mobile apps | < 100ms | Variable | On-device image recognition |
+| Remote locations | < 200ms | Satellite | Agricultural monitoring |
 
-**Next Chapter Preview:**
-In Chapter 9, we'll explore **Model Monitoring & Observability**, covering drift detection, performance monitoring, and building comprehensive observability platforms.
+### Edge Serving Frameworks
+
+| Framework | Model Format | Hardware Support | Size |
+|-----------|-------------|-----------------|------|
+| **TensorFlow Lite** | TFLite | Mobile, Edge TPUs | < 5MB runtime |
+| **ONNX Runtime** | ONNX | CPU, GPU, NPU | < 10MB runtime |
+| **TensorRT** | TRT | NVIDIA GPUs | < 50MB runtime |
+| **OpenVINO** | IR | Intel CPUs, VPUs | < 100MB runtime |
+| **Core ML** | MLModel | Apple Neural Engine | iOS/macOS only |
+
+### Model Optimization for Edge
+
+| Technique | Size Reduction | Accuracy Impact | Implementation |
+|-----------|---------------|-----------------|----------------|
+| Quantization (INT8) | 4x | 1-3% drop | Post-training or quantization-aware training |
+| Pruning | 2-10x | 1-5% drop | Structured or unstructured |
+| Knowledge Distillation | Variable | 2-8% drop | Teacher-student training |
+| Model Architecture Search | Variable | Can improve | Hardware-aware NAS |
 
 ---
 
-*End of Chapter 8*
+## 8.9 When to Use / When Not to Use
+
+### When to Use Each Pattern
+
+| Pattern | Best For | When to Use |
+|---------|----------|-------------|
+| **Online serving** | Real-time decisions | User-facing applications requiring < 100ms latency |
+| **Batch serving** | Scheduled predictions | Recommendations updated hourly/daily, risk scoring |
+| **Hybrid serving** | Complex pipelines | Recommendation systems, real-time with pre-computed features |
+| **Edge serving** | Offline/low-latency | Mobile apps, IoT, autonomous systems |
+| **A/B testing** | Model comparison | When you need statistical evidence of improvement |
+| **Canary deployment** | Risk mitigation | Any production model update with business impact |
+
+### When Not to Use
+
+| Pattern | When to Avoid | Why |
+|---------|--------------|-----|
+| **Online serving** | Predictions needed once daily | Batch is more cost-effective |
+| **Batch serving** | Real-time user interaction | Latency too high |
+| **A/B testing** | Model is safety-critical (medical) | Ethical concerns with randomized experiments |
+| **Canary deployment** | Model must be instant-deployed | Canary takes days/weeks |
+| **Edge serving** | Model requires full GPU | Edge devices have limited compute |
+| **Complex serving** | Simple regression model | Over-engineering increases maintenance burden |
+
+---
+
+## 8.10 Summary
+
+Model deployment architecture is the bridge between model development and business impact. The key patterns are:
+
+1. **Online serving** for real-time decisions with strict latency requirements
+2. **Batch serving** for scheduled predictions where latency is not critical
+3. **Hybrid serving** for complex pipelines requiring both real-time and batch
+4. **Canary and A/B testing** for safe, statistically rigorous model evaluation
+
+Seldon Core provides a production-grade serving platform with built-in support for these patterns. The case studies from Stripe and the war story demonstrate that deployment success depends on comprehensive monitoring, automated rollback, and thorough offline validation.
+
+---
+
+## 8.11 Discussion Questions
+
+1. **Serving Architecture**: You are designing a fraud detection system for a payment processor. The model must evaluate every transaction in < 50ms. Design the serving architecture, including what you would batch vs. serve online.
+
+2. **A/B Testing Design**: A recommendation model shows a 5% improvement in offline AUC-ROC. How would you design the online A/B test to validate this improvement? What sample size do you need?
+
+3. **Canary Deployment Strategy**: A model serving 10M requests/day needs to be updated. Design a canary deployment plan that balances risk mitigation with deployment speed.
+
+4. **Edge vs. Cloud**: You are building an image classification system for a factory floor with 100 cameras. Each camera needs < 20ms inference latency. Should you deploy models on edge devices or in the cloud?
+
+5. **Rollback Design**: Design a rollback mechanism that can switch from a new model to the old model within 30 seconds, for a model serving 100K QPS.
+
+---
+
+## 8.12 Exercises
+
+### Exercise 1: Serving Architecture Design
+
+Design a complete serving architecture for a product recommendation system that:
+- Serves 50M users with < 100ms latency
+- Requires both candidate generation (batch) and ranking (real-time)
+- Must handle model updates without downtime
+- Budget: $50K/month for serving infrastructure
+
+**Tasks:**
+1. Draw the architecture diagram
+2. Select serving technologies (Seldon Core, KServe, or cloud-managed)
+3. Estimate the infrastructure cost
+4. Design the model update process
+
+### Exercise 2: A/B Test Analysis
+
+You run an A/B test for 2 weeks with the following results:
+- Control (old model): 10,000 conversions out of 200,000 impressions (5.0%)
+- Treatment (new model): 1,080 conversions out of 20,000 impressions (5.4%)
+
+**Tasks:**
+1. Calculate the statistical significance (p-value)
+2. Calculate the 95% confidence interval for the difference
+3. Determine if the test has sufficient power
+4. Make a recommendation: deploy or continue testing?
+
+### Exercise 3: Edge Deployment Optimization
+
+You need to deploy a ResNet-50 model on edge devices for image classification. The model is 100MB and takes 50ms per inference on CPU.
+
+**Tasks:**
+1. Apply quantization to reduce model size
+2. Benchmark the quantized model for accuracy and latency
+3. Design the update mechanism for pushing new model versions to edge devices
+4. Estimate the storage and bandwidth requirements for 1,000 edge devices
+
+---
+
+## 8.13 References
+
+- **Seldon Core Documentation**: https://docs.seldon.io/projects/seldon-core/en/latest/
+- **KServe (formerly KFServing)**: https://kserve.github.io/website/
+- **Kubeflow Serving**: https://www.kubeflow.org/docs/components/kfserving/
+- **Stripe Engineering Blog**: https://stripe.com/blog/engineering
+- **Google ML Serving**: https://cloud.google.com/ai-platform/prediction/docs
+- **NVIDIA Triton Inference Server**: https://developer.nvidia.com/nvidia-triton-inference-server
+- **TensorFlow Serving**: https://www.tensorflow.org/tfx/guide/serving
+- **ONNX Runtime**: https://onnxruntime.ai/
+- **Seldon Case Studies**: https://www.seldon.io/case-studies
+- **Google Canaary Analysis**: https://research.google/pubs/pub46388/
+- **ML A/B Testing Best Practices**: https://research.google/pubs/pub45998/

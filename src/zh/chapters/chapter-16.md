@@ -1,788 +1,313 @@
-# 第16章：AI 平台架构
+# 第16章：AI平台架构
 
-🟢 入门 | 🟡 中级 | 🔴 高级 | ⚫ 管理者
+## 学习目标
 
----
+完成本章学习后，你将能够：
 
-## 16.1 统一 AI 平台设计
-
-### 平台愿景
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                统一 AI 平台架构                                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  用户界面层                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Web UI  │  │  CLI     │  │  API     │  │SDK   │  │   │
-│  │  │仪表板    │  │  工具    │  │  网关    │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                平台服务层                                 │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │实验跟踪  │  │  模型    │  │ 管道     │  │数据  │  │   │
-│  │  │          │  │  注册表  │  │ 编排     │  │管理  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │特征存储  │  │  模型    │  │训练      │  │监控  │  │   │
-│  │  │          │  │  服务    │  │ 服务     │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              基础设施层                                   │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │Kubernetes│  │  GPU     │  │ 存储     │  │网络  │  │   │
-│  │  │集群      │  │  池      │  │  系统    │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 核心组件
-
-📌 **关键概念**：统一 AI 平台提供从数据摄取到模型部署和监控的端到端 ML 生命周期管理。
-
-```yaml
-# 平台核心组件
-platform_components:
-  data_layer:
-    - name: "数据湖"
-      technology: "S3/ADLS/GCS"
-      purpose: "原始数据存储"
-    - name: "特征存储"
-      technology: "Feast/Tecton"
-      purpose: "特征管理"
-    - name: "数据版本控制"
-      technology: "DVC/Pachyderm"
-      purpose: "数据血缘"
-  
-  training_layer:
-    - name: "实验跟踪"
-      technology: "MLflow/W&B"
-      purpose: "实验管理"
-    - name: "训练服务"
-      technology: "Kubeflow/Ray"
-      purpose: "分布式训练"
-    - name: "超参数调优"
-      technology: "Optuna/Ray Tune"
-      purpose: "HPO"
-  
-  serving_layer:
-    - name: "模型注册表"
-      technology: "MLflow Registry"
-      purpose: "模型版本控制"
-    - name: "模型服务"
-      technology: "KServe/Seldon"
-      purpose: "推理"
-    - name: "批量推理"
-      technology: "Spark/Flink"
-      purpose: "离线预测"
-  
-  monitoring_layer:
-    - name: "模型监控"
-      technology: "Evidently/WhyLabs"
-      purpose: "数据/模型漂移"
-    - name: "基础设施监控"
-      technology: "Prometheus/Grafana"
-      purpose: "系统指标"
-    - name: "告警"
-      technology: "Alertmanager/PagerDuty"
-      purpose: "事件响应"
-```
+1. 设计一个统一的AI平台，支持从数据摄取到模型部署的完整生命周期
+2. 实现自助式AI平台模式，使没有基础设施专业知识的数据科学家能够工作
+3. 评估AI平台组件的自建与购买决策
+4. 架构平台治理，在灵活性与运营稳定性之间取得平衡
+5. 避免AI平台开发中的常见失败模式，包括过度工程
 
 ---
 
-## 16.2 多模型管理
+## 16.1 引言：什么是AI平台？
 
-### 模型注册表架构
+AI平台是一组集成的工具和服务，使数据科学家和ML工程师能够以最小的摩擦开发、训练、部署和监控机器学习模型。它抽象了基础设施复杂性，使从业者可以专注于模型质量而不是集群管理。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                 模型注册表架构                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    模型注册表                             │   │
-│  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │                 模型存储                         │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐     │   │   │
-│  │  │  │模型 A    │  │模型 B    │  │模型 C    │     │   │   │
-│  │  │  │v1.0.0   │  │v2.1.0   │  │v1.5.0   │     │   │   │
-│  │  │  │Staging   │  │Production│  │Archived  │     │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘     │   │   │
-│  │  └─────────────────────────────────────────────────┘   │   │
-│  │                                                         │   │
-│  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │              模型元数据                         │   │   │
-│  │  │  • 模型名称、版本、描述                          │   │   │
-│  │  │  • 训练指标（准确率、损失等）                    │   │   │
-│  │  │  • 超参数                                        │   │   │
-│  │  │  • 数据血缘                                      │   │   │
-│  │  │  • 依赖项（框架、CUDA 版本）                     │   │   │
-│  │  │  • 制品（权重、配置、分词器）                    │   │   │
-│  │  └─────────────────────────────────────────────────┘   │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+"AI平台"一词是刻意宽泛的。它包含特征存储、实验跟踪、模型注册表、训练基础设施、服务基础设施和监控——所有这些通过定义良好的API和工作流连接。
 
-### MLflow 模型注册表设置
+**平台为什么重要：** 没有平台，每个团队都重新发明轮子。他们构建临时训练脚本，手动管理GPU集群，创建自定义部署管道，并编写定制的监控仪表板。这种重复浪费工程时间并产生不一致、脆弱的系统。
 
-```yaml
-# Kubernetes 上的 MLflow 部署
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mlflow-server
-  namespace: ai-platform
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: mlflow-server
-  template:
-    metadata:
-      labels:
-        app: mlflow-server
-    spec:
-      containers:
-      - name: mlflow
-        image: mlflow/mlflow:2.8.0
-        command:
-        - mlflow
-        - server
-        - --host=0.0.0.0
-        - --port=5000
-        - --backend-store-uri=postgresql://mlflow:password@mlflow-db:5432/mlflow
-        - --default-artifact-root=s3://mlflow-artifacts/
-        - --serve-artifacts
-        env:
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: aws-credentials
-              key: access-key
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: aws-credentials
-              key: secret-key
-        ports:
-        - containerPort: 5000
-        resources:
-          requests:
-            memory: "2Gi"
-            cpu: "1"
-          limits:
-            memory: "4Gi"
-            cpu: "2"
----
-# 用于 MLflow 后端的 PostgreSQL
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: mlflow-db
-  namespace: ai-platform
-spec:
-  serviceName: mlflow-db
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mlflow-db
-  template:
-    metadata:
-      labels:
-        app: mlflow-db
-    spec:
-      containers:
-      - name: postgres
-        image: postgres:15
-        env:
-        - name: POSTGRES_DB
-          value: mlflow
-        - name: POSTGRES_USER
-          value: mlflow
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: mlflow-db-secret
-              key: password
-        ports:
-        - containerPort: 5432
-  volumeClaimTemplates:
-  - metadata:
-      name: postgres-data
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 50Gi
-```
-
-### 模型版本管理工作流
-
-```python
-# MLflow 模型注册工作流
-import mlflow
-from mlflow.tracking import MlflowClient
-
-# 初始化 MLflow
-mlflow.set_tracking_uri("http://mlflow-server:5000")
-client = MlflowClient()
-
-def register_model(model_path, model_name, metrics, params):
-    """在 MLflow 中注册新模型版本。"""
-    
-    # 记录模型
-    model_info = mlflow.sklearn.log_model(
-        model_path,
-        artifact_path="model",
-        registered_model_name=model_name
-    )
-    
-    # 记录指标
-    for key, value in metrics.items():
-        mlflow.log_metric(key, value)
-    
-    # 记录参数
-    for key, value in params.items():
-        mlflow.log_param(key, value)
-    
-    # 获取模型版本
-    model_versions = client.search_model_versions(
-        f"name='{model_name}'"
-    )
-    
-    latest_version = max(
-        [int(v.version) for v in model_versions]
-    )
-    
-    return latest_version
-
-def promote_model(model_name, version, stage):
-    """将模型提升到新阶段。"""
-    client.transition_model_version_stage(
-        name=model_name,
-        version=version,
-        stage=stage
-    )
-    
-    # 添加描述
-    client.update_model_version(
-        name=model_name,
-        version=version,
-        description=f"模型已提升至 {stage}"
-    )
-
-def compare_models(model_name, version1, version2):
-    """比较两个模型版本。"""
-    v1 = client.get_model_version(model_name, version1)
-    v2 = client.get_model_version(model_name, version2)
-    
-    # 获取运行信息
-    run1 = client.get_run(v1.run_id)
-    run2 = client.get_run(v2.run_id)
-    
-    comparison = {
-        "version1": {
-            "version": version1,
-            "metrics": run1.data.metrics,
-            "params": run1.data.params
-        },
-        "version2": {
-            "version": version2,
-            "metrics": run2.data.metrics,
-            "params": run2.data.params
-        }
-    }
-    
-    return comparison
-```
+> **📌 真实数据框**
+> Uber的**Michelangelo**平台于2017年推出，是Uber ML基础设施的支柱，支持生产中超过**1,000个模型**，涵盖乘车定价、ETA预测、欺诈检测和自动驾驶。该平台在峰值负载时每秒处理**5000万+次预测**（Uber Engineering Blog）。
 
 ---
 
-## 16.3 工作流编排
+## 16.2 AI平台架构模式
 
-### Kubeflow Pipelines 架构
+### 模式1：分层架构
+
+最常见的AI平台架构将组件组织为水平层：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Kubeflow Pipelines 架构                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  管道组件                                 │   │
-│  │                                                         │   │
-│  │  ┌──────────┐     ┌──────────┐     ┌──────────┐       │   │
-│  │  │  数据    │────→│  训练    │────→│  评估    │       │   │
-│  │  │  处理    │     │          │     │          │       │   │
-│  │  └──────────┘     └──────────┘     └──────────┘       │   │
-│  │       │               │                  │             │   │
-│  │       ▼               ▼                  ▼             │   │
-│  │  ┌──────────┐     ┌──────────┐     ┌──────────┐       │   │
-│  │  │  特征    │     │  超参数  │     │  模型    │       │   │
-│  │  │  存储    │     │  调优    │     │  注册表  │       │   │
-│  │  └──────────┘     └──────────┘     └──────────┘       │   │
-│  │                                            │           │   │
-│  │                                            ▼           │   │
-│  │                                      ┌──────────┐     │   │
-│  │                                      │  部署    │     │   │
-│  │                                      │          │     │   │
-│  │                                      └──────────┘     │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│            开发者接口层                      │
+│    （IDE、CLI、SDK、Web UI、Notebooks）      │
+├─────────────────────────────────────────────┤
+│            编排层                            │
+│   （工作流引擎、调度、触发器）               │
+├─────────────────────────────────────────────┤
+│            ML框架层                          │
+│  （训练、服务、特征存储、注册表）            │
+├─────────────────────────────────────────────┤
+│            基础设施层                        │
+│   （Kubernetes、GPU池、存储、网络）          │
+├─────────────────────────────────────────────┤
+│            可观测性层                        │
+│    （监控、日志、告警、追踪）                │
+└─────────────────────────────────────────────┘
 ```
 
-### 管道定义示例
+**层职责：**
 
-```python
-# 使用 Kubeflow 的完整 ML 管道
-import kfp
-from kfp import dsl
-from kfp.components import load_component_from_file
+| 层 | 组件 | 关键设计决策 |
+|----|------|------------|
+| 开发者接口 | JupyterHub、VS Code扩展、CLI工具 | 必须是数据科学家熟悉的 |
+| 编排 | Airflow、Kubeflow Pipelines、Argo | 基于DAG vs 事件驱动 |
+| ML框架 | MLflow、Kubeflow、KServe、Feast | 开源 vs 托管 |
+| 基础设施 | Kubernetes、Terraform、云服务 | 多云 vs 单云 |
+| 可观测性 | Prometheus、Grafana、自定义仪表板 | ML指标 vs 基础设施指标 |
 
-# 加载组件定义
-data_processing = load_component_from_file('components/data_processing.yaml')
-feature_engineering = load_component_from_file('components/feature_engineering.yaml')
-model_training = load_component_from_file('components/model_training.yaml')
-model_evaluation = load_component_from_file('components/model_evaluation.yaml')
-model_deployment = load_component_from_file('components/model_deployment.yaml')
+### 模式2：面向服务架构
 
-@dsl.pipeline(
-    name='ML 训练管道',
-    description='用于图像分类的端到端 ML 管道',
-    pipeline_root='gs://my-bucket/pipelines'
-)
-def ml_pipeline(
-    dataset_path: str,
-    model_name: str = 'image_classifier',
-    num_epochs: int = 100,
-    learning_rate: float = 0.001,
-    batch_size: int = 32,
-    deploy_threshold: float = 0.85
-):
-    # 步骤 1：数据处理
-    data_task = data_processing(
-        input_path=dataset_path,
-        output_path='/tmp/processed_data'
-    )
-    
-    # 步骤 2：特征工程
-    feature_task = feature_engineering(
-        input_data=data_task.outputs['output_path'],
-        output_path='/tmp/features'
-    )
-    
-    # 步骤 3：使用超参数调优进行模型训练
-    training_task = model_training(
-        train_data=feature_task.outputs['output_path'],
-        num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        batch_size=batch_size
-    )
-    
-    # 步骤 4：模型评估
-    eval_task = model_evaluation(
-        model=training_task.outputs['model'],
-        test_data=feature_task.outputs['output_path'],
-        metrics=['accuracy', 'precision', 'recall', 'f1']
-    )
-    
-    # 步骤 5：条件部署
-    with dsl.Condition(eval_task.outputs['accuracy'] > deploy_threshold):
-        deploy_task = model_deployment(
-            model=training_task.outputs['model'],
-            model_name=model_name,
-            serving_config={
-                'replicas': 2,
-                'resources': {
-                    'cpu': '2',
-                    'memory': '4Gi',
-                    'gpu': '1'
-                }
-            }
-        )
+将平台组织为具有定义良好API的独立服务：
 
-# 编译管道
-compiler = kfp.compiler.Compiler()
-compiler.compile(ml_pipeline, 'ml_pipeline.yaml')
-```
+| 服务 | API契约 | 数据流 |
+|------|--------|--------|
+| 数据服务 | 读/写数据集、版本控制 | S3/GCS ↔ 训练 |
+| 训练服务 | 提交/监控/取消任务 | API → Kubernetes → GPU节点 |
+| 注册表服务 | 注册/查询模型 | 训练 → 注册表 → 服务 |
+| 服务服务 | 部署/预测/回滚 | 注册表 → 服务 → 流量 |
+| 监控服务 | 指标/告警/报告 | 服务 → 监控 → 告警 |
+
+**优势：** 每个服务可以独立开发、部署和扩展。团队可以交换实现（例如，用Weights & Biases替换MLflow）而不影响其他服务。
+
+**劣势：** 服务边界创建集成复杂性。每个服务需要自己的API版本控制、身份验证和错误处理。
+
+### 模式3：平台即产品
+
+最成熟的组织将AI平台视为内部产品，具有：
+
+- **专门的平台团队**，包含产品经理、工程师和设计师
+- **用户研究**——理解数据科学家的工作流程和痛点
+- **版本化API**——向后兼容性保证
+- **自助能力**——无需向基础设施团队提交工单
+- **文档和入门引导**——新团队成员在几天内即可高效工作
+- **SLA**——保证正常运行时间、延迟和支持响应时间
 
 ---
 
-## 16.4 自助式 AI 服务
+## 16.3 自助式AI平台架构
 
-### 开发者门户架构
+自助式AI平台的目标是使任何数据科学家能够从想法到生产模型，无需提交基础设施工单。
+
+### 16.3.1 自助组件
+
+| 能力 | 自助机制 | 所需基础设施 |
+|------|---------|------------|
+| Notebook环境 | 一键JupyterHub启动 | Kubernetes + PVC + 镜像仓库 |
+| 训练任务提交 | CLI或API调用 | Training Operator + GPU配额 |
+| 实验跟踪 | 自动记录 | MLflow/Weights & Biases服务器 |
+| 模型部署 | 一键serve | KServe + Ingress + 自动扩缩 |
+| 数据访问 | 基于模式的数据目录 | Metastore + ACL系统 |
+| 特征计算 | 特征存储API | Feast/Hopsworks + Spark |
+
+### 16.3.2 开发者工作流
+
+设计良好的自助平台支持此工作流：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              自助式 AI 平台                                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  开发者门户                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  项目    │  │  资源    │  │ 管道     │  │部署  │  │   │
-│  │  │  模板    │  │  配置    │  │ 构建器   │  │向导  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  自助式 API                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │命名空间  │  │  GPU     │  │ 训练     │  │模型  │  │   │
-│  │  │API       │  │  API     │  │  API     │  │API   │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  治理层                                   │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  预算    │  │  访问    │  │  策略    │  │审计  │  │   │
-│  │  │  控制    │  │  控制    │  │  引擎    │  │日志  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+1. 打开notebook环境（自动配置，支持GPU）
+2. 从特征存储/数据目录拉取数据
+3. 使用熟悉的框架（PyTorch、TensorFlow）编写训练代码
+4. 自动跟踪实验（指标、工件、参数）
+5. 将最佳模型注册到模型注册表
+6. 一键命令部署模型到服务端点
+7. 通过仪表板监控模型性能
+8. 检测到数据漂移时自动触发重新训练
 ```
 
-### 资源配置 API
+每一步都应要求数据科学家零基础设施知识。
 
-```yaml
-# 自助式命名空间配置
-apiVersion: ai.platform.example.com/v1
-kind: ProjectNamespace
-metadata:
-  name: ml-project-alpha
-  labels:
-    team: data-science
-    environment: production
-spec:
-  owner: john.doe@company.com
-  team: data-science
-  description: "用于客户流失预测的 ML 项目"
-  resources:
-    quotas:
-      cpu: "32"
-      memory: "64Gi"
-      gpu: "4"
-    limits:
-      cpu: "64"
-      memory: "128Gi"
-      gpu: "8"
-  access:
-    mlEngineers:
-      - alice@company.com
-      - bob@company.com
-    dataScientists:
-      - charlie@company.com
-    viewers:
-      - manager@company.com
-  budget:
-    monthly_limit: 5000
-    alert_threshold: 80
-  templates:
-    - name: "training"
-      enabled: true
-      default_resources:
-        cpu: "8"
-        memory: "16Gi"
-        gpu: "2"
-    - name: "inference"
-      enabled: true
-      default_resources:
-        cpu: "4"
-        memory: "8Gi"
-        gpu: "1"
-```
+### 16.3.3 护栏和治理
+
+自助不等于不受控制。设计良好的平台通过以下方式执行治理：
+
+| 治理机制 | 实施方式 |
+|---------|---------|
+| 资源配额 | 命名空间级CPU/GPU/内存限制 |
+| 成本跟踪 | 通过标签进行每团队成本归属 |
+| 模型审批关卡 | 生产部署前要求审查 |
+| 数据访问控制 | 基于角色的敏感数据集访问 |
+| 合规性检查 | 训练数据中自动PII检测 |
+| 可重现性 | 强制实验跟踪和模型注册表 |
 
 ---
 
-## 16.5 平台治理与合规
+## 16.4 案例研究：Uber如何构建Michelangelo
 
-### 治理框架
+Uber的Michelangelo平台旨在服务于快速增长的ML组织需求，涵盖乘车定价、ETA预测、欺诈检测和自动驾驶。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              平台治理框架                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  策略引擎 (OPA)                          │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  访问    │  │  预算    │  │  安全    │  │合规  │  │   │
-│  │  │  策略    │  │  策略    │  │  策略    │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  审计与合规                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  审计    │  │  数据    │  │  模型    │  │访问  │  │   │
-│  │  │  日志    │  │  血缘    │  │  血缘    │  │日志  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+**平台组件：**
 
-### AI 平台的 OPA 策略
+| 组件 | 技术 | 用途 |
+|------|------|------|
+| 特征存储 | 基于Hopsworks | 特征计算和服务 |
+| 训练 | 自定义 + Spark + PyTorch | 批处理和在线训练 |
+| 模型注册表 | 自定义 | 模型版本控制和元数据 |
+| 服务 | 自定义（Prediction Services） | 低延迟实时推理 |
+| 批量预测 | 基于Spark | 大规模离线评分 |
+| 监控 | 自定义仪表板 | 模型性能跟踪 |
 
-```rego
-# 模型部署的 OPA 策略
-package ai.platform.model_deployment
+**规模指标：**
 
-default allow = false
+- 生产中1,000+模型
+- 5000万+次预测/秒（峰值）
+- 10,000+次特征计算/秒
+- 100+数据科学家使用平台
+- 15+不同业务领域
 
-# 如果满足所有条件则允许部署
-allow {
-    # 模型必须处于生产阶段
-    input.model.stage == "production"
-    
-    # 模型必须通过准确率阈值
-    input.model.metrics.accuracy >= input.thresholds.min_accuracy
-    
-    # 部署不得超过资源限制
-    input.deployment.resources.gpu <= input.limits.max_gpu
-    input.deployment.resources.memory <= input.limits.max_memory
-    
-    # 部署者必须具有所需权限
-    has_permission(input.user, "deploy")
-    
-    # 无安全违规
-    not has_security_violation(input.model)
-}
+**关键架构决策：**
 
-# 检查用户权限
-has_permission(user, action) {
-    permission := data.permissions[user][_]
-    permission.action == action
-    permission.resource == "model"
-}
+1. **特征存储作为基础。** Michelangelo的特征存储预计算和缓存在线预测所需的特征。这消除了训练-服务偏移问题（训练特征与服务特征不同）。特征在Spark中离线计算，并存储在键值存储中用于在线服务。
 
-# 检查安全违规
-has_security_violation(model) {
-    # 检查模型中的敏感数据
-    model.contains_pii == true
-}
+2. **训练和服务基础设施分离。** 训练使用面向批处理的资源（启动和关闭的大GPU节点）。服务使用始终在线的资源，支持自动扩缩。这种分离防止训练任务影响预测延迟。
 
-has_security_violation(model) {
-    # 检查已知漏洞
-    model.vulnerabilities[_].severity == "critical"
-}
+3. **模型元数据作为一等公民。** 注册表中的每个模型包括：训练数据版本、超参数、评估指标、特征管道版本和部署历史。这使得通过追溯预测到训练条件来调试生产问题成为可能。
 
-# 预算检查
-allow {
-    # 检查部署是否在预算内
-    input.project.budget.remaining >= estimated_cost(input.deployment)
-    
-    # 检查项目是否未被冻结
-    input.project.status != "frozen"
-}
+4. **默认渐进式推出。** 新模型部署在影子流量路由器后面，该路由器向新旧模型发送真实流量。在完全流量切换前比较性能。
 
-estimated_cost(deployment) = cost {
-    cost := deployment.replicas * deployment.resources.gpu * data.gpu_hourly_rate
-}
-```
+**面临的挑战：**
+
+- **平台复杂性增长快于团队规模。** 到2020年，Michelangelo有20+微服务，平台团队花费更多时间维护平台而不是构建新功能。
+- **解决方案：** 合并冗余服务并投资统一API层。
 
 ---
 
-## 💡 案例研究：企业级 AI 平台架构设计
+## 16.5 战争故事：平台变得过于复杂而无法维护
 
-### 完整平台设计
+**公司：** 中型AI初创公司，50名数据科学家，3名平台工程师
 
-🔴 高级
+**问题：** 公司从零开始构建了自定义AI平台，随着需求出现添加服务。2年后，平台累积了：
 
-```yaml
-# 企业级 AI 平台 - 完整架构
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ai-platform
-  labels:
-    istio-injection: enabled
----
-# 平台访问的 Istio Gateway
-apiVersion: networking.istio.io/v1beta1
-kind: Gateway
-metadata:
-  name: ai-platform-gateway
-  namespace: ai-platform
-spec:
-  selector:
-    istio: ingressgateway
-  servers:
-  - port:
-      number: 443
-      name: https
-      protocol: HTTPS
-    tls:
-      mode: SIMPLE
-      credentialName: ai-platform-tls
-    hosts:
-    - ai-platform.company.com
-  - port:
-      number: 80
-      name: http
-      protocol: HTTP
-    hosts:
-    - ai-platform.company.com
-    tls:
-      httpsRedirect: true
----
-# 路由的 Virtual Service
-apiVersion: networking.istio.io/v1beta1
-kind: VirtualService
-metadata:
-  name: ai-platform-routes
-  namespace: ai-platform
-spec:
-  hosts:
-  - ai-platform.company.com
-  gateways:
-  - ai-platform-gateway
-  http:
-  - match:
-    - uri:
-        prefix: /api/v1
-    route:
-    - destination:
-        host: api-gateway
-        port:
-          number: 8080
-  - match:
-    - uri:
-        prefix: /mlflow
-    route:
-    - destination:
-        host: mlflow-server
-        port:
-          number: 5000
-  - match:
-    - uri:
-        prefix: /jupyter
-    route:
-    - destination:
-        host: jupyter-hub
-        port:
-          number: 8000
-```
+- 3个不同的实验跟踪系统（每个为不同团队构建）
+- 2个模型服务框架（一个用于批处理，一个用于实时）
+- 4种不同的数据访问方式（HDFS、S3直接访问、SQL、自定义API）
+- 2个编排引擎（Airflow + 自定义）
+- 自定义身份验证（未与公司SSO集成）
+- 无API版本控制——每周部署破坏性更改
 
-### 平台监控栈
+**症状：**
 
-```yaml
-# 用于平台监控的 Prometheus
-apiVersion: monitoring.coreos.com/v1
-kind: Prometheus
-metadata:
-  name: ai-platform-prometheus
-  namespace: monitoring
-spec:
-  replicas: 3
-  retention: 90d
-  resources:
-    requests:
-      memory: "8Gi"
-      cpu: "4"
-  storage:
-    volumeClaimTemplate:
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 500Gi
-  serviceMonitorSelector:
-    matchLabels:
-      team: ai-platform
-  ruleSelector:
-    matchLabels:
-      team: ai-platform
----
-# 用于 ML 监控的自定义指标
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: ml-monitoring-rules
-  namespace: monitoring
-spec:
-  groups:
-  - name: ml-model-alerts
-    rules:
-    - alert: ModelAccuracyDrop
-      expr: |
-        ml_model_accuracy{job="model-serving"} < 0.8
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "模型准确率降至阈值以下"
-        
-    - alert: HighLatency
-      expr: |
-        histogram_quantile(0.99, rate(ml_inference_duration_seconds_bucket[5m])) > 1
-      for: 5m
-      labels:
-        severity: critical
-      annotations:
-        summary: "模型推理延迟过高"
-        
-    - alert: DataDriftDetected
-      expr: |
-        ml_data_drift_score{job="drift-detector"} > 0.3
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "在模型输入中检测到数据漂移"
-```
+| 指标 | 值 |
+|------|---|
+| 部署新模型时间 | 2-3周（应<1天） |
+| 每月平台事件 | 8-12 |
+| 数据科学家入职时间 | 3-4周 |
+| 平台工程师花在bug上的时间 | 70% |
+| 文档覆盖率 | ~30% |
+
+**根本原因：**
+
+1. **无平台愿景。** 每个服务由不同工程师在不同时间孤立构建。没有人拥有端到端体验。
+2. **过早抽象。** 团队为所有事情构建自定义API，而不是使用现有工具（MLflow、Seldon、Feast）。
+3. **无弃用策略。** 旧系统从未被移除——它们与新系统一起累积。
+4. **平台工程投资不足。** 三名工程师无法维护服务50名数据科学家的平台。
+
+**补救措施：**
+
+1. **平台审计。** 编目每个组件、其所有者、其用户和其依赖关系。发现40%的组件是冗余或未使用的。
+2. **合并。** 迁移到单一实验跟踪器（MLflow）、单一服务框架（KServe）和单一数据访问层（特征存储）。删除或归档未使用的系统。
+3. **平台团队扩展。** 从3人扩展到8人，配备专职产品经理。
+4. **API治理。** 建立版本化API，具有6个月弃用窗口。
+5. **开发者体验投资。** 创建CLI工具（`mlplatform init`、`mlplatform train`、`mlplatform serve`），封装最佳实践。
+
+**6个月后的结果：**
+
+| 指标 | 改进前 | 改进后 |
+|------|--------|--------|
+| 部署新模型时间 | 2-3周 | 2小时 |
+| 每月平台事件 | 8-12 | 1-2 |
+| 数据科学家入职时间 | 3-4周 | 2-3天 |
+| 平台工程师bug时间 | 70% | 30% |
+| 文档覆盖率 | 30% | 85% |
 
 ---
 
-## 📝 练习
+## 16.6 自建与购买决策
 
-### 练习 16.1：平台设计
-设计支持以下功能的 AI 平台：
-1. 5 个数据科学团队
-2. 20+ 生产中的 ML 模型
-3. 每周 100+ 实验
-4. 自动化模型再训练
-5. 模型部署的 A/B 测试
+| 组件 | 自建 | 购买/使用开源 | 建议 |
+|------|------|-------------|------|
+| 实验跟踪 | 自定义仪表板 | MLflow、W&B | 使用MLflow/W&B——自定义跟踪很少更好 |
+| 特征存储 | 自定义特征计算 | Feast、Hopsworks | 从Feast开始；仅在有独特需求时自建 |
+| 模型服务 | 自定义推理服务器 | KServe、Triton、Seldon | 使用KServe/Triton——生产服务很难 |
+| 训练编排 | 自定义任务管理器 | Kubeflow、Airflow | 对ML特定工作流使用Kubeflow Pipelines |
+| 数据版本控制 | 自定义快照系统 | DVC、Delta Lake | 文件用DVC，表用Delta Lake |
+| 监控 | 自定义仪表板 | Evidently AI、Whylabs | 从开源开始，为ML特定需求定制 |
+| GPU集群管理 | 自定义调度器 | Kubernetes + GPU Operator | 使用Kubernetes——自定义GPU调度器是陷阱 |
 
-### 练习 16.2：工作流自动化
-实现自动化 ML 工作流，要求：
-1. 在新数据到达时触发
-2. 执行特征工程
-3. 训练多个模型变体
-4. 自动选择最佳模型
-5. 使用金丝雀发布进行部署
-6. 监控模型性能
+**黄金法则：** 如果开源工具满足80%的需求，使用它并自定义剩余的20%。只有当现有工具与你的需求相差甚远时，才证明从零构建是合理的。
 
 ---
 
-## ⚠️ 警告
+## 16.7 何时使用/何时不使用AI平台
 
-1. **平台复杂性**：不要一开始就构建所有内容。从核心组件开始，迭代扩展。
-2. **供应商锁定**：优先选择开源标准而非专有解决方案。设计时考虑可移植性。
-3. **成本升级**：密切监控平台使用情况。共享基础设施可能导致成本超支。
-4. **安全性**：实现纵深防御。AI 平台处理敏感数据和模型。
+### 何时构建AI平台
+
+| 场景 | 平台有帮助的原因 |
+|------|----------------|
+| > 10名数据科学家 | 共享基础设施防止重复 |
+| > 5个生产模型 | 标准化部署减少事件 |
+| 多个业务领域 | 跨团队特征重用 |
+| 需要合规性 | 审计跟踪、模型治理 |
+| 团队快速增长 | 自助减少入职时间 |
+
+### 何时不构建AI平台
+
+| 场景 | 平台有害的原因 | 替代方案 |
+|------|---------------|---------|
+| < 5名数据科学家 | 平台维护超过收益 | JupyterHub + MLflow + 脚本 |
+| 原型设计阶段 | 平台约束减慢实验 | 本地开发 + git |
+| 无生产模型 | 解决你还没有的问题 | 专注于让第一个模型投入生产 |
+| 无平台工程团队 | 无人维护的平台成为负担 | 使用托管服务（SageMaker、Vertex AI） |
+| 预算 < $200K/年 | 无法资助专门的平台团队 | 托管ML服务 |
 
 ---
 
-## 本章小结
+## 16.8 本章小结
 
-本章介绍了用于统一 ML 生命周期管理的 AI 平台架构。关键主题包括：
+- AI平台抽象了基础设施复杂性，使数据科学家能够专注于模型质量
+- 三种主要架构模式：**分层**（水平层）、**面向服务**（独立服务）和**平台即产品**（具有专门团队的内部产品）
+- **自助**是关键价值主张——数据科学家应从想法到生产无需提交基础设施工单
+- **特征存储**是消除训练-服务偏移的基础
+- 最常见的失败模式是**过度工程**——为所有事情构建自定义解决方案而不是利用现有工具
+- Uber的**Michelangelo**展示了规模：1,000+模型，5000万次预测/秒，但即使Uber也在意识到复杂性增长快于能力后合并了服务
 
-1. 具有清晰层级分离的统一平台设计
-2. 具有适当版本控制和治理的多模型管理
-3. 使用 Kubeflow Pipelines 进行工作流编排
-4. 为数据科学团队提供自助式功能
-5. 平台治理与合规自动化
+---
 
-下一章我们将探讨边缘 AI 基础和部署策略。
+## 讨论题
+
+1. 一家公司有15名数据科学家，来自3个团队，使用不同工具（Jupyter notebooks、SageMaker、自定义脚本）。他们想要在单一平台上标准化。你会优先构建哪些组件，哪些你会购买/使用开源？
+
+2. Uber的Michelangelo在3年内累积了20+微服务。你会如何设计治理和架构原则来防止这种平台蔓延？
+
+3. 比较使用自助AI平台与手动管理基础设施的开发者体验。在灵活性、速度和运营负担方面有哪些权衡？
+
+4. 一家医疗AI公司需要HIPAA合规的ML平台。与非受监管公司相比，这个需求如何改变架构决策？
+
+5. 特征存储应该是集中式的（一个存储服务所有团队）还是去中心化的（每个团队拥有自己的特征）？有哪些权衡？
+
+---
+
+## 练习
+
+**练习1：** 为8名数据科学家团队设计最小AI平台架构。列出每个组件、你是自建还是购买，以及每月估计基础设施成本。
+
+**练习2：** 在Kubernetes上设置具有每命名空间隔离的自助MLflow跟踪服务器。创建一个notebook环境，当数据科学家启动训练任务时自动将实验记录到MLflow。
+
+**练习3：** 审计现有ML项目，识别哪些部分可以被现有开源工具替代。估计切换到这些工具每月节省的时间。
+
+---
+
+## 参考文献
+
+- Uber Michelangelo ML平台：https://eng.uber.com/michelangelo-machine-learning/
+- Uber Michelangelo PyML：https://eng.uber.com/uber-creates-michelangelo-pyml/
+- MLflow文档：https://mlflow.org/docs/latest/
+- Feast特征存储：https://docs.feast.dev/
+- KServe文档：https://kserve.github.io/website/
+- MLOps社区：https://mlops.community/
+- Chip Huyen ML系统设计：https://huyenchip.com/machine-learning-systems-design/
+- Google MLOps白皮书：https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning

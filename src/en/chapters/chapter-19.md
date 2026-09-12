@@ -1,1578 +1,469 @@
 # Chapter 19: Edge Deployment Architecture
 
-🟢 Beginner | 🟡 Intermediate | 🔴 Advanced | ⚫ Manager
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+1. Compare edge inference frameworks and select the appropriate one for target hardware
+2. Design over-the-air (OTA) model update systems with rollback and canary deployment capabilities
+3. Architect edge-cloud synchronization systems that balance freshness with bandwidth constraints
+4. Implement health monitoring and drift detection for distributed edge deployments
+5. Design deployment pipelines that handle the unique challenges of edge infrastructure
 
 ---
 
-## 19.1 Edge Inference Frameworks
+## 19.1 Introduction: Edge Deployment is Not Cloud Deployment
 
-### Framework Comparison
+Deploying AI models to edge devices is fundamentally different from deploying to cloud servers. Edge devices are heterogeneous, often offline, resource-constrained, and physically dispersed. A deployment architecture designed for cloud will fail on edge.
+
+**Cloud vs Edge deployment characteristics:**
+
+| Characteristic | Cloud | Edge |
+|---------------|-------|------|
+| Hardware | Homogeneous (same GPU type) | Heterogeneous (ARM, x86, NPU, GPU) |
+| Connectivity | Always-on, high bandwidth | Intermittent, low bandwidth |
+| Update mechanism | Rolling deployment, blue-green | OTA with rollback, canary |
+| Monitoring | Full telemetry, real-time | Intermittent telemetry, batch |
+| Failure mode | Redundant, auto-healing | Device-specific, manual recovery |
+| Scale | 10-1000 servers | 10,000-1,000,000 devices |
+| Physical access | Data center | Remote, often inaccessible |
+
+> **📌 Real Data Box**
+> BMW deploys AI models to **edge devices in over 30 factories worldwide** for quality inspection, using a hybrid edge-cloud architecture that processes over **500,000 images per day** per factory (bmw.com). Siemens' MindSphere platform connects **over 300,000 edge devices** across industrial facilities for real-time AI inference (siemens.com). The NVIDIA Jetson platform powers **over 1 million deployed edge AI devices** across robotics, healthcare, and smart cities (nvidia.com).
+
+---
+
+## 19.2 Edge Inference Frameworks
+
+### 19.2.1 Framework Comparison
+
+| Framework | Hardware Support | Model Format | Latency (ResNet-50, INT8) | Best For |
+|-----------|-----------------|-------------|--------------------------|----------|
+| **TensorRT** | NVIDIA GPU | TRT engine | 0.6ms (Jetson Orin) | NVIDIA hardware |
+| **ONNX Runtime** | CPU, CUDA, DirectML, OpenVINO | ONNX | 1.2ms (CPU), 0.8ms (CUDA) | Cross-platform |
+| **OpenVINO** | Intel CPU, VPU, GPU | IR format | 2.1ms (CPU), 1.8ms (VPU) | Intel hardware |
+| **TensorFlow Lite** | CPU, GPU, Edge TPU | TFLite | 3.2ms (CPU), 1.1ms (Edge TPU) | Mobile/Edge TPU |
+| **PyTorch Mobile** | CPU, GPU | TorchScript | 4.1ms (CPU) | PyTorch ecosystem |
+| **NCNN** | ARM CPU | NCNN format | 2.8ms (ARM) | Mobile ARM devices |
+| **MNN** | ARM CPU, GPU | MNN format | 2.5ms (ARM) | Alibaba ecosystem |
+
+### 19.2.2 Framework Selection Decision Tree
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Edge Inference Frameworks                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Framework          │ Hardware Support    │ Model Formats       │
-│  ─────────────────────────────────────────────────────────────  │
-│  ONNX Runtime       │ CPU, GPU, NPU      │ ONNX               │
-│  TensorRT           │ NVIDIA GPU         │ ONNX, Caffe, PT    │
-│  TFLite             │ CPU, GPU, Edge TPU │ TFLite, TF SavedM  │
-│  OpenVINO           │ Intel CPU, VPU     │ ONNX, IR           │
-│  CoreML             │ Apple Neural Eng.  │ CoreML, ONNX       │
-│  NCNN               │ ARM CPU            │ Caffe, ONNX        │
-│  MNN                │ ARM CPU, GPU       │ ONNX, TFLite       │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+Is the target hardware NVIDIA GPU?
+├── Yes → TensorRT (best performance)
+│         └── Need cross-platform? → ONNX Runtime with TensorRT EP
+└── No → Is the target Intel hardware?
+         ├── Yes → OpenVINO
+         └── No → Is the target mobile/Edge TPU?
+                  ├── Yes → TensorFlow Lite
+                  └── No → ONNX Runtime (most portable)
 ```
 
-### ONNX Runtime for Edge
+### 19.2.3 TensorRT Optimization Pipeline
+
+TensorRT applies multiple optimization passes:
+
+1. **Layer fusion:** Merges convolution + bias + activation into a single kernel
+2. **Kernel auto-tuning:** Profiles multiple CUDA kernels per layer, selects fastest for the specific GPU
+3. **Precision calibration:** Determines optimal precision per layer (FP16, INT8, or mixed)
+4. **Dynamic tensor memory:** Minimizes memory footprint by reusing buffers
+5. **Multi-stream execution:** Overlaps compute and memory operations
+
+**TensorRT optimization results (Jetson Orin Nano, batch size 1):**
+
+| Model | PyTorch FP32 | TensorRT FP16 | TensorRT INT8 | Speedup |
+|-------|-------------|---------------|---------------|---------|
+| ResNet-50 | 12.3ms | 3.1ms | 1.2ms | 10.3x |
+| YOLOv5-S | 28.5ms | 8.2ms | 4.1ms | 7.0x |
+| BERT-base | 18.7ms | 6.3ms | 3.8ms | 4.9x |
+
+---
+
+## 19.3 Over-the-Air (OTA) Model Update Patterns
+
+### 19.3.1 OTA Update Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│                Cloud Control Plane           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ Model    │  │ Update   │  │ Rollback │  │
+│  │ Registry │  │ Scheduler│  │ Manager  │  │
+│  └──────────┘  └──────────┘  └──────────┘  │
+└────────────────────┬────────────────────────┘
+                     │ HTTPS/mTLS
+┌────────────────────┴────────────────────────┐
+│              Edge Device Fleet              │
+│  ┌────────┐  ┌────────┐  ┌────────┐       │
+│  │Device A│  │Device B│  │Device C│  ...   │
+│  │ Agent  │  │ Agent  │  │ Agent  │       │
+│  └────────┘  └────────┘  └────────┘       │
+└─────────────────────────────────────────────┘
+```
+
+### 19.3.2 Update Strategies
+
+**Strategy 1: Full Model Replacement**
+
+- Download complete new model to device
+- Swap model pointer atomically
+- Simple but bandwidth-intensive
+
+**Best for:** Small models (< 50MB), infrequent updates, high-bandwidth connections.
+
+**Strategy 2: Delta/Differential Updates**
+
+- Compute binary diff between old and new model
+- Transmit only the delta
+- 80-95% bandwidth reduction
+
+**Best for:** Large models, frequent updates, low-bandwidth connections.
+
+**Strategy 3: Weight-Only Updates**
+
+- Model architecture stays the same, only weights change
+- Transmit weight file only (skip architecture)
+- Reduces update size by 10-30% vs full model
+
+**Best for:** Retraining with same architecture, online learning scenarios.
+
+**Strategy 4: Layered Updates**
+
+- Split model into layers/chunks
+- Prioritize critical layers for immediate update
+- Download remaining layers in background
+
+**Best for:** Very large models, devices with limited storage, progressive enhancement.
+
+### 19.3.3 Canary Deployment for Edge
+
+```
+Phase 1: Deploy to 1% of devices
+         ┌─────────┐
+         │ 1% fleet│ → Monitor for 24-48 hours
+         └─────────┘
+         
+Phase 2: If metrics OK, deploy to 10%
+         ┌─────────┐
+         │ 10% fleet│ → Monitor for 24-48 hours
+         └──────────┘
+         
+Phase 3: If metrics OK, deploy to 50%
+         ┌─────────┐
+         │ 50% fleet│ → Monitor for 24-48 hours
+         └──────────┘
+         
+Phase 4: Full rollout
+         ┌─────────┐
+         │ 100% fleet│
+         └──────────┘
+         
+If ANY phase shows degradation → automatic rollback
+```
+
+### 19.3.4 Rollback Mechanisms
+
+| Mechanism | Description | Recovery Time |
+|-----------|------------|--------------|
+| **Model versioning** | Keep previous model on device, switch pointer | < 1 second |
+| **A/B partition** | Two model slots, swap active partition | < 1 second |
+| **Cloud rollback** | Push previous version to all devices | 5-30 minutes |
+| **Factory reset** | Wipe device, re-initialize from scratch | 10-60 minutes |
+| **Physical intervention** | Manual device recovery | Hours to days |
+
+**Recommended approach:** Always maintain at least 2 model versions on each device. The active model can be switched instantly, and the previous version is available for immediate rollback without network access.
+
+---
+
+## 19.4 Edge-Cloud Synchronization Architecture
+
+### 19.4.1 Sync Patterns
+
+**Pattern 1: Push-Based Updates**
+```
+Cloud pushes new model → Device agent receives → Applies update → Reports status
+```
+Used for: Model updates, configuration changes, firmware patches.
+
+**Pattern 2: Pull-Based Polling**
+```
+Device polls cloud → Checks for updates → Downloads if available → Reports status
+```
+Used for: Periodic sync, devices behind firewalls, bandwidth-constrained environments.
+
+**Pattern 3: Hybrid (Event-Triggered Push + Periodic Pull)**
+```
+Cloud sends push notification → Device pulls update on next connectivity window
+```
+Best for: Intermittent connectivity, balancing freshness with bandwidth.
+
+### 19.4.2 Data Synchronization
+
+**Upstream (Device → Cloud):**
+
+| Data Type | Frequency | Bandwidth | Priority |
+|-----------|-----------|-----------|----------|
+| Model health metrics | Every 5-15 min | Low (~1KB) | High |
+| Inference statistics | Every 15-60 min | Low (~10KB) | Medium |
+| Drift detection alerts | Event-driven | Low (~1KB) | High |
+| Sample predictions (for retraining) | Batched daily | Medium (~100MB) | Medium |
+| Raw sensor data | Rarely/never | Very high | Low |
+
+**Downstream (Cloud → Device):**
+
+| Data Type | Frequency | Size | Priority |
+|-----------|-----------|------|----------|
+| Model updates | Weekly/monthly | 5-500MB | High |
+| Configuration updates | As needed | < 1MB | Medium |
+| Security patches | As needed | 1-50MB | Critical |
+
+### 19.4.3 Conflict Resolution
+
+When edge devices operate offline and later sync, conflicts can arise:
+
+| Conflict Type | Resolution Strategy |
+|--------------|-------------------|
+| Configuration changed on device and cloud | Cloud wins (centralized governance) |
+| Model version mismatch | Device keeps current until next update |
+| Data inconsistencies | Merge with timestamps (most recent wins) |
+| Resource allocation conflicts | Cloud authority overrides device |
+
+---
+
+## 19.5 Case Study: How BMW Uses Edge AI for Quality Inspection
+
+BMW deploys edge AI across its global manufacturing network for real-time quality inspection on production lines.
+
+**Architecture:**
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Edge devices** | NVIDIA Jetson AGX Xavier (32 TOPS) | Real-time image inference on production line |
+| **Edge servers** | NVIDIA DGX stations | Aggregate results from multiple cameras, run larger models |
+| **Factory cloud** | On-premise Kubernetes cluster | Model management, data aggregation, dashboards |
+| **Global cloud** | BMW cloud infrastructure | Cross-factory analytics, model retraining, fleet management |
+
+**Inspection workflow:**
+
+1. **Image capture:** High-resolution cameras (20MP) capture images of each vehicle component at 30 frames per second
+2. **Edge inference (device):** Jetson device runs YOLOv8 for defect detection with <20ms latency
+3. **Edge aggregation (server):** DGX station correlates results across 8-16 cameras per station, runs larger models for ambiguous cases
+4. **Factory dashboard:** Real-time quality metrics displayed on factory floor monitors
+5. **Cloud retraining:** Defective samples sent to cloud weekly for model retraining
+6. **OTA update:** Retrained model pushed to all factories globally
+
+**Scale and metrics:**
+
+- 30+ factories worldwide
+- 500,000+ images processed per factory per day
+- 15+ defect types detected (scratches, dents, misalignment, color variations)
+- 99.7% detection rate (vs 94% human inspector baseline)
+- False positive rate: 0.8% (human baseline: 5-8%)
+- Average defect detection latency: 18ms (edge) + 120ms (server aggregation)
+- Model update frequency: Bi-weekly across all factories
+
+**Key architectural decisions:**
+
+1. **Two-tier edge architecture.** Fast detection happens on the Jetson device (<20ms). Complex cases are referred to the edge server for ensemble analysis (<150ms total). This balances latency with accuracy.
+
+2. **Cloud-managed, edge-executed.** Models are trained in the cloud, but inference runs entirely at the edge. The factory can operate for days without cloud connectivity.
+
+3. **Global model, local calibration.** A base model is trained on data from all factories. Each factory fine-tunes with local data (different lighting, camera angles, product variants) and deploys a factory-specific version.
+
+4. **Human-in-the-loop for ambiguous cases.** When the model confidence is below 70%, the image is flagged for human review. These reviewed cases are added to the retraining dataset.
+
+---
+
+## 19.6 War Story: Edge Device Running Out of Memory in Production
+
+**Company:** Smart retail chain, deploying 5,000 shelf-scanning cameras with on-device AI
+
+**Problem:** After 3 months of deployment, 12% of devices (600 cameras) began experiencing out-of-memory (OOM) crashes, growing at 2% per week. Devices would crash, reboot, and crash again within minutes.
+
+**Timeline of degradation:**
+
+| Month | OOM Crashes | Crash Rate | Root Cause |
+|-------|-------------|-----------|------------|
+| Month 1 | 3 | 0.06% | Random, acceptable |
+| Month 2 | 15 | 0.3% | Memory leak suspected |
+| Month 3 | 600 | 12% | Systematic failure |
+| Month 4 (projected) | 3,000+ | 60%+ | Fleet-wide crisis |
+
+**Root cause analysis:**
+
+1. **Memory leak in image preprocessing pipeline.** The camera software cached decoded images in a ring buffer. Due to a race condition, images were sometimes retained beyond their expected lifecycle. Each 20MP image consumed ~60MB of RAM.
+
+2. **Cache grew unboundedly.** Over weeks, the leaked images accumulated in memory. The 2GB RAM device eventually exhausted available memory.
+
+3. **Model inference memory not reclaimed.** The ONNX Runtime session allocated GPU memory (via OpenCL) but did not release it after inference. This memory was separate from the Python garbage collector.
+
+4. **OTA update increased model size.** A model update deployed in Month 2 increased the model from 45MB to 62MB, reducing available headroom.
+
+**Diagnostic approach:**
 
 ```python
-# ONNX Runtime Edge Inference
-import onnxruntime as ort
-import numpy as np
-import cv2
+# Memory profiling on affected devices
+import tracemalloc
+tracemalloc.start()
 
-class EdgeInferenceEngine:
-    def __init__(self, model_path, providers=['CPUExecutionProvider']):
-        """Initialize ONNX Runtime inference engine."""
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
-        sess_options.intra_op_num_threads = 4
-        sess_options.inter_op_num_threads = 2
-        
-        self.session = ort.InferenceSession(
-            model_path,
-            sess_options,
-            providers=providers
-        )
-        
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-    
-    def preprocess(self, image, input_size=(224, 224)):
-        """Preprocess image for inference."""
-        # Resize
-        img = cv2.resize(image, input_size)
-        
-        # Convert BGR to RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Normalize
-        img = img.astype(np.float32) / 255.0
-        img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-        
-        # Transpose to CHW
-        img = img.transpose(2, 0, 1)
-        
-        # Add batch dimension
-        img = np.expand_dims(img, axis=0)
-        
-        return img
-    
-    def inference(self, input_data):
-        """Run inference."""
-        outputs = self.session.run(
-            [self.output_name],
-            {self.input_name: input_data}
-        )
-        return outputs[0]
-    
-    def postprocess(self, output, top_k=5):
-        """Post-process output."""
-        # Apply softmax
-        exp_output = np.exp(output - np.max(output))
-        probabilities = exp_output / exp_output.sum()
-        
-        # Get top-k predictions
-        top_k_indices = np.argsort(probabilities[0])[-top_k:][::-1]
-        top_k_probs = probabilities[0][top_k_indices]
-        
-        return list(zip(top_k_indices.tolist(), top_k_probs.tolist()))
-    
-    def predict(self, image):
-        """Full prediction pipeline."""
-        input_data = self.preprocess(image)
-        output = self.inference(input_data)
-        predictions = self.postprocess(output)
-        return predictions
-
-# Usage example
-engine = EdgeInferenceEngine(
-    model_path='resnet50_quantized.onnx',
-    providers=['CPUExecutionProvider']
-)
-
-# Load and predict
-image = cv2.imread('test_image.jpg')
-predictions = engine.predict(image)
-
-for class_id, prob in predictions:
-    print(f"Class {class_id}: {prob:.4f}")
+# Run inference loop for 1 hour
+for i in range(3600):
+    image = camera.capture()
+    result = model.infer(image)
+    if i % 100 == 0:
+        current, peak = tracemalloc.get_traced_memory()
+        print(f"Iteration {i}: Current={current/1e6:.1f}MB, Peak={peak/1e6:.1f}MB")
 ```
 
-### TensorRT Optimization
+Output showed memory growing from 800MB at startup to 1.9GB after 30 minutes, confirming the leak.
 
-```python
-# TensorRT Optimization for Edge
-import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
-import numpy as np
+**Fixes applied:**
 
-class TensorRTInference:
-    def __init__(self, engine_path):
-        """Initialize TensorRT inference engine."""
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        
-        # Load engine
-        with open(engine_path, 'rb') as f:
-            runtime = trt.Runtime(self.logger)
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        
-        self.context = self.engine.create_execution_context()
-        
-        # Allocate memory
-        self._allocate_buffers()
-    
-    def _allocate_buffers(self):
-        """Allocate GPU memory for input/output."""
-        self.inputs = []
-        self.outputs = []
-        self.bindings = []
-        
-        for i in range(self.engine.num_bindings):
-            binding_shape = self.engine.get_binding_shape(i)
-            binding_dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            
-            size = trt.volume(binding_shape)
-            host_mem = cuda.pagelocked_empty(size, binding_dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
-            self.bindings.append(int(device_mem))
-            
-            if self.engine.binding_is_input(i):
-                self.inputs.append({'host': host_mem, 'device': device_mem})
-            else:
-                self.outputs.append({'host': host_mem, 'device': device_mem})
-    
-    def infer(self, input_data):
-        """Run TensorRT inference."""
-        # Copy input to host memory
-        np.copyto(self.inputs[0]['host'], input_data.ravel())
-        
-        # Transfer input to GPU
-        cuda.memcpy_htod(
-            self.inputs[0]['device'],
-            self.inputs[0]['host']
-        )
-        
-        # Run inference
-        self.context.execute_v2(bindings=self.bindings)
-        
-        # Transfer output back to host
-        cuda.memcpy_dtoh(
-            self.outputs[0]['host'],
-            self.outputs[0]['device']
-        )
-        
-        return self.outputs[0]['host'].reshape(self.engine.get_binding_shape(1))
+| Fix | Impact |
+|-----|--------|
+| Fixed ring buffer race condition (added proper reference counting) | Eliminated 70% of memory leak |
+| Added explicit ONNX Runtime session memory management | Eliminated 25% of memory leak |
+| Reduced model to 48MB (pruned unnecessary layers) | Recovered 14MB headroom |
+| Added memory watchdog (reboot if > 85% RAM used) | Prevented cascading crashes |
+| Added automatic cache eviction after 30 seconds | Reduced peak memory by 40% |
 
-def build_tensorrt_engine(onnx_path, engine_path, fp16=True, max_batch_size=8):
-    """Build TensorRT engine from ONNX."""
-    logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    )
-    parser = trt.OnnxParser(network, logger)
-    
-    # Parse ONNX model
-    with open(onnx_path, 'rb') as f:
-        if not parser.parse(f.read()):
-            for error in range(parser.num_errors):
-                print(parser.get_error(error))
-            return None
-    
-    # Configure builder
-    config = builder.create_builder_config()
-    config.max_workspace_size = 1 << 30  # 1GB
-    
-    if fp16 and builder.platform_has_fast_fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
-    
-    # Set optimization profiles
-    profile = builder.create_optimization_profile()
-    profile.set_shape(
-        'input',
-        min=(1, 3, 224, 224),
-        opt=(max_batch_size // 2, 3, 224, 224),
-        max=(max_batch_size, 3, 224, 224)
-    )
-    config.add_optimization_profile(profile)
-    
-    # Build engine
-    engine = builder.build_engine(network, config)
-    
-    # Save engine
-    with open(engine_path, 'wb') as f:
-        f.write(engine.serialize())
-    
-    return engine
-```
+**Results:**
+
+| Metric | Before Fix | After Fix |
+|--------|-----------|-----------|
+| OOM crashes per week | 200+ | 0 |
+| Memory at 24h runtime | 1.85GB (crash) | 1.1GB (stable) |
+| Uptime per device | 4-6 hours | 30+ days |
+| OTA deployment reliability | 88% | 99.5% |
+
+**Prevention measures implemented:**
+
+1. **Mandatory memory profiling** before any OTA deployment
+2. **Memory budget per component** (model: 80MB, preprocessing: 100MB, runtime: 50MB, OS: 700MB)
+3. **48-hour soak test** before fleet-wide rollout
+4. **Real-time memory telemetry** from all devices to central monitoring
+5. **Automatic rollback** if memory usage exceeds 80% threshold for 5 minutes
 
 ---
 
-## 19.2 Model Update Strategy
+## 19.7 Edge Deployment Pipeline Architecture
 
-### Update Architecture
+A complete edge deployment pipeline includes:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Model Update Architecture                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  Cloud (Central)                         │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Model   │  │  Update  │  │  Version │  │Push  │  │   │
-│  │  │ Registry │  │  Manager │  │  Control │  │Service│  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │   Update Channel  │                      │
-│                    │   (OTA/CDN)       │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  Edge Fleet                              │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Edge    │  │  Edge    │  │  Edge    │  │Edge  │  │   │
-│  │  │ Device 1 │  │ Device 2 │  │ Device 3 │  │Dev N │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   Model      │    │   Model      │    │   Model      │
+│   Training   │ →  │   Validation │ →  │   Packaging  │
+│   (Cloud)    │    │   (Cloud)    │    │   (Cloud)    │
+└──────────────┘    └──────────────┘    └──────────────┘
+                                              │
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   Fleet      │    │   Canary     │    │   OTA        │
+│   Rollout    │ ←  │   Testing    │ ←  │   Upload     │
+│   (Cloud)    │    │   (Edge)     │    │   (Cloud)    │
+└──────────────┘    └──────────────┘    └──────────────┘
+       │
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   Device     │    │   Monitoring │    │   Rollback   │
+│   Execution  │ →  │   & Drift    │ →  │   (if needed)│
+│   (Edge)     │    │   (Cloud)    │    │   (Cloud)    │
+└──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-### OTA Update Implementation
+### 19.7.1 Model Packaging for Edge
 
-```python
-# OTA Model Update System
-import requests
-import hashlib
-import json
-import time
-import os
-from pathlib import Path
+| Component | Contents | Format |
+|-----------|----------|--------|
+| Model weights | Quantized, compressed model | .onnx, .trt, .tflite |
+| Runtime | Inference engine | Static binary or container |
+| Configuration | Input/output specs, preprocessing | JSON/YAML |
+| Metadata | Version, checksum, target hardware | Manifest file |
+| Rollback model | Previous working model | Same format as primary |
 
-class EdgeOTAUpdater:
-    def __init__(self, device_id, registry_url, local_model_dir):
-        self.device_id = device_id
-        self.registry_url = registry_url
-        self.local_model_dir = Path(local_model_dir)
-        self.local_model_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Device state
-        self.current_model_version = self._get_current_version()
-        self.last_update_check = 0
-        self.update_interval = 3600  # Check every hour
-    
-    def _get_current_version(self):
-        """Get current model version."""
-        version_file = self.local_model_dir / 'version.json'
-        if version_file.exists():
-            with open(version_file, 'r') as f:
-                return json.load(f)
-        return {'version': '0.0.0', 'hash': None}
-    
-    def _save_version(self, version_info):
-        """Save version information."""
-        version_file = self.local_model_dir / 'version.json'
-        with open(version_file, 'w') as f:
-            json.dump(version_info, f)
-    
-    def check_for_updates(self):
-        """Check if update is available."""
-        if time.time() - self.last_update_check < self.update_interval:
-            return None
-        
-        self.last_update_check = time.time()
-        
-        try:
-            response = requests.get(
-                f"{self.registry_url}/api/models/device/{self.device_id}",
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            latest = response.json()
-            
-            if latest['version'] != self.current_model_version['version']:
-                return latest
-            
-            return None
-            
-        except Exception as e:
-            print(f"Error checking for updates: {e}")
-            return None
-    
-    def download_model(self, model_url, expected_hash):
-        """Download model with integrity check."""
-        temp_path = self.local_model_dir / 'model_new.onnx'
-        
-        try:
-            # Download with progress
-            response = requests.get(model_url, stream=True, timeout=300)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-            
-            # Verify hash
-            actual_hash = self._compute_hash(temp_path)
-            if actual_hash != expected_hash:
-                raise ValueError(f"Hash mismatch: {actual_hash} != {expected_hash}")
-            
-            return temp_path
-            
-        except Exception as e:
-            # Clean up on failure
-            if temp_path.exists():
-                temp_path.unlink()
-            raise e
-    
-    def _compute_hash(self, file_path):
-        """Compute SHA-256 hash of file."""
-        sha256 = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b''):
-                sha256.update(chunk)
-        return sha256.hexdigest()
-    
-    def apply_update(self, new_model_path, version_info):
-        """Apply model update with rollback capability."""
-        backup_dir = self.local_model_dir / 'backup'
-        backup_dir.mkdir(exist_ok=True)
-        
-        # Backup current model
-        current_model = self.local_model_dir / 'model.onnx'
-        if current_model.exists():
-            backup_model = backup_dir / f'model_{self.current_model_version["version"]}.onnx'
-            if backup_model.exists():
-                backup_model.unlink()
-            current_model.rename(backup_model)
-        
-        # Apply new model
-        new_model = self.local_model_dir / 'model.onnx'
-        new_model_path.rename(new_model)
-        
-        # Update version
-        self._save_version(version_info)
-        self.current_model_version = version_info
-        
-        print(f"Model updated to version {version_info['version']}")
-    
-    def rollback(self):
-        """Rollback to previous model version."""
-        backup_dir = self.local_model_dir / 'backup'
-        
-        # Find latest backup
-        backups = sorted(backup_dir.glob('model_*.onnx'))
-        if not backups:
-            raise ValueError("No backup available for rollback")
-        
-        latest_backup = backups[-1]
-        
-        # Restore
-        current_model = self.local_model_dir / 'model.onnx'
-        if current_model.exists():
-            current_model.unlink()
-        
-        latest_backup.rename(current_model)
-        
-        # Update version
-        version = latest_backup.stem.replace('model_', '')
-        self._save_version({'version': version, 'hash': None})
-        
-        print(f"Rolled back to version {version}")
-    
-    def update_loop(self):
-        """Main update loop."""
-        while True:
-            update = self.check_for_updates()
-            
-            if update:
-                print(f"Update available: {update['version']}")
-                
-                try:
-                    # Download new model
-                    temp_path = self.download_model(
-                        update['download_url'],
-                        update['hash']
-                    )
-                    
-                    # Apply update
-                    self.apply_update(temp_path, update)
-                    
-                except Exception as e:
-                    print(f"Update failed: {e}")
-                    # Continue with current model
-            
-            time.sleep(60)  # Check every minute
-```
+### 19.7.2 Drift Detection at Edge
+
+Edge devices should detect when the model is no longer performing well on current data:
+
+| Drift Type | Detection Method | Response |
+|-----------|-----------------|----------|
+| **Data drift** | Statistical comparison (KS test, PSI) of input features | Flag for review, consider retraining |
+| **Concept drift** | Monitor prediction confidence distribution | Trigger cloud retraining |
+| **Performance drift** | Compare predictions against ground truth (when available) | Alert operations team |
+| **Model staleness** | Track days since last update | Schedule update |
+
+**Practical threshold:** If the Population Stability Index (PSI) exceeds 0.2 for 3 consecutive days, trigger a retraining pipeline in the cloud.
 
 ---
 
-## 19.3 Edge Cluster Management
+## 19.8 When to Use / When Not to Use Edge Deployment
 
-### Kubernetes at the Edge (K3s/kubeedge)
+### When to Use Edge Deployment
 
-```yaml
-# K3s Edge Cluster Configuration
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: edge-ai
-  labels:
-    edge-cluster: "true"
----
-# Edge Device Fleet
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: edge-agent
-  namespace: edge-ai
-spec:
-  selector:
-    matchLabels:
-      app: edge-agent
-  template:
-    metadata:
-      labels:
-        app: edge-agent
-    spec:
-      containers:
-      - name: agent
-        image: edge-agent:latest
-        env:
-        - name: CLOUD_ENDPOINT
-          value: "https://cloud-gateway.company.com"
-        - name: DEVICE_GROUP
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.labels['device-group']
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        volumeMounts:
-        - name: model-storage
-          mountPath: /models
-        - name: config
-          mountPath: /config
-      volumes:
-      - name: model-storage
-        hostPath:
-          path: /var/lib/edge-models
-          type: DirectoryOrCreate
-      - name: config
-        configMap:
-          name: edge-config
-      nodeSelector:
-        node-type: edge
-      tolerations:
-      - key: "edge-node"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
----
-# Edge inference deployment
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: inference-service
-  namespace: edge-ai
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: inference-service
-  template:
-    metadata:
-      labels:
-        app: inference-service
-    spec:
-      containers:
-      - name: inference
-        image: edge-inference:latest
-        ports:
-        - containerPort: 8080
-        resources:
-          requests:
-            nvidia.com/gpu: "1"
-            memory: "4Gi"
-            cpu: "2"
-          limits:
-            nvidia.com/gpu: "1"
-            memory: "8Gi"
-            cpu: "4"
-        env:
-        - name: MODEL_PATH
-          value: "/models/current"
-        - name: MAX_BATCH_SIZE
-          value: "8"
-        - name: INFERENCE_TIMEOUT
-          value: "100"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /ready
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
-```
+| Scenario | Why Edge is Required |
+|----------|---------------------|
+| Latency < 20ms | Cloud round-trip too slow |
+| No internet connectivity | Cloud unreachable |
+| Privacy regulations (GDPR, HIPAA) | Data cannot leave premises |
+| High data volume (video, sensors) | Bandwidth too expensive |
+| Safety-critical systems | Network failure cannot disable AI |
+| Thousands of deployment sites | Per-device cloud cost prohibitive |
 
-### Edge Fleet Management
+### When NOT to Use Edge Deployment
 
-```python
-# Edge Fleet Management System
-import asyncio
-import aiohttp
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-from enum import Enum
-
-class DeviceStatus(Enum):
-    ONLINE = "online"
-    OFFLINE = "offline"
-    UPDATING = "updating"
-    ERROR = "error"
-
-@dataclass
-class EdgeDevice:
-    device_id: str
-    location: str
-    status: DeviceStatus
-    current_model_version: str
-    last_heartbeat: datetime
-    resource_usage: Dict[str, float]
-
-class EdgeFleetManager:
-    def __init__(self, cloud_endpoint: str):
-        self.cloud_endpoint = cloud_endpoint
-        self.devices: Dict[str, EdgeDevice] = {}
-        self.update_schedule: Dict[str, datetime] = {}
-    
-    async def register_device(self, device_info: Dict):
-        """Register new edge device."""
-        device = EdgeDevice(
-            device_id=device_info['device_id'],
-            location=device_info['location'],
-            status=DeviceStatus.ONLINE,
-            current_model_version=device_info['model_version'],
-            last_heartbeat=datetime.now(),
-            resource_usage=device_info.get('resource_usage', {})
-        )
-        
-        self.devices[device.device_id] = device
-        
-        # Notify cloud
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.cloud_endpoint}/api/devices/register",
-                json=device_info
-            ) as response:
-                return await response.json()
-    
-    async def heartbeat(self, device_id: str, status: Dict):
-        """Receive heartbeat from edge device."""
-        if device_id in self.devices:
-            self.devices[device_id].last_heartbeat = datetime.now()
-            self.devices[device_id].status = DeviceStatus.ONLINE
-            self.devices[device_id].resource_usage = status.get('resource_usage', {})
-    
-    async def check_device_health(self):
-        """Check health of all devices."""
-        now = datetime.now()
-        unhealthy_devices = []
-        
-        for device_id, device in self.devices.items():
-            # Check if heartbeat is stale
-            if (now - device.last_heartbeat) > timedelta(minutes=5):
-                device.status = DeviceStatus.OFFLINE
-                unhealthy_devices.append(device_id)
-            
-            # Check resource usage
-            if device.resource_usage.get('gpu_memory', 0) > 90:
-                unhealthy_devices.append(device_id)
-        
-        return unhealthy_devices
-    
-    async def orchestrate_update(self, model_version: str, 
-                                  strategy: str = 'rolling'):
-        """Orchestrate model update across fleet."""
-        devices = list(self.devices.keys())
-        
-        if strategy == 'rolling':
-            # Update 10% at a time
-            batch_size = max(1, len(devices) // 10)
-            
-            for i in range(0, len(devices), batch_size):
-                batch = devices[i:i + batch_size]
-                
-                # Update batch
-                await self._update_batch(batch, model_version)
-                
-                # Wait for batch to complete
-                await asyncio.sleep(60)
-                
-                # Check health
-                unhealthy = await self.check_device_health()
-                if unhealthy:
-                    print(f"Unhealthy devices during update: {unhealthy}")
-                    # Rollback if too many failures
-                    if len(unhealthy) > batch_size * 0.5:
-                        await self._rollback_batch(batch)
-                        break
-        
-        elif strategy == 'canary':
-            # Update 1 device first
-            canary_device = devices[0]
-            await self._update_batch([canary_device], model_version)
-            
-            # Wait and check
-            await asyncio.sleep(300)
-            
-            if canary_device not in await self.check_device_health():
-                # Proceed with rest
-                await self._update_batch(devices[1:], model_version)
-            else:
-                print("Canary update failed, aborting")
-                await self._rollback_batch([canary_device])
-    
-    async def _update_batch(self, device_ids: List[str], model_version: str):
-        """Update a batch of devices."""
-        for device_id in device_ids:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.cloud_endpoint}/api/devices/{device_id}/update",
-                        json={'model_version': model_version}
-                    ) as response:
-                        if response.status == 200:
-                            self.devices[device_id].status = DeviceStatus.UPDATING
-                        else:
-                            print(f"Failed to update {device_id}")
-            except Exception as e:
-                print(f"Error updating {device_id}: {e}")
-    
-    async def _rollback_batch(self, device_ids: List[str]):
-        """Rollback a batch of devices."""
-        for device_id in device_ids:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.cloud_endpoint}/api/devices/{device_id}/rollback"
-                    ) as response:
-                        if response.status == 200:
-                            print(f"Rolled back {device_id}")
-            except Exception as e:
-                print(f"Error rolling back {device_id}: {e}")
-    
-    def get_fleet_status(self) -> Dict:
-        """Get overall fleet status."""
-        status_counts = {
-            'total': len(self.devices),
-            'online': sum(1 for d in self.devices.values() 
-                         if d.status == DeviceStatus.ONLINE),
-            'offline': sum(1 for d in self.devices.values() 
-                          if d.status == DeviceStatus.OFFLINE),
-            'updating': sum(1 for d in self.devices.values() 
-                           if d.status == DeviceStatus.UPDATING),
-            'error': sum(1 for d in self.devices.values() 
-                        if d.status == DeviceStatus.ERROR)
-        }
-        
-        return status_counts
-```
+| Scenario | Why Edge Doesn't Fit | Alternative |
+|----------|---------------------|-------------|
+| Model requires > 100 TOPS | Edge hardware insufficient | Cloud inference |
+| Frequent model updates (daily) | OTA complexity too high | Cloud inference |
+| Centralized data processing needed | Edge fragmentation hurts | Cloud batch processing |
+| No edge engineering team | Deployment maintenance burden | Managed cloud services |
+| Prototype / development phase | Edge debugging is slow | Cloud for development, edge for production |
 
 ---
 
-## 19.4 Offline Inference Architecture
+## 19.9 Summary
 
-### Offline Mode Design
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              Offline Inference Architecture                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  Online Mode                             │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Input   │  │ Inference│  │  Output  │  │Cloud │  │   │
-│  │  │  Stream  │→ │  Engine  │→ │  Stream  │→ │Sync  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │   Network State   │                      │
-│                    │   Detection       │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  Offline Mode                            │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Input   │  │ Inference│  │  Local   │  │Queue │  │   │
-│  │  │  Stream  │→ │  Engine  │→ │  Storage │  │Manager│  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Key Features:                                                 │
-│  • Local model caching                                         │
-│  • Result queueing for later sync                              │
-│  • Graceful degradation                                        │
-│  • Automatic sync when connectivity restored                   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Implementation
-
-```python
-# Offline Inference Manager
-import asyncio
-import json
-import sqlite3
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, Dict, Any
-import aiohttp
-
-class OfflineInferenceManager:
-    def __init__(self, model_path: str, sync_endpoint: str, 
-                 local_db_path: str = '/data/offline_queue.db'):
-        self.model_path = model_path
-        self.sync_endpoint = sync_endpoint
-        self.local_db_path = local_db_path
-        
-        # Initialize local database
-        self._init_db()
-        
-        # Network state
-        self.is_online = True
-        self.sync_interval = 300  # 5 minutes
-        self.max_queue_size = 10000
-        
-        # Load model
-        self.model = self._load_model()
-    
-    def _init_db(self):
-        """Initialize local SQLite database."""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS inference_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input_data TEXT NOT NULL,
-                output_data TEXT,
-                timestamp TEXT NOT NULL,
-                synced BOOLEAN DEFAULT FALSE,
-                model_version TEXT
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def _load_model(self):
-        """Load model from local storage."""
-        import onnxruntime as ort
-        
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
-        
-        return ort.InferenceSession(
-            self.model_path,
-            sess_options,
-            providers=['CPUExecutionProvider']
-        )
-    
-    async def check_connectivity(self) -> bool:
-        """Check if cloud is reachable."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.sync_endpoint}/health",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    return response.status == 200
-        except:
-            return False
-    
-    async def inference(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Run inference with offline support."""
-        # Run inference locally
-        output = self._run_inference(input_data)
-        
-        # Store in queue if offline
-        if not self.is_online:
-            self._queue_result(input_data, output)
-        
-        # Try to sync if online
-        if self.is_online:
-            await self._try_sync()
-        
-        return output
-    
-    def _run_inference(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Run local inference."""
-        import numpy as np
-        
-        # Preprocess input
-        input_tensor = self._preprocess(input_data)
-        
-        # Run inference
-        input_name = self.model.get_inputs()[0].name
-        output = self.model.run(None, {input_name: input_tensor})[0]
-        
-        # Postprocess output
-        result = self._postprocess(output)
-        
-        return result
-    
-    def _preprocess(self, input_data: Dict[str, Any]) -> np.ndarray:
-        """Preprocess input data."""
-        # Example: image preprocessing
-        if 'image' in input_data:
-            import cv2
-            img = cv2.imdecode(
-                np.frombuffer(input_data['image'], np.uint8),
-                cv2.IMREAD_COLOR
-            )
-            img = cv2.resize(img, (224, 224))
-            img = img.astype(np.float32) / 255.0
-            img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-            img = img.transpose(2, 0, 1)
-            return np.expand_dims(img, axis=0)
-        
-        return input_data.get('tensor', np.array([]))
-    
-    def _postprocess(self, output: np.ndarray) -> Dict[str, Any]:
-        """Postprocess inference output."""
-        # Apply softmax
-        exp_output = np.exp(output - np.max(output))
-        probabilities = exp_output / exp_output.sum()
-        
-        return {
-            'predictions': probabilities.tolist(),
-            'timestamp': datetime.now().isoformat(),
-            'model_version': self._get_model_version()
-        }
-    
-    def _get_model_version(self) -> str:
-        """Get current model version."""
-        version_file = Path(self.model_path).parent / 'version.json'
-        if version_file.exists():
-            with open(version_file, 'r') as f:
-                return json.load(f).get('version', 'unknown')
-        return 'unknown'
-    
-    def _queue_result(self, input_data: Dict, output: Dict):
-        """Queue result for later sync."""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        # Check queue size
-        cursor.execute('SELECT COUNT(*) FROM inference_queue WHERE synced = FALSE')
-        queue_size = cursor.fetchone()[0]
-        
-        if queue_size >= self.max_queue_size:
-            # Remove oldest unsynced results
-            cursor.execute('''
-                DELETE FROM inference_queue 
-                WHERE synced = FALSE 
-                AND id IN (
-                    SELECT id FROM inference_queue 
-                    WHERE synced = FALSE 
-                    ORDER BY timestamp ASC 
-                    LIMIT 1000
-                )
-            ''')
-        
-        # Insert new result
-        cursor.execute('''
-            INSERT INTO inference_queue (input_data, output_data, timestamp, model_version)
-            VALUES (?, ?, ?, ?)
-        ''', (
-            json.dumps(input_data),
-            json.dumps(output),
-            datetime.now().isoformat(),
-            self._get_model_version()
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    async def _try_sync(self):
-        """Try to sync queued results to cloud."""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        # Get unsynced results
-        cursor.execute('''
-            SELECT id, input_data, output_data, timestamp, model_version
-            FROM inference_queue
-            WHERE synced = FALSE
-            ORDER BY timestamp ASC
-            LIMIT 100
-        ''')
-        
-        results = cursor.fetchall()
-        
-        if not results:
-            conn.close()
-            return
-        
-        # Sync to cloud
-        try:
-            async with aiohttp.ClientSession() as session:
-                for row in results:
-                    record_id, input_data, output_data, timestamp, model_version = row
-                    
-                    await session.post(
-                        f"{self.sync_endpoint}/api/inference/results",
-                        json={
-                            'input': json.loads(input_data),
-                            'output': json.loads(output_data),
-                            'timestamp': timestamp,
-                            'model_version': model_version
-                        }
-                    )
-                    
-                    # Mark as synced
-                    cursor.execute(
-                        'UPDATE inference_queue SET synced = TRUE WHERE id = ?',
-                        (record_id,)
-                    )
-            
-            conn.commit()
-            
-        except Exception as e:
-            print(f"Sync failed: {e}")
-        
-        finally:
-            conn.close()
-    
-    async def sync_loop(self):
-        """Background sync loop."""
-        while True:
-            # Check connectivity
-            self.is_online = await self.check_connectivity()
-            
-            if self.is_online:
-                await self._try_sync()
-            
-            await asyncio.sleep(self.sync_interval)
-    
-    def get_queue_status(self) -> Dict:
-        """Get queue status."""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT COUNT(*) FROM inference_queue WHERE synced = FALSE')
-        unsynced = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM inference_queue WHERE synced = TRUE')
-        synced = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        return {
-            'unsynced': unsynced,
-            'synced': synced,
-            'total': unsynced + synced,
-            'is_online': self.is_online
-        }
-```
+- **Edge inference frameworks** vary significantly in hardware support and performance: TensorRT for NVIDIA, OpenVINO for Intel, ONNX Runtime for cross-platform, TFLite for mobile/Edge TPU
+- **OTA model updates** require careful architecture: delta updates reduce bandwidth by 80-95%, canary deployment catches issues before fleet-wide rollout, and dual-model slots enable instant rollback
+- **Edge-cloud synchronization** should be hybrid: push notifications trigger pull-based updates on the device's connectivity schedule
+- **BMW's architecture** demonstrates production-grade edge AI: two-tier edge (device + server), cloud-managed but edge-executed, global model with local calibration
+- **Memory management** is the most common production failure in edge deployments — mandatory profiling, soak testing, and real-time telemetry are essential
+- Edge deployment is a **solved problem** architecturally but requires discipline in testing, monitoring, and rollback capabilities
 
 ---
 
-## 19.5 Edge-Cloud Collaboration Architecture
+## Discussion Questions
 
-### Architecture Overview
+1. Design an OTA update system for 100,000 IoT devices running AI models. The devices have 512MB RAM, 2GB storage, and connect to the internet once per hour for 5 minutes. What update strategy, packaging format, and rollback mechanism would you use?
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              Edge-Cloud Collaboration Architecture              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   Cloud Layer                            │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Model   │  │ Training │  │  Fleet   │  │Data  │  │   │
-│  │  │ Registry │  │ Service  │  │ Manager  │  │Lake  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │  Communication    │                      │
-│                    │  Layer (MQTT/     │                      │
-│                    │  gRPC/HTTP)       │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   Edge Layer                             │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Edge    │  │  Local   │  │ Inference│  │Data  │  │   │
-│  │  │ Agent   │  │  Cache   │  │  Engine  │  │Filter│  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   Device Layer                           │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  Sensor  │  │  Camera  │  │  Actuator│  │User  │  │   │
-│  │  │  Array   │  │  Feed    │  │  Control │  │Input │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+2. Compare the total cost of edge deployment versus cloud deployment for a video analytics system with 1,000 cameras. Include hardware, software, maintenance, network, and model update costs over 3 years.
 
-### Communication Protocol
+3. A factory has 50 edge devices running quality inspection AI. After a model update, 5 devices show degraded accuracy. Design a response plan that minimizes production downtime while investigating the issue.
 
-```python
-# Edge-Cloud Communication Protocol
-import asyncio
-import json
-from datetime import datetime
-from typing import Dict, Any, Optional
-from enum import Enum
+4. How would you implement federated learning across 100 edge devices to improve a model without centralizing training data? What communication and aggregation patterns would you use?
 
-class MessageType(Enum):
-    HEARTBEAT = "heartbeat"
-    MODEL_UPDATE = "model_update"
-    INFERENCE_RESULT = "inference_result"
-    TRAINING_DATA = "training_data"
-    CONFIG_UPDATE = "config_update"
-    ALERT = "alert"
-
-class EdgeCloudProtocol:
-    def __init__(self, device_id: str, cloud_endpoint: str):
-        self.device_id = device_id
-        self.cloud_endpoint = cloud_endpoint
-        self.message_queue = asyncio.Queue()
-        self.is_connected = False
-        
-    async def connect(self):
-        """Establish connection to cloud."""
-        # Implementation depends on protocol (MQTT, gRPC, etc.)
-        self.is_connected = True
-        
-    async def send_message(self, msg_type: MessageType, payload: Dict[str, Any]):
-        """Send message to cloud."""
-        message = {
-            'device_id': self.device_id,
-            'message_type': msg_type.value,
-            'timestamp': datetime.now().isoformat(),
-            'payload': payload
-        }
-        
-        if self.is_connected:
-            # Send directly
-            await self._send_to_cloud(message)
-        else:
-            # Queue for later
-            await self.message_queue.put(message)
-    
-    async def receive_messages(self):
-        """Receive messages from cloud."""
-        # Implementation depends on protocol
-        pass
-    
-    async def _send_to_cloud(self, message: Dict):
-        """Internal send implementation."""
-        import aiohttp
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.cloud_endpoint}/api/messages",
-                json=message
-            ) as response:
-                return await response.json()
-    
-    async def sync_queued_messages(self):
-        """Sync queued messages when connected."""
-        while not self.message_queue.empty():
-            message = await self.message_queue.get()
-            try:
-                await self._send_to_cloud(message)
-            except Exception:
-                # Put back in queue on failure
-                await self.message_queue.put(message)
-                break
-```
-
-### Collaborative Training
-
-```python
-# Federated Learning for Edge-Cloud Collaboration
-import torch
-import torch.nn as nn
-from typing import List, Dict
-import asyncio
-
-class FederatedLearningCoordinator:
-    def __init__(self, global_model: nn.Module, num_clients: int):
-        self.global_model = global_model
-        self.num_clients = num_clients
-        self.round_number = 0
-        self.client_updates = []
-    
-    async def coordinate_round(self, edge_clients: List):
-        """Coordinate one round of federated learning."""
-        self.round_number += 1
-        
-        # Send global model to clients
-        global_weights = self.global_model.state_dict()
-        
-        # Collect updates from clients
-        updates = []
-        for client in edge_clients:
-            update = await client.train_locally(global_weights)
-            updates.append(update)
-        
-        # Aggregate updates
-        aggregated_weights = self._aggregate_updates(updates)
-        
-        # Update global model
-        self.global_model.load_state_dict(aggregated_weights)
-        
-        return aggregated_weights
-    
-    def _aggregate_updates(self, updates: List[Dict]) -> Dict:
-        """Aggregate client updates using FedAvg."""
-        averaged_weights = {}
-        
-        for key in updates[0].keys():
-            averaged_weights[key] = torch.zeros_like(updates[0][key])
-            
-            for update in updates:
-                averaged_weights[key] += update[key]
-            
-            averaged_weights[key] /= len(updates)
-        
-        return averaged_weights
-
-class EdgeFederatedClient:
-    def __init__(self, local_data, local_model: nn.Module, 
-                 local_epochs: int = 5):
-        self.local_data = local_data
-        self.local_model = local_model
-        self.local_epochs = local_epochs
-    
-    async def train_locally(self, global_weights: Dict) -> Dict:
-        """Train locally and return update."""
-        # Load global weights
-        self.local_model.load_state_dict(global_weights)
-        
-        # Local training
-        optimizer = torch.optim.SGD(self.local_model.parameters(), lr=0.01)
-        criterion = nn.CrossEntropyLoss()
-        
-        self.local_model.train()
-        for epoch in range(self.local_epochs):
-            for data, labels in self.local_data:
-                optimizer.zero_grad()
-                output = self.local_model(data)
-                loss = criterion(output, labels)
-                loss.backward()
-                optimizer.step()
-        
-        # Calculate update (difference from global)
-        update = {}
-        for key, value in self.local_model.state_dict().items():
-            update[key] = value - global_weights[key]
-        
-        return update
-```
+5. A self-driving car fleet needs to update models while vehicles are in motion. What safety constraints must be satisfied, and how does this change the OTA architecture compared to stationary edge devices?
 
 ---
 
-## 💡 Case Study: NVIDIA Jetson Edge Deployment
+## Exercises
 
-### Complete Deployment Pipeline
+**Exercise 1:** Set up a complete edge deployment pipeline: train a model, optimize it with TensorRT, package it for a Jetson device, deploy via OTA, and verify rollback works correctly.
 
-🔴 Advanced
+**Exercise 2:** Implement a memory profiling framework for edge devices that tracks memory usage over 24 hours, detects leaks, and generates alerts when usage exceeds defined thresholds.
 
-```yaml
-# NVIDIA Jetson Deployment Configuration
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: jetson-config
-  namespace: edge-ai
-data:
-  DEPLOY_MODE: "production"
-  MODEL_FORMAT: "tensorrt"
-  ENABLE_DLA: "true"
-  GPU_MEMORY_FRACTION: "0.8"
-  MAX_BATCH_SIZE: "4"
-  INFERENCE_PRECISION: "fp16"
----
-# Jetson-specific DaemonSet
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: jetson-agent
-  namespace: edge-ai
-spec:
-  selector:
-    matchLabels:
-      app: jetson-agent
-  template:
-    metadata:
-      labels:
-        app: jetson-agent
-    spec:
-      containers:
-      - name: jetson-agent
-        image: nvcr.io/nvidia/l4t-pytorch:r32.7.1-pth1.10-py3
-        command:
-        - python
-        - /scripts/jetson_agent.py
-        env:
-        - name: JETSON_MODEL
-          value: "resnet50"
-        - name: TENSORRT_CACHE_PATH
-          value: "/var/cache/tensorrt"
-        resources:
-          limits:
-            nvidia.com/gpu: "1"
-        volumeMounts:
-        - name: model-cache
-          mountPath: /var/cache/models
-        - name: tensorrt-cache
-          mountPath: /var/cache/tensorrt
-        - name: dla-config
-          mountPath: /etc/dla
-      volumes:
-      - name: model-cache
-        hostPath:
-          path: /var/lib/jetson-models
-          type: DirectoryOrCreate
-      - name: tensorrt-cache
-        hostPath:
-          path: /var/cache/tensorrt
-          type: DirectoryOrCreate
-      - name: dla-config
-        configMap:
-          name: dla-config
-      nodeSelector:
-        hardware: nvidia-jetson
-      tolerations:
-      - key: "jetson"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
-```
-
-### Jetson Optimization Code
-
-```python
-# NVIDIA Jetson Optimization
-import tensorrt as trt
-import pycuda.driver as cuda
-import numpy as np
-from pathlib import Path
-
-class JetsonInference:
-    def __init__(self, model_path: str, use_dla: bool = False, 
-                 dla_core: int = 0):
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        self.use_dla = use_dla
-        self.dla_core = dla_core
-        
-        # Build or load engine
-        self.engine = self._load_engine(model_path)
-        self.context = self.engine.create_execution_context()
-        
-        # Allocate memory
-        self._allocate_buffers()
-        
-        # CUDA stream
-        self.stream = cuda.Stream()
-    
-    def _load_engine(self, model_path: str) -> trt.ICudaEngine:
-        """Load TensorRT engine."""
-        cache_path = Path(model_path).with_suffix('.trt')
-        
-        if cache_path.exists():
-            # Load cached engine
-            with open(cache_path, 'rb') as f:
-                runtime = trt.Runtime(self.logger)
-                return runtime.deserialize_cuda_engine(f.read())
-        else:
-            # Build new engine
-            engine = self._build_engine(model_path)
-            
-            # Cache engine
-            with open(cache_path, 'wb') as f:
-                f.write(engine.serialize())
-            
-            return engine
-    
-    def _build_engine(self, onnx_path: str) -> trt.ICudaEngine:
-        """Build TensorRT engine from ONNX."""
-        builder = trt.Builder(self.logger)
-        network = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
-        parser = trt.OnnxParser(network, self.logger)
-        
-        # Parse ONNX
-        with open(onnx_path, 'rb') as f:
-            if not parser.parse(f.read()):
-                for error in range(parser.num_errors):
-                    print(parser.get_error(error))
-                raise RuntimeError("Failed to parse ONNX model")
-        
-        # Configure builder
-        config = builder.create_builder_config()
-        config.max_workspace_size = 1 << 28  # 256MB
-        
-        # Enable FP16
-        if builder.platform_has_fast_fp16:
-            config.set_flag(trt.BuilderFlag.FP16)
-        
-        # Enable DLA if available
-        if self.use_dla and builder.platform_has_fast_dla:
-            config.default_device_type = trt.DeviceType.DLA
-            config.DLA_core = self.dla_core
-            config.set_flag(trt.BuilderFlag.STRICT_TYPES)
-        
-        # Build engine
-        engine = builder.build_engine(network, config)
-        
-        return engine
-    
-    def _allocate_buffers(self):
-        """Allocate GPU memory."""
-        self.inputs = []
-        self.outputs = []
-        self.bindings = []
-        
-        for i in range(self.engine.num_bindings):
-            shape = self.engine.get_binding_shape(i)
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            
-            size = trt.volume(shape)
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
-            self.bindings.append(int(device_mem))
-            
-            if self.engine.binding_is_input(i):
-                self.inputs.append({
-                    'host': host_mem,
-                    'device': device_mem,
-                    'shape': shape
-                })
-            else:
-                self.outputs.append({
-                    'host': host_mem,
-                    'device': device_mem,
-                    'shape': shape
-                })
-    
-    def infer(self, input_data: np.ndarray) -> np.ndarray:
-        """Run inference on Jetson."""
-        # Reshape input if needed
-        input_data = input_data.astype(np.float32)
-        
-        # Copy input to pinned memory
-        np.copyto(self.inputs[0]['host'], input_data.ravel())
-        
-        # Transfer to GPU
-        cuda.memcpy_htod_async(
-            self.inputs[0]['device'],
-            self.inputs[0]['host'],
-            self.stream
-        )
-        
-        # Run inference
-        self.context.execute_async_v2(
-            bindings=self.bindings,
-            stream_handle=self.stream.handle
-        )
-        
-        # Transfer output back
-        cuda.memcpy_dtoh_async(
-            self.outputs[0]['host'],
-            self.outputs[0]['device'],
-            self.stream
-        )
-        
-        # Synchronize
-        self.stream.synchronize()
-        
-        return self.outputs[0]['host'].reshape(self.outputs[0]['shape'])
-
-# Usage on Jetson
-def deploy_on_jetson():
-    """Complete Jetson deployment example."""
-    # Initialize inference
-    engine = JetsonInference(
-        model_path='/var/lib/jetson-models/resnet50.onnx',
-        use_dla=True,
-        dla_core=0
-    )
-    
-    # Process camera feed
-    import cv2
-    
-    cap = cv2.VideoCapture(0)
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Preprocess
-        input_tensor = preprocess_frame(frame)
-        
-        # Inference
-        output = engine.infer(input_tensor)
-        
-        # Postprocess
-        predictions = postprocess_output(output)
-        
-        # Display
-        display_predictions(frame, predictions)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    
-    cap.release()
-
-def preprocess_frame(frame):
-    """Preprocess camera frame."""
-    import cv2
-    
-    # Resize
-    img = cv2.resize(frame, (224, 224))
-    
-    # Convert BGR to RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    # Normalize
-    img = img.astype(np.float32) / 255.0
-    img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-    
-    # Transpose
-    img = img.transpose(2, 0, 1)
-    
-    # Add batch
-    return np.expand_dims(img, axis=0)
-
-def postprocess_output(output):
-    """Postprocess model output."""
-    # Softmax
-    exp_output = np.exp(output - np.max(output))
-    probs = exp_output / exp_output.sum()
-    
-    # Get top predictions
-    top_k = 5
-    top_indices = np.argsort(probs[0])[-top_k:][::-1]
-    top_probs = probs[0][top_indices]
-    
-    return list(zip(top_indices.tolist(), top_probs.tolist()))
-
-def display_predictions(frame, predictions):
-    """Display predictions on frame."""
-    import cv2
-    
-    y_offset = 30
-    for class_id, prob in predictions:
-        text = f"Class {class_id}: {prob:.4f}"
-        cv2.putText(frame, text, (10, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        y_offset += 30
-    
-    cv2.imshow('Jetson Inference', frame)
-```
+**Exercise 3:** Design and implement a canary deployment system that automatically rolls back a model update if error rate exceeds 2% within the first 100 inferences on any device.
 
 ---
 
-## 📝 Exercises
+## References
 
-### Exercise 19.1: Edge Deployment Pipeline
-Build a complete edge deployment pipeline that:
-1. Exports PyTorch model to ONNX
-2. Optimizes with TensorRT
-3. Deploys to Jetson device
-4. Monitors inference performance
-5. Handles model updates
-
-### Exercise 19.2: Offline Inference
-Implement offline inference for a remote location:
-1. Handle network disconnections gracefully
-2. Queue results locally
-3. Sync when connectivity restored
-4. Maintain data consistency
-5. Handle model updates during offline periods
-
-### Exercise 19.3: Edge-Cloud Collaboration
-Design an edge-cloud collaboration system for:
-1. Federated learning across 100 edge devices
-2. Privacy-preserving data aggregation
-3. Efficient model distribution
-4. Real-time monitoring and alerting
-5. Automatic scaling based on demand
-
----
-
-## ⚠️ Warnings
-
-1. **Resource Constraints**: Edge devices have limited compute and memory. Optimize models aggressively.
-2. **Thermal Throttling**: Monitor device temperature. Performance degrades under thermal pressure.
-3. **Power Management**: Implement power-aware scheduling. Battery-powered devices need careful energy management.
-4. **Security**: Edge devices are physically exposed. Implement secure boot, encrypted storage, and remote wipe.
-5. **Connectivity**: Design for intermittent connectivity. Never assume constant network access.
-
----
-
-## Summary
-
-This chapter covered edge deployment architecture and strategies:
-1. Edge inference frameworks (ONNX Runtime, TensorRT, TFLite)
-2. Model update strategies (OTA, versioning, rollback)
-3. Edge cluster management (K3s, Kubernetes at edge)
-4. Offline inference architecture
-5. Edge-cloud collaboration patterns
-6. NVIDIA Jetson deployment best practices
-
-This completes Part 6: Edge AI Architecture. You now have comprehensive knowledge of both cloud-native and edge AI architectures, enabling you to design and deploy AI systems across the entire computing continuum.
+- NVIDIA Jetson Edge AI Deployment: https://developer.nvidia.com/embedded-computing
+- TensorRT Developer Guide: https://developer.nvidia.com/tensorrt
+- ONNX Runtime Deployment Guide: https://onnxruntime.ai/docs/tutorials/
+- Google Coral Deployment: https://coral.ai/docs/
+- OpenVINO Edge Deployment: https://docs.openvino.ai/
+- BMW AI in Manufacturing: https://www.bmwgroup.com/en/innovation/
+- Siemens MindSphere IoT Platform: https://www.siemens.com/global/en/products/software/mindsphere.html
+- NVIDIA Fleet Command (OTA Management): https://developer.nvidia.com/fleet-command
+- Eclipse hawkBit (OTA Update Framework): https://www.eclipse.org/hawkbit/

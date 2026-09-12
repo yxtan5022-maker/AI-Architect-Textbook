@@ -1,1458 +1,545 @@
 # Chapter 9: Model Monitoring & Observability
 
-> **Part III: MLOps Architecture**
+## Learning Objectives
 
-**Learning Objectives:**
-- Implement comprehensive model drift detection
-- Design data drift monitoring systems
-- Build performance metrics monitoring dashboards
-- Configure alerting and automated response systems
-- Architect observability platforms for ML systems
+By the end of this chapter, you will be able to:
 
----
-
-## 9.1 Model Drift Detection
-
-### 9.1.1 What Is Model Drift?
-
-🟢 **Beginner**
-
-Model drift occurs when a deployed model's performance degrades over time due to changes in the underlying data distribution or relationships between features and targets.
-
-```
-Model Drift Illustration:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Accuracy Over Time:                                        │
-│                                                             │
-│  0.95 ┤ ●──●──●──●──●                                     │
-│  0.90 ┤              ●──●──●                               │
-│  0.85 ┤                     ●──●                           │
-│  0.80 ┤                          ●──●──●                   │
-│  0.75 ┤                                 ●──●              │
-│  0.70 ┤                                    ●──●           │
-│       └─────┬─────┬─────┬─────┬─────┬─────┬─────        │
-│            T0    T1    T2    T3    T4    T5    T6         │
-│            ▲                                     ▲         │
-│            │                                     │         │
-│        Model deployed                   Performance        │
-│                                          degraded          │
-│                                                             │
-│  Types of Drift:                                            │
-│  ├── Data Drift: Input data distribution changes           │
-│  ├── Concept Drift: Relationship between X and Y changes   │
-│  ├── Model Drift: Model performance degrades               │
-│  └── Upstream Drift: Data pipeline changes affect inputs   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.1.2 Types of Drift
-
-🟡 **Intermediate**
-
-| Drift Type | Description | Detection Method | Example |
-|------------|-------------|------------------|---------|
-| **Data Drift** | Input distribution changes | Statistical tests (KS, PSI) | Seasonal patterns change |
-| **Concept Drift** | P(Y\|X) changes | Performance monitoring | User behavior shifts |
-| **Model Drift** | Overall performance degradation | Accuracy/F1 monitoring | Model becomes outdated |
-| **Prediction Drift** | Output distribution changes | Distribution comparison | Prediction patterns shift |
-| **Covariate Drift** | Feature distribution changes | Feature-level monitoring | Data collection changes |
-
-### 9.1.3 Drift Detection Algorithms
-
-🔴 **Advanced**
-
-```python
-import numpy as np
-from scipy import stats
-from sklearn.metrics import accuracy_score
-
-class ModelDriftDetector:
-    def __init__(self, reference_data, reference_predictions):
-        self.reference_data = reference_data
-        self.reference_predictions = reference_predictions
-    
-    def detect_data_drift_ks(self, current_data, feature_idx, threshold=0.05):
-        """Kolmogorov-Smirnov test for data drift"""
-        
-        reference_feature = self.reference_data[:, feature_idx]
-        current_feature = current_data[:, feature_idx]
-        
-        # Perform KS test
-        ks_statistic, p_value = stats.ks_2samp(reference_feature, current_feature)
-        
-        # Determine if drift occurred
-        is_drifted = p_value < threshold
-        
-        return {
-            "test": "Kolmogorov-Smirnov",
-            "feature_idx": feature_idx,
-            "ks_statistic": ks_statistic,
-            "p_value": p_value,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-    
-    def detect_data_drift_psi(self, reference_data, current_data, feature_idx, threshold=0.1):
-        """Population Stability Index for data drift"""
-        
-        reference_feature = reference_data[:, feature_idx]
-        current_feature = current_data[:, feature_idx]
-        
-        # Create bins
-        n_bins = 10
-        combined = np.concatenate([reference_feature, current_feature])
-        bins = np.percentile(combined, np.linspace(0, 100, n_bins + 1))
-        
-        # Calculate proportions
-        ref_proportions = np.histogram(reference_feature, bins=bins)[0] / len(reference_feature)
-        cur_proportions = np.histogram(current_feature, bins=bins)[0] / len(current_feature)
-        
-        # Avoid division by zero
-        ref_proportions = np.where(ref_proportions == 0, 0.0001, ref_proportions)
-        cur_proportions = np.where(cur_proportions == 0, 0.0001, cur_proportions)
-        
-        # Calculate PSI
-        psi = np.sum((cur_proportions - ref_proportions) * np.log(cur_proportions / ref_proportions))
-        
-        # Determine drift
-        is_drifted = psi > threshold
-        
-        return {
-            "test": "Population Stability Index",
-            "feature_idx": feature_idx,
-            "psi": psi,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-    
-    def detect_concept_drift(self, current_data, current_labels, window_size=100):
-        """Detect concept drift using performance degradation"""
-        
-        # Calculate performance on recent data
-        recent_predictions = self.model.predict(current_data[-window_size:])
-        recent_labels = current_labels[-window_size:]
-        recent_accuracy = accuracy_score(recent_labels, recent_predictions)
-        
-        # Compare with reference performance
-        reference_accuracy = self.reference_accuracy
-        performance_drop = reference_accuracy - recent_accuracy
-        
-        # Threshold for significant drop
-        threshold = 0.05  # 5% performance drop
-        
-        is_drifted = performance_drop > threshold
-        
-        return {
-            "test": "Performance Degradation",
-            "reference_accuracy": reference_accuracy,
-            "recent_accuracy": recent_accuracy,
-            "performance_drop": performance_drop,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-    
-    def detect_prediction_drift(self, current_predictions, threshold=0.1):
-        """Detect drift in prediction distribution"""
-        
-        # Compare prediction distributions
-        reference_mean = np.mean(self.reference_predictions)
-        reference_std = np.std(self.reference_predictions)
-        
-        current_mean = np.mean(current_predictions)
-        current_std = np.std(current_predictions)
-        
-        # Calculate distribution shift
-        mean_shift = abs(current_mean - reference_mean) / reference_std
-        std_shift = abs(current_std - reference_std) / reference_std
-        
-        is_drifted = mean_shift > threshold or std_shift > threshold
-        
-        return {
-            "test": "Prediction Distribution",
-            "mean_shift": mean_shift,
-            "std_shift": std_shift,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-
-# Usage
-detector = ModelDriftDetector(reference_data, reference_predictions)
-
-# Check data drift for each feature
-for i in range(n_features):
-    result = detector.detect_data_drift_ks(current_data, feature_idx=i)
-    if result["is_drifted"]:
-        print(f"Feature {i}: Drift detected (p={result['p_value']:.4f})")
-
-# Check concept drift
-concept_result = detector.detect_concept_drift(current_data, current_labels)
-if concept_result["is_drifted"]:
-    print(f"Concept drift: {concept_result['performance_drop']:.2%} drop")
-```
+1. Design a comprehensive ML monitoring strategy covering data, model, and system health
+2. Implement drift detection using statistical methods and production-grade tools
+3. Configure Prometheus and Grafana for ML-specific metrics collection and visualization
+4. Identify silent model degradation before it impacts business metrics
+5. Build alerting strategies that balance sensitivity with alert fatigue
 
 ---
 
-## 9.2 Data Drift Monitoring
+## 9.1 Why ML Monitoring is Different
 
-### 9.2.1 Data Drift Monitoring Architecture
+Traditional software monitoring asks: "Is the system working?" ML monitoring asks: "Is the system working AND are its outputs still correct?" This second question is fundamentally harder because you often don't know the correct answer at serving time.
 
-🟡 **Intermediate**
+### The Three Types of Drift
+
+| Drift Type | What Changes | Detection Method | Example |
+|-----------|-------------|-----------------|---------|
+| **Data drift** (covariate shift) | Distribution of input features | Statistical tests on feature distributions | User behavior changes after a holiday |
+| **Concept drift** | Relationship between features and target | Model performance degradation | Spam patterns evolve over time |
+| **Prediction drift** | Distribution of model outputs | Statistical tests on prediction distribution | Model starts predicting more "positive" outcomes |
+
+### Why Silent Failures Happen
+
+ML models fail silently because:
+1. **No ground truth at serving time**: Unlike a web server returning 500 errors, a model returning a wrong prediction doesn't trigger an exception
+2. **Gradual degradation**: Most model failures are gradual, not catastrophic. Performance degrades slowly, staying above alert thresholds for weeks
+3. **Correlation masking**: Business metrics may not immediately reflect model degradation because of lag effects or correlation with other factors
+4. **Distribution shift is normal**: Data distributions change constantly. The model doesn't break — it becomes less accurate over time
+
+> 📌 **Verified Data**: Prometheus is a CNCF graduated project and the industry standard for metrics collection and alerting (prometheus.io). Grafana is the industry standard for metrics visualization (grafana.com). Together, they form the backbone of most production ML monitoring stacks. Seldon Core (4.8K stars, seldon.io) provides built-in integration with Prometheus for ML-specific metrics.
+
+---
+
+## 9.2 ML Monitoring Architecture
+
+### The Monitoring Stack
 
 ```
-Data Drift Monitoring Pipeline:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Data Sources                            │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Training │  │ Production│  │ External │         │   │
-│  │  │ Data     │  │ Data     │  │ Data     │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  └───────┼──────────────┼──────────────┼───────────────┘   │
-│          │              │              │                    │
-│          ▼              ▼              ▼                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Feature Store                           │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Reference Statistics (Training)             │   │   │
-│  │  │  ├── Mean, Std, Min, Max per feature        │   │   │
-│  │  │  ├── Distribution histograms                 │   │   │
-│  │  │  └── Correlation matrices                    │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              Drift Detection Engine                   │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Statistical│  │ ML-Based │  │ Business │         │   │
-│  │  │ Tests     │  │ Detection│  │ Rules    │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  │       └──────────────┼──────────────┘               │   │
-│  │                      │                              │   │
-│  │                      ▼                              │   │
-│  │              ┌──────────────┐                       │   │
-│  │              │ Drift Score  │                       │   │
-│  │              │ Calculator   │                       │   │
-│  │              └──────────────┘                       │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              Alert & Response                         │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Alert    │  │ Auto-    │  │ Dashboard│         │   │
-│  │  │ System   │  │ Retrain  │  │ Display  │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   Monitoring Stack                       │
+├─────────────┬─────────────┬─────────────┬───────────────┤
+│  Data Layer │ Model Layer │ System Layer│ Business Layer│
+├─────────────┼─────────────┼─────────────┼───────────────┤
+│ Feature     │ Prediction  │ Latency     │ Conversion    │
+│ distributions│ distributions│ Throughput  │ Revenue       │
+│ Missing     │ Accuracy    │ Error rate  │ User          │
+│ values      │ (when known)│ CPU/GPU     │ satisfaction  │
+│ Schema      │ Confidence  │ Memory      │ Churn         │
+│ changes     │ scores      │ Network     │ Engagement    │
+└─────────────┴─────────────┴─────────────┴───────────────┘
+         │             │             │             │
+         ▼             ▼             ▼             ▼
+┌─────────────────────────────────────────────────────────┐
+│              Prometheus (Metrics Collection)             │
+├─────────────────────────────────────────────────────────┤
+│              Grafana (Visualization & Alerting)          │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 9.2.2 Implementing Data Drift Detection with Evidently
+### Key Metrics by Layer
 
-🔴 **Advanced**
+| Layer | Metric | Description | Alert Threshold |
+|-------|--------|-------------|----------------|
+| **Data** | Feature missing rate | % of requests with missing features | > 5% increase |
+| **Data** | Feature distribution | KL divergence from training distribution | > 0.1 |
+| **Data** | Schema violations | Requests with unexpected feature types | > 0 |
+| **Model** | Prediction distribution | PSI from training predictions | > 0.2 |
+| **Model** | Confidence scores | Average prediction confidence | < 0.3 (for calibrated models) |
+| **Model** | A/B test metrics | Online performance vs. baseline | Statistical significance |
+| **System** | Latency (p50, p99) | Inference time | > 2x baseline |
+| **System** | Throughput | Requests per second | < 50% of capacity |
+| **System** | Error rate | Failed predictions | > 1% |
+| **Business** | Conversion rate | Business KPI | < 5% degradation |
+| **Business** | Revenue per prediction | ROI metric | < 10% degradation |
+
+---
+
+## 9.3 Prometheus for ML Monitoring
+
+### Prometheus Architecture
+
+Prometheus uses a pull-based model where it scrapes metrics from instrumented endpoints at regular intervals:
+
+```
+ML Model Server (exposes /metrics endpoint)
+         │
+         │ HTTP GET /metrics
+         ▼
+    Prometheus Server
+         │
+         │ PromQL queries
+         ├──► Grafana Dashboards
+         └──► Alertmanager → Slack/Email/PagerDuty
+```
+
+### ML-Specific Prometheus Metrics
 
 ```python
-from evidently import ColumnMapping
-from evidently.report import Report
-from evidently.metric_preset import (
-    DataDriftPreset, 
-    DataQualityPreset,
-    TargetDriftPreset
-)
-import pandas as pd
+from prometheus_client import Counter, Histogram, Gauge, Summary
 
-class DataDriftMonitor:
-    def __init__(self, reference_data: pd.DataFrame):
-        self.reference_data = reference_data
-        self.column_mapping = None
-        
-    def set_column_mapping(self, target_column: str = None, 
-                          numerical_columns: list = None,
-                          categorical_columns: list = None):
-        """Set column mapping for Evidently"""
-        
-        self.column_mapping = ColumnMapping(
-            target=target_column,
-            numerical_features=numerical_columns,
-            categorical_features=categorical_columns
-        )
-    
-    def generate_drift_report(self, current_data: pd.DataFrame, 
-                             save_path: str = None) -> dict:
-        """Generate comprehensive drift report"""
-        
-        # Create drift report
-        drift_report = Report(metrics=[
-            DataDriftPreset(),
-            DataQualityPreset(),
-            TargetDriftPreset()
-        ])
-        
-        # Run report
-        drift_report.run(
-            reference_data=self.reference_data,
-            current_data=current_data,
-            column_mapping=self.column_mapping
-        )
-        
-        # Get results
-        report_dict = drift_report.as_dict()
-        
-        # Save report if path provided
-        if save_path:
-            drift_report.save_html(save_path)
-        
-        # Extract key metrics
-        result = {
-            "dataset_drift": report_dict["metrics"][0]["result"]["dataset_drift"],
-            "drift_score": report_dict["metrics"][0]["result"]["drift_score"],
-            "n_drifted_columns": report_dict["metrics"][0]["result"]["n_drifted_columns"],
-            "drifted_columns": report_dict["metrics"][0]["result"]["drifted_columns"]
-        }
-        
-        return result
-    
-    def monitor_real_time(self, current_batch: pd.DataFrame, 
-                         threshold: float = 0.5) -> dict:
-        """Real-time drift monitoring for streaming data"""
-        
-        # Calculate drift score for batch
-        drift_result = self.generate_drift_report(current_batch)
-        
-        # Check threshold
-        needs_alert = drift_result["drift_score"] > threshold
-        
-        # Determine action
-        if needs_alert:
-            action = {
-                "type": "alert",
-                "severity": "high" if drift_result["drift_score"] > 0.8 else "medium",
-                "message": f"Data drift detected: score={drift_result['drift_score']:.3f}",
-                "drifted_features": drift_result["drifted_columns"]
-            }
-        else:
-            action = {
-                "type": "continue",
-                "message": "No significant drift detected"
-            }
-        
-        return {
-            "drift_result": drift_result,
-            "action": action,
-            "timestamp": pd.Timestamp.now()
-        }
-
-# Usage
-monitor = DataDriftMonitor(reference_data=train_df)
-monitor.set_column_mapping(
-    target_column="target",
-    numerical_columns=["feature1", "feature2", "feature3"],
-    categorical_columns=["category1", "category2"]
+# Prediction metrics
+prediction_counter = Counter(
+    'ml_predictions_total',
+    'Total number of predictions made',
+    ['model_name', 'model_version', 'prediction_class']
 )
 
-# Generate report
-result = monitor.generate_drift_report(current_data=production_df)
-print(f"Dataset drift: {result['dataset_drift']}")
-print(f"Drift score: {result['drift_score']:.3f}")
-print(f"Drifted columns: {result['drifted_columns']}")
+prediction_latency = Histogram(
+    'ml_prediction_latency_seconds',
+    'Prediction latency in seconds',
+    ['model_name', 'model_version'],
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+)
+
+prediction_confidence = Summary(
+    'ml_prediction_confidence',
+    'Model prediction confidence scores',
+    ['model_name', 'model_version']
+)
+
+# Data drift metrics
+feature_drift = Gauge(
+    'ml_feature_drift_psi',
+    'Population Stability Index for feature drift',
+    ['model_name', 'feature_name']
+)
+
+missing_value_rate = Gauge(
+    'ml_missing_value_rate',
+    'Rate of missing values per feature',
+    ['model_name', 'feature_name']
+)
+
+# System metrics
+model_loaded = Gauge(
+    'ml_model_loaded',
+    'Whether model is loaded in memory',
+    ['model_name', 'model_version']
+)
+
+gpu_utilization = Gauge(
+    'ml_gpu_utilization_percent',
+    'GPU utilization percentage',
+    ['model_name', 'gpu_id']
+)
+```
+
+### PromQL Queries for ML Monitoring
+
+```promql
+# Prediction rate (predictions per second)
+rate(ml_predictions_total[5m])
+
+# p99 latency
+histogram_quantile(0.99, rate(ml_prediction_latency_seconds_bucket[5m]))
+
+# p50 latency
+histogram_quantile(0.50, rate(ml_prediction_latency_seconds_bucket[5m]))
+
+# Average confidence score
+avg(ml_prediction_confidence)
+
+# Feature drift alert
+ml_feature_drift_psi > 0.2
+
+# Missing value rate increase
+/ml_missing_value_rate > 0.05
+
+# GPU utilization below threshold
+/ml_gpu_utilization_percent < 30
 ```
 
 ---
 
-## 9.3 Performance Metrics Monitoring
+## 9.4 Drift Detection Methods
 
-### 9.3.1 Performance Metrics Framework
+### Statistical Tests for Data Drift
 
-🟢 **Beginner**
+| Test | Data Type | Null Hypothesis | When to Use |
+|------|----------|----------------|-------------|
+| **Kolmogorov-Smirnov** | Continuous | Distributions are the same | Feature distribution comparison |
+| **Chi-squared** | Categorical | Distributions are the same | Categorical feature comparison |
+| **Jensen-Shannon Divergence** | Any | Distributions are the same | Non-negative divergence measure |
+| **Population Stability Index (PSI)** | Any | Distributions are the same | Industry standard for drift detection |
+| **Cramér-von Mises** | Continuous | Distributions are the same | More powerful than KS for some distributions |
+
+### PSI (Population Stability Index)
+
+The most widely used drift metric in production:
 
 ```
-ML Performance Metrics Framework:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Model Quality Metrics:                                     │
-│  ├── Accuracy                                               │
-│  ├── Precision / Recall / F1                                │
-│  ├── AUC-ROC                                                │
-│  ├── Mean Squared Error (MSE)                               │
-│  └── Mean Absolute Error (MAE)                              │
-│                                                             │
-│  Operational Metrics:                                       │
-│  ├── Latency (P50, P90, P95, P99)                         │
-│  ├── Throughput (QPS)                                       │
-│  ├── Error Rate                                             │
-│  └── Availability                                           │
-│                                                             │
-│  Business Metrics:                                          │
-│  ├── Conversion Rate                                        │
-│  ├── Revenue per Prediction                                 │
-│  ├── User Satisfaction Score                                │
-│  └── Cost per Prediction                                    │
-│                                                             │
-│  System Metrics:                                            │
-│  ├── CPU / Memory Usage                                     │
-│  ├── GPU Utilization                                        │
-│  ├── Network I/O                                            │
-│  └── Disk I/O                                               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+PSI = Σ (P_i - Q_i) × ln(P_i / Q_i)
+
+Where:
+- P_i = proportion of observations in bin i for reference distribution
+- Q_i = proportion of observations in bin i for current distribution
+- Bins are typically deciles of the reference distribution
 ```
 
-### 9.3.2 Building Monitoring Dashboards
+**Interpretation:**
+| PSI Range | Interpretation | Action |
+|-----------|---------------|--------|
+| < 0.1 | No significant drift | No action needed |
+| 0.1 - 0.25 | Moderate drift | Investigate, consider retraining |
+| > 0.25 | Significant drift | Retrain model |
 
-🟡 **Intermediate**
+### Real-Time Drift Detection Pipeline
 
-```python
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
-import time
-import numpy as np
-
-class MLMetricsCollector:
-    def __init__(self, port=8000):
-        self.port = port
-        
-        # Define metrics
-        self.prediction_counter = Counter(
-            'ml_predictions_total',
-            'Total number of predictions',
-            ['model_name', 'model_version']
-        )
-        
-        self.prediction_latency = Histogram(
-            'ml_prediction_latency_seconds',
-            'Prediction latency in seconds',
-            ['model_name', 'model_version'],
-            buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
-        )
-        
-        self.prediction_errors = Counter(
-            'ml_prediction_errors_total',
-            'Total number of prediction errors',
-            ['model_name', 'model_version', 'error_type']
-        )
-        
-        self.model_accuracy = Gauge(
-            'ml_model_accuracy',
-            'Current model accuracy',
-            ['model_name', 'model_version']
-        )
-        
-        self.data_drift_score = Gauge(
-            'ml_data_drift_score',
-            'Current data drift score',
-            ['model_name', 'feature_name']
-        )
-        
-        self.gpu_utilization = Gauge(
-            'ml_gpu_utilization_percent',
-            'GPU utilization percentage',
-            ['gpu_id']
-        )
-        
-        self.memory_usage = Gauge(
-            'ml_memory_usage_bytes',
-            'Memory usage in bytes',
-            ['model_name']
-        )
-    
-    def start_metrics_server(self):
-        """Start Prometheus metrics server"""
-        start_http_server(self.port)
-        print(f"Metrics server started on port {self.port}")
-    
-    def record_prediction(self, model_name: str, model_version: str, 
-                         latency: float, success: bool):
-        """Record a prediction event"""
-        
-        # Increment prediction counter
-        self.prediction_counter.labels(
-            model_name=model_name, 
-            model_version=model_version
-        ).inc()
-        
-        # Record latency
-        self.prediction_latency.labels(
-            model_name=model_name, 
-            model_version=model_version
-        ).observe(latency)
-        
-        # Record errors if failed
-        if not success:
-            self.prediction_errors.labels(
-                model_name=model_name,
-                model_version=model_version,
-                error_type="prediction_failed"
-            ).inc()
-    
-    def update_accuracy(self, model_name: str, model_version: str, accuracy: float):
-        """Update model accuracy metric"""
-        self.model_accuracy.labels(
-            model_name=model_name,
-            model_version=model_version
-        ).set(accuracy)
-    
-    def update_drift_score(self, model_name: str, feature_name: str, score: float):
-        """Update data drift score"""
-        self.data_drift_score.labels(
-            model_name=model_name,
-            feature_name=feature_name
-        ).set(score)
-    
-    def update_system_metrics(self, gpu_id: int, gpu_util: float, 
-                             memory_bytes: int, model_name: str):
-        """Update system metrics"""
-        self.gpu_utilization.labels(gpu_id=str(gpu_id)).set(gpu_util)
-        self.memory_usage.labels(model_name=model_name).set(memory_bytes)
-
-# Usage
-collector = MLMetricsCollector(port=8000)
-collector.start_metrics_server()
-
-# Record predictions
-for prediction in predictions:
-    start_time = time.time()
-    
-    # Make prediction
-    try:
-        result = model.predict(prediction)
-        success = True
-    except Exception as e:
-        success = False
-    
-    latency = time.time() - start_time
-    
-    # Record metrics
-    collector.record_prediction(
-        model_name="text-classifier",
-        model_version="v1.0",
-        latency=latency,
-        success=success
-    )
+```
+Incoming requests
+    │
+    ▼
+Feature extraction → Buffer (e.g., 1000 samples)
+    │
+    ▼
+Statistical comparison (KS test / PSI)
+    │
+    ├── No drift → Continue serving
+    │
+    └── Drift detected → Alert + Trigger investigation
+                              │
+                              ├── Feature drift → Feature pipeline review
+                              └── Concept drift → Model retraining
 ```
 
-### 9.3.3 Grafana Dashboard Configuration
+---
 
-🟡 **Intermediate**
+## 9.5 Case Study: How Uber Monitors ML Models
+
+> 💡 **Case Study: Uber's Michelangelo ML Platform Monitoring**
+
+Uber's Michelangelo ML platform, described in their engineering blog (eng.uber.com), serves thousands of models across the company. Monitoring these models at scale requires a sophisticated observability strategy.
+
+**Scale:**
+- Thousands of ML models in production
+- Models serve predictions for pricing, routing, fraud detection, ETA estimation, and demand forecasting
+- Serving billions of predictions per day across multiple regions
+
+**Monitoring Architecture (from public descriptions):**
+
+1. **Multi-layer monitoring**: Uber monitors at four layers:
+   - **Data layer**: Feature distributions, missing values, schema changes
+   - **Model layer**: Prediction distributions, confidence scores, accuracy (when ground truth becomes available)
+   - **System layer**: Latency, throughput, error rates, resource utilization
+   - **Business layer**: Business KPIs (ride completion rate, driver utilization, customer satisfaction)
+
+2. **Automated drift detection**: Uber uses automated statistical tests to detect drift in both input features and model outputs. When drift exceeds thresholds, the system automatically triggers investigation workflows.
+
+3. **Feature store monitoring**: Uber's feature store provides centralized monitoring of feature quality. If a feature pipeline breaks or produces unexpected values, the monitoring system detects it before it affects model predictions.
+
+4. **Shadow model evaluation**: Before deploying new models, Uber runs them in shadow mode, comparing their predictions against the production model. This provides offline evaluation on real production traffic.
+
+5. **A/B testing platform**: Uber maintains a sophisticated A/B testing platform that integrates with the ML platform. Every model change goes through controlled experimentation with statistical rigor.
+
+**Key Insight:**
+Uber's monitoring approach emphasizes **proactive detection** rather than reactive alerting. By monitoring data quality and feature distributions (leading indicators), they can detect problems before they affect model predictions (lagging indicators). This is fundamentally different from monitoring only prediction accuracy, which tells you about problems after they've already occurred.
+
+**Lessons for practitioners:**
+- Monitor leading indicators (data quality, feature distributions) not just lagging indicators (prediction accuracy)
+- Centralized feature store monitoring prevents a common source of silent failures
+- Shadow mode deployment is valuable for high-stakes models
+- Automated drift detection reduces the need for manual monitoring
+
+---
+
+## 9.6 War Story: Silent Model Degradation Costing Millions
+
+> ⚠️ **War Story: The $5M Silent Degradation**
+
+**Company:** A large financial institution (anonymized, based on industry reports)
+**Model:** Fraud detection model for credit card transactions
+**Timeframe:** 2021-2022
+
+**Background:**
+The company operated a fraud detection model that processed millions of transactions daily. The model was retrained quarterly and showed consistent performance on offline evaluation. The production monitoring focused on system metrics (latency, throughput, error rate) but did not monitor prediction quality.
+
+**What happened:**
+
+**Month 1-2:** No visible issues. System metrics were healthy. The model was processing transactions with normal latency and throughput.
+
+**Month 3:** A new type of fraud emerged — synthetic identity fraud, where criminals create fake identities using a combination of real and fabricated information. The model had never been trained on this pattern and began classifying these transactions as legitimate.
+
+**Month 4-6:** The fraud rate increased gradually. However, because the model's overall accuracy remained high (the vast majority of transactions were still legitimate), the monitoring system did not trigger alerts. The model's precision for fraud detection degraded from 92% to 78%, but this was not visible in aggregate metrics.
+
+**Month 7:** The quarterly model review discovered the issue. By this point, approximately $5M in fraudulent transactions had been approved. The review process identified:
+- 15,000+ fraudulent transactions that should have been flagged
+- The fraudulent transactions had a distinct pattern that a drift detection system would have caught
+- The model's confidence scores for these transactions were abnormally low (0.3-0.5 vs. typical 0.7-0.9), but no one was monitoring confidence score distributions
+
+**Root causes:**
+1. **No prediction distribution monitoring**: The company did not monitor the distribution of prediction confidence scores. Low-confidence predictions are often a leading indicator of model degradation.
+2. **No ground truth feedback loop**: Fraud is typically detected days or weeks after the transaction. The company did not have an automated pipeline to feed back confirmed fraud cases into monitoring.
+3. **Aggregate metrics masked degradation**: Overall accuracy remained high because fraud was a small fraction of total transactions. The model could be wrong on 100% of fraud cases and still show 99%+ overall accuracy.
+4. **No drift detection on features**: The model's input features had shifted significantly (new merchant categories, new transaction patterns), but no one was monitoring feature distributions.
+
+**The fix:**
+- Implemented confidence score monitoring with automated alerting
+- Built a feedback pipeline that feeds confirmed fraud cases back into monitoring within 24 hours
+- Added per-class monitoring (fraud detection rate separately from legitimate detection rate)
+- Implemented feature drift detection using PSI on all input features
+- Changed retraining trigger from quarterly schedule to drift-based triggering
+
+**Cost of the failure:**
+- Direct loss: $5M in fraudulent transactions
+- Investigation cost: $500K in forensic analysis
+- Regulatory penalties: $1M (delayed detection violated reporting requirements)
+- Total: ~$6.5M
+
+**Key takeaway:** Monitoring only system health (latency, throughput, errors) is necessary but not sufficient for ML systems. You must monitor prediction quality, and the most effective approach is to monitor leading indicators (data drift, confidence scores) rather than lagging indicators (accuracy after ground truth becomes available).
+
+---
+
+## 9.7 Grafana Dashboard Design for ML
+
+### Dashboard Hierarchy
+
+| Dashboard Level | Audience | Refresh Rate | Key Metrics |
+|----------------|----------|-------------|-------------|
+| **Executive** | C-suite, product managers | 1 hour | Business KPIs, model count, SLA compliance |
+| **Operational** | ML engineers, SREs | 1 minute | Latency, throughput, error rate, drift alerts |
+| **Diagnostic** | Data scientists, ML engineers | 5 minutes | Feature distributions, confidence scores, per-class metrics |
+| **Debug** | Data scientists | Real-time | Individual predictions, feature values, model internals |
+
+### Essential Grafana Panels for ML
+
+| Panel Type | Metric | Visualization | Alert |
+|-----------|--------|--------------|-------|
+| **Prediction Rate** | `rate(ml_predictions_total[5m])` | Time series | < 50% of baseline |
+| **Latency Distribution** | `histogram_quantile(0.99, ...)` | Heatmap or time series | > 2x baseline |
+| **Confidence Scores** | `avg(ml_prediction_confidence)` | Histogram or time series | < 0.3 |
+| **Feature Drift** | `ml_feature_drift_psi` | Heatmap (features × time) | > 0.25 |
+| **Error Rate** | `rate(ml_prediction_errors_total[5m])` | Time series | > 1% |
+| **GPU Utilization** | `ml_gpu_utilization_percent` | Gauge or time series | < 30% or > 95% |
+
+### Sample Grafana Dashboard JSON (Simplified)
 
 ```json
 {
-  "dashboard": {
-    "title": "ML Model Monitoring",
-    "panels": [
-      {
-        "title": "Prediction Rate",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "rate(ml_predictions_total[5m])",
-            "legendFormat": "{{model_name}} - {{model_version}}"
-          }
-        ]
-      },
-      {
-        "title": "Prediction Latency",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket[5m]))",
-            "legendFormat": "P95 Latency"
-          },
-          {
-            "expr": "histogram_quantile(0.50, rate(ml_prediction_latency_seconds_bucket[5m]))",
-            "legendFormat": "P50 Latency"
-          }
-        ]
-      },
-      {
-        "title": "Model Accuracy",
-        "type": "stat",
-        "targets": [
-          {
-            "expr": "ml_model_accuracy",
-            "legendFormat": "{{model_name}}"
-          }
-        ]
-      },
-      {
-        "title": "Error Rate",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "rate(ml_prediction_errors_total[5m])",
-            "legendFormat": "{{error_type}}"
-          }
-        ]
-      },
-      {
-        "title": "Data Drift Score",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "ml_data_drift_score",
-            "legendFormat": "{{feature_name}}"
-          }
-        ]
-      },
-      {
-        "title": "GPU Utilization",
-        "type": "gauge",
-        "targets": [
-          {
-            "expr": "ml_gpu_utilization_percent",
-            "legendFormat": "GPU {{gpu_id}}"
-          }
-        ]
-      }
-    ],
-    "refresh": "30s",
-    "time": {
-      "from": "now-6h",
-      "to": "now"
+  "panels": [
+    {
+      "title": "Prediction Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ml_predictions_total[5m])",
+          "legendFormat": "{{model_name}} - {{model_version}}"
+        }
+      ]
+    },
+    {
+      "title": "p99 Latency",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(ml_prediction_latency_seconds_bucket[5m]))",
+          "legendFormat": "{{model_name}}"
+        }
+      ],
+      "thresholds": [
+        {
+          "value": 0.2,
+          "color": "red",
+          "op": "gt"
+        }
+      ]
     }
-  }
+  ]
 }
 ```
 
 ---
 
-## 9.4 Alerting & Automated Response
+## 9.8 Alerting Strategy
 
-### 9.4.1 Alerting Strategy
+### Alert Severity Levels
 
-🟡 **Intermediate**
+| Severity | Response Time | Channel | Example |
+|----------|-------------|---------|---------|
+| **Critical** | Immediate (< 5 min) | PagerDuty, phone | Error rate > 5%, complete service degradation |
+| **High** | < 30 min | Slack, email | Latency > 2x baseline, drift > 0.25 |
+| **Medium** | < 4 hours | Slack, email | Feature drift > 0.1, confidence drop |
+| **Low** | Next business day | Email, ticket | Minor anomaly, informational |
 
-```
-Alerting Strategy Framework:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Alert Severity Levels:                                     │
-│  ├── Critical (P0): Model completely broken                │
-│  │   ├── Immediate notification (PagerDuty)                │
-│  │   ├── Auto-rollback triggered                           │
-│  │   └── Human intervention required                       │
-│  │                                                         │
-│  ├── Warning (P1): Significant degradation                 │
-│  │   ├── Team notification (Slack)                         │
-│  │   ├── Increased monitoring frequency                    │
-│  │   └── Investigation required                            │
-│  │                                                         │
-│  ├── Info (P2): Minor issues detected                      │
-│  │   ├── Log entry                                         │
-│  │   ├── Dashboard update                                  │
-│  │   └── Review during business hours                      │
-│  │                                                         │
-│  └── Low (P3): Potential concerns                          │
-│      ├── Metric recording                                  │
-│      └── Weekly review                                     │
-│                                                             │
-│  Alert Channels:                                            │
-│  ├── PagerDuty (Critical)                                  │
-│  ├── Slack (Warning)                                       │
-│  ├── Email (Info)                                          │
-│  └── Dashboard (All)                                       │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### Alert Fatigue Prevention
 
-### 9.4.2 Prometheus Alert Rules
+| Strategy | Implementation | Benefit |
+|----------|---------------|---------|
+| **Rate limiting** | Max 1 alert per metric per 15 minutes | Prevents alert storms |
+| **Aggregation** | Group related alerts into single notification | Reduces noise |
+| **Hysteresis** | Require metric to breach threshold for N consecutive evaluations | Prevents flapping |
+| **Maintenance windows** | Suppress alerts during known maintenance | Reduces false positives |
+| **Anomaly detection** | Use ML to detect unusual patterns instead of static thresholds | Adapts to normal variation |
 
-🔴 **Advanced**
+### Prometheus Alerting Rules for ML
 
 ```yaml
-# prometheus-rules.yaml
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: ml-model-alerts
-  namespace: monitoring
-spec:
-  groups:
-  - name: ml-model-alerts
-    rules:
-    # Model Performance Alerts
-    - alert: ModelAccuracyBelowThreshold
-      expr: ml_model_accuracy < 0.85
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "Model accuracy below threshold"
-        description: "Model {{ $labels.model_name }} accuracy is {{ $value }}"
-    
-    - alert: ModelAccuracyCritical
-      expr: ml_model_accuracy < 0.75
-      for: 2m
-      labels:
-        severity: critical
-      annotations:
-        summary: "Model accuracy critically low"
-        description: "Model {{ $labels.model_name }} accuracy is {{ $value }}"
-    
-    # Latency Alerts
-    - alert: HighPredictionLatency
-      expr: histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket[5m])) > 0.5
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High prediction latency"
-        description: "P95 latency is {{ $value }}s"
-    
-    - alert: CriticalPredictionLatency
-      expr: histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket[5m])) > 1.0
-      for: 2m
-      labels:
-        severity: critical
-      annotations:
-        summary: "Critical prediction latency"
-        description: "P95 latency is {{ $value }}s"
-    
-    # Error Rate Alerts
-    - alert: HighErrorRate
-      expr: rate(ml_prediction_errors_total[5m]) / rate(ml_predictions_total[5m]) > 0.05
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High error rate"
-        description: "Error rate is {{ $value | humanizePercentage }}"
-    
-    # Data Drift Alerts
-    - alert: DataDriftDetected
-      expr: ml_data_drift_score > 0.5
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "Data drift detected"
-        description: "Feature {{ $labels.feature_name }} drift score is {{ $value }}"
-    
-    - alert: CriticalDataDrift
-      expr: ml_data_drift_score > 0.8
-      for: 5m
-      labels:
-        severity: critical
-      annotations:
-        summary: "Critical data drift"
-        description: "Feature {{ $labels.feature_name }} drift score is {{ $value }}"
-    
-    # Resource Alerts
-    - alert: HighGPUUtilization
-      expr: ml_gpu_utilization_percent > 90
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High GPU utilization"
-        description: "GPU {{ $labels.gpu_id }} utilization is {{ $value }}%"
-    
-    # Prediction Volume Alerts
-    - alert: LowPredictionVolume
-      expr: rate(ml_predictions_total[15m]) < 10
-      for: 15m
-      labels:
-        severity: info
-      annotations:
-        summary: "Low prediction volume"
-        description: "Prediction rate is {{ $value }} req/s"
-```
+groups:
+- name: ml-model-alerts
+  rules:
+  - alert: HighPredictionLatency
+    expr: histogram_quantile(0.99, rate(ml_prediction_latency_seconds_bucket[5m])) > 0.2
+    for: 5m
+    labels:
+      severity: high
+    annotations:
+      summary: "High prediction latency for {{ $labels.model_name }}"
+      description: "p99 latency is {{ $value }}s, exceeding 200ms threshold"
 
-### 9.4.3 Automated Response System
+  - alert: ModelDriftDetected
+    expr: ml_feature_drift_psi > 0.25
+    for: 15m
+    labels:
+      severity: high
+    annotations:
+      summary: "Significant drift detected for {{ $labels.feature_name }}"
+      description: "PSI is {{ $value }}, exceeding 0.25 threshold"
 
-🔴 **Advanced**
-
-```python
-import requests
-import json
-from datetime import datetime, timedelta
-from typing import Dict, List
-import logging
-
-class AutomatedResponseSystem:
-    def __init__(self, config: Dict):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize components
-        self.prometheus_url = config.get('prometheus_url', 'http://localhost:9090')
-        self.alertmanager_url = config.get('alertmanager_url', 'http://localhost:9093')
-        self.kubernetes_api = config.get('kubernetes_api', 'https://kubernetes.default.svc')
-        
-    def check_model_health(self, model_name: str, model_version: str) -> Dict:
-        """Check overall model health"""
-        
-        # Query Prometheus for metrics
-        queries = {
-            'accuracy': f'ml_model_accuracy{{model_name="{model_name}",model_version="{model_version}"}}',
-            'latency_p95': f'histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket{{model_name="{model_name}"}}[5m]))',
-            'error_rate': f'rate(ml_prediction_errors_total{{model_name="{model_name}"}}[5m]) / rate(ml_predictions_total{{model_name="{model_name}"}}[5m])',
-            'drift_score': f'ml_data_drift_score{{model_name="{model_name}"}}'
-        }
-        
-        results = {}
-        for metric_name, query in queries.items():
-            response = requests.get(f'{self.prometheus_url}/api/v1/query', params={'query': query})
-            if response.status_code == 200:
-                data = response.json()
-                if data['data']['result']:
-                    results[metric_name] = float(data['data']['result'][0]['value'][1])
-        
-        # Determine health status
-        health_status = {
-            'model_name': model_name,
-            'model_version': model_version,
-            'timestamp': datetime.now().isoformat(),
-            'metrics': results,
-            'status': 'healthy',
-            'issues': []
-        }
-        
-        # Check thresholds
-        if results.get('accuracy', 1.0) < 0.85:
-            health_status['status'] = 'degraded'
-            health_status['issues'].append('Low accuracy')
-        
-        if results.get('latency_p95', 0) > 0.5:
-            health_status['status'] = 'degraded'
-            health_status['issues'].append('High latency')
-        
-        if results.get('error_rate', 0) > 0.05:
-            health_status['status'] = 'critical'
-            health_status['issues'].append('High error rate')
-        
-        if results.get('drift_score', 0) > 0.5:
-            health_status['status'] = 'warning'
-            health_status['issues'].append('Data drift detected')
-        
-        return health_status
-    
-    def auto_rollback(self, model_name: str, reason: str) -> bool:
-        """Automatically rollback to previous model version"""
-        
-        self.logger.warning(f"Auto-rollback triggered for {model_name}: {reason}")
-        
-        # Get previous stable version
-        previous_version = self._get_previous_stable_version(model_name)
-        
-        if previous_version:
-            # Update SeldonDeployment
-            success = self._update_seldon_deployment(model_name, previous_version)
-            
-            if success:
-                # Send notification
-                self._send_notification(
-                    severity="critical",
-                    title=f"Auto-rollback: {model_name}",
-                    message=f"Rolled back to version {previous_version}. Reason: {reason}"
-                )
-                
-                # Log the rollback
-                self._log_rollback_event(model_name, previous_version, reason)
-                
-                return True
-        
-        return False
-    
-    def auto_scale(self, model_name: str, metric: str, target_value: float) -> bool:
-        """Automatically scale model deployment based on metrics"""
-        
-        # Get current replicas
-        current_replicas = self._get_current_replicas(model_name)
-        
-        # Calculate desired replicas based on metric
-        if metric == 'latency':
-            current_latency = self._get_metric(model_name, 'latency_p95')
-            if current_latency > target_value * 1.2:
-                desired_replicas = min(current_replicas + 2, 10)  # Scale up
-            elif current_latency < target_value * 0.8:
-                desired_replicas = max(current_replicas - 1, 2)  # Scale down
-            else:
-                desired_replicas = current_replicas
-        elif metric == 'queue_depth':
-            current_queue = self._get_metric(model_name, 'queue_depth')
-            if current_queue > target_value:
-                desired_replicas = min(current_replicas + 1, 10)
-            else:
-                desired_replicas = current_replicas
-        
-        # Apply scaling if needed
-        if desired_replicas != current_replicas:
-            return self._scale_deployment(model_name, desired_replicas)
-        
-        return True
-    
-    def trigger_retraining(self, model_name: str, reason: str) -> str:
-        """Trigger model retraining pipeline"""
-        
-        # Create Kubeflow Pipeline run
-        pipeline_run = self._create_kubeflow_run(
-            pipeline_name="model-retraining",
-            params={
-                "model_name": model_name,
-                "reason": reason,
-                "trigger_time": datetime.now().isoformat()
-            }
-        )
-        
-        # Send notification
-        self._send_notification(
-            severity="info",
-            title=f"Retraining triggered: {model_name}",
-            message=f"Pipeline run started: {pipeline_run['run_id']}. Reason: {reason}"
-        )
-        
-        return pipeline_run['run_id']
-    
-    def _get_previous_stable_version(self, model_name: str) -> str:
-        """Get previous stable model version"""
-        # Implementation depends on model registry
-        pass
-    
-    def _update_seldon_deployment(self, model_name: str, version: str) -> bool:
-        """Update SeldonDeployment to use specified version"""
-        # Implementation depends on Kubernetes API
-        pass
-    
-    def _send_notification(self, severity: str, title: str, message: str):
-        """Send notification via configured channels"""
-        
-        if severity == "critical":
-            # PagerDuty
-            self._send_pagerduty(title, message)
-        
-        # Slack
-        self._send_slack(severity, title, message)
-        
-        # Email
-        self._send_email(severity, title, message)
-    
-    def _send_pagerduty(self, title: str, message: str):
-        """Send PagerDuty alert"""
-        pass
-    
-    def _send_slack(self, severity: str, title: str, message: str):
-        """Send Slack notification"""
-        pass
-    
-    def _send_email(self, severity: str, title: str, message: str):
-        """Send email notification"""
-        pass
-    
-    def _log_rollback_event(self, model_name: str, version: str, reason: str):
-        """Log rollback event for audit"""
-        pass
-
-# Usage
-response_system = AutomatedResponseSystem({
-    'prometheus_url': 'http://prometheus:9090',
-    'alertmanager_url': 'http://alertmanager:9093',
-    'kubernetes_api': 'https://kubernetes.default.svc'
-})
-
-# Check model health
-health = response_system.check_model_health("text-classifier", "v1.0")
-print(f"Model status: {health['status']}")
-print(f"Issues: {health['issues']}")
-
-# Auto-rollback if critical
-if health['status'] == 'critical':
-    response_system.auto_rollback("text-classifier", health['issues'][0])
+  - alert: LowConfidenceScores
+    expr: avg(ml_prediction_confidence) < 0.3
+    for: 30m
+    labels:
+      severity: medium
+    annotations:
+      summary: "Low average confidence for {{ $labels.model_name }}"
+      description: "Average confidence is {{ $value }}, below 0.3 threshold"
 ```
 
 ---
 
-## 9.5 Observability Platform Architecture
+## 9.9 When to Use / When Not to Use
 
-### 9.5.1 The Three Pillars of ML Observability
+### When to Use Each Monitoring Approach
 
-🟡 **Intermediate**
+| Approach | Best For | When to Use |
+|----------|----------|-------------|
+| **System monitoring (Prometheus)** | All production models | Always — baseline requirement |
+| **Prediction distribution monitoring** | Models with gradual degradation | Most ML models in production |
+| **Feature drift detection** | Models with changing input data | Models trained on user-generated data |
+| **Confidence score monitoring** | Classification models | When prediction confidence is meaningful |
+| **A/B test monitoring** | Model comparison | During model deployment and evaluation |
+| **Business metric monitoring** | All models | When model impact on business is measurable |
+| **Shadow mode evaluation** | High-stakes models | Before deploying critical model changes |
 
-```
-ML Observability Pillars:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Logs                                     │   │
-│  │  ├── Prediction logs                                 │   │
-│  │  ├── Error logs                                      │   │
-│  │  ├── Audit logs                                      │   │
-│  │  └── System logs                                     │   │
-│  │                                                     │   │
-│  │  Tools: ELK Stack, Fluentd, Loki                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Metrics                                  │   │
-│  │  ├── Model metrics (accuracy, latency)              │   │
-│  │  ├── System metrics (CPU, memory, GPU)              │   │
-│  │  ├── Business metrics (conversion, revenue)         │   │
-│  │  └── Data metrics (drift, quality)                  │   │
-│  │                                                     │   │
-│  │  Tools: Prometheus, Grafana, DataDog                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Traces                                   │   │
-│  │  ├── Request traces                                  │   │
-│  │  ├── Model inference traces                          │   │
-│  │  ├── Data pipeline traces                            │   │
-│  │  └── Distributed traces                              │   │
-│  │                                                     │   │
-│  │  Tools: Jaeger, Zipkin, OpenTelemetry                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### When Not to Use
 
-### 9.5.2 Complete Observability Architecture
-
-🔴 **Advanced**
-
-```
-ML Observability Platform Architecture:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Data Collection Layer                    │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Model    │  │ System   │  │ Business │         │   │
-│  │  │ Metrics  │  │ Metrics  │  │ Metrics  │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  │       ▼              ▼              ▼               │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │           Prometheus                         │   │   │
-│  │  │  ├── Time-series storage                    │   │   │
-│  │  │  ├── PromQL queries                         │   │   │
-│  │  │  └── Alerting rules                         │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Visualization Layer                     │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │              Grafana                         │   │   │
-│  │  │  ├── Model performance dashboards           │   │   │
-│  │  │  ├── System health dashboards               │   │   │
-│  │  │  ├── Business metrics dashboards            │   │   │
-│  │  │  └── Alert management                       │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Analysis Layer                          │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Drift    │  │ Anomaly  │  │ Root     │         │   │
-│  │  │ Detection│  │ Detection│  │ Cause    │         │   │
-│  │  │          │  │          │  │ Analysis │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Response Layer                          │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Alerting │  │ Auto-    │  │ Feedback │         │   │
-│  │  │ System   │  │ Response │  │ Loop     │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.5.3 OpenTelemetry Integration
-
-🔴 **Advanced**
-
-```python
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.jaeger.thrift import JaegerExporter
-from opentelemetry.sdk.resources import Resource
-import time
-
-class MLTracingSetup:
-    def __init__(self, service_name: str, jaeger_endpoint: str):
-        # Create resource
-        resource = Resource.create({
-            "service.name": service_name,
-            "service.version": "1.0.0",
-            "deployment.environment": "production"
-        })
-        
-        # Configure tracer
-        provider = TracerProvider(resource=resource)
-        
-        # Configure Jaeger exporter
-        jaeger_exporter = JaegerExporter(
-            agent_host_name="localhost",
-            agent_port=6831,
-        )
-        
-        # Add processor
-        processor = BatchSpanProcessor(jaeger_exporter)
-        provider.add_span_processor(processor)
-        
-        # Set global tracer
-        trace.set_tracer_provider(provider)
-        
-        self.tracer = trace.get_tracer(__name__)
-    
-    def trace_prediction(self, model_name: str, input_data: dict):
-        """Trace a prediction request"""
-        
-        with self.tracer.start_as_current_span("prediction") as span:
-            # Add attributes
-            span.set_attribute("model.name", model_name)
-            span.set_attribute("input.size", len(str(input_data)))
-            
-            # Start preprocessing span
-            with self.tracer.start_as_current_span("preprocessing") as preprocess_span:
-                start_time = time.time()
-                # Preprocessing logic
-                processed_data = self._preprocess(input_data)
-                preprocess_span.set_attribute("preprocessing.duration", 
-                                            time.time() - start_time)
-            
-            # Start inference span
-            with self.tracer.start_as_current_span("inference") as inference_span:
-                start_time = time.time()
-                # Inference logic
-                prediction = self._predict(processed_data)
-                inference_span.set_attribute("inference.duration", 
-                                           time.time() - start_time)
-                inference_span.set_attribute("prediction.confidence", 
-                                           prediction.get('confidence', 0))
-            
-            # Start postprocessing span
-            with self.tracer.start_as_current_span("postprocessing") as postprocess_span:
-                start_time = time.time()
-                # Postprocessing logic
-                result = self._postprocess(prediction)
-                postprocess_span.set_attribute("postprocessing.duration", 
-                                             time.time() - start_time)
-            
-            return result
-    
-    def _preprocess(self, data):
-        """Preprocessing logic"""
-        pass
-    
-    def _predict(self, data):
-        """Prediction logic"""
-        pass
-    
-    def _postprocess(self, prediction):
-        """Postprocessing logic"""
-        pass
-
-# Usage
-tracing = MLTracingSetup(
-    service_name="text-classifier",
-    jaeger_endpoint="http://jaeger:14268/api/traces"
-)
-
-# Trace prediction
-result = tracing.trace_prediction(
-    model_name="text-classifier",
-    input_data={"text": "This is a great product!"}
-)
-```
+| Approach | When to Avoid | Why |
+|----------|--------------|-----|
+| **Complex drift detection** | Simple models with static data | Overhead exceeds benefit |
+| **Real-time monitoring** | Batch prediction models | Batch monitoring sufficient |
+| **Per-prediction logging** | High-throughput models (>100K QPS) | Storage cost prohibitive |
+| **Confidence monitoring** | Models that don't produce meaningful confidence | Misleading signals |
+| **Automated retraining triggers** | Models requiring human review of changes | Risk of incorrect automated decisions |
 
 ---
 
-## 💡 Case Study: Prometheus + Grafana AI Monitoring System
+## 9.10 Summary
 
-### System Architecture
+ML monitoring is fundamentally different from traditional software monitoring because ML models fail silently. The monitoring strategy must cover four layers: data, model, system, and business.
 
-```
-Prometheus + Grafana AI Monitoring System:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              ML Services                             │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Model    │  │ Training │  │ Data     │         │   │
-│  │  │ Serving  │  │ Pipeline │  │ Pipeline │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  └───────┼──────────────┼──────────────┼───────────────┘   │
-│          │              │              │                    │
-│          ▼              ▼              ▼                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Metrics Exporters                       │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Custom   │  │ Node     │  │ cAdvisor │         │   │
-│  │  │ Exporter │  │ Exporter │  │          │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  └───────┼──────────────┼──────────────┼───────────────┘   │
-│          │              │              │                    │
-│          ▼              ▼              ▼                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Prometheus Server                        │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  ├── Scrape intervals (15s-60s)             │   │   │
-│  │  │  ├── Retention (30 days)                    │   │   │
-│  │  │  ├── Alert rules                            │   │   │
-│  │  │  └── Recording rules                       │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│                         ▼                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Grafana Dashboard                        │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Dashboard 1: Model Performance              │   │   │
-│  │  │  ├── Accuracy over time                     │   │   │
-│  │  │  ├── Latency distribution                   │   │   │
-│  │  │  ├── Error rate                             │   │   │
-│  │  │  └── Prediction volume                      │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Dashboard 2: Data Quality                   │   │   │
-│  │  │  ├── Data drift scores                      │   │   │
-│  │  │  ├── Feature distributions                  │   │   │
-│  │  │  ├── Missing values                         │   │   │
-│  │  │  └── Data freshness                         │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  Dashboard 3: System Health                  │   │   │
-│  │  │  ├── CPU/Memory usage                       │   │   │
-│  │  │  ├── GPU utilization                        │   │   │
-│  │  │  ├── Network I/O                            │   │   │
-│  │  │  └── Disk usage                             │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Alerting Pipeline                       │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │Prometheus│  │ Alert    │  │ Notifi-  │         │   │
-│  │  │ Alerting │──│ Manager  │──│ cations  │         │   │
-│  │  │ Rules    │  │          │  │          │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                     │              │               │   │
-│  │                     ▼              ▼               │   │
-│  │              ┌──────────┐  ┌──────────┐           │   │
-│  │              │ Slack    │  │ PagerDuty│           │   │
-│  │              │          │  │          │           │   │
-│  │              └──────────┘  └──────────┘           │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+Key tools and practices:
+1. **Prometheus + Grafana** for metrics collection and visualization (industry standard)
+2. **Statistical drift detection** using PSI, KS tests, and divergence measures
+3. **Multi-layer monitoring** covering data quality, prediction distributions, system health, and business KPIs
+4. **Proactive monitoring** of leading indicators (data drift, confidence scores) rather than only lagging indicators (accuracy)
+5. **Structured alerting** that balances sensitivity with alert fatigue prevention
 
-### Deployment Instructions
-
-```bash
-# 1. Create monitoring namespace
-kubectl create namespace monitoring
-
-# 2. Deploy Prometheus
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm install prometheus prometheus-community/prometheus \
-  --namespace monitoring \
-  --set alertmanager.enabled=true
-
-# 3. Deploy Grafana
-helm repo add grafana https://grafana.github.io/helm-charts
-helm install grafana grafana/grafana \
-  --namespace monitoring \
-  --set adminPassword=admin123
-
-# 4. Deploy custom ML exporter
-cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ml-metrics-exporter
-  namespace: monitoring
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: ml-metrics-exporter
-  template:
-    metadata:
-      labels:
-        app: ml-metrics-exporter
-    spec:
-      containers:
-      - name: exporter
-        image: registry.example.com/ml-metrics-exporter:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: PROMETHEUS_URL
-          value: "http://prometheus-server:9090"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ml-metrics-exporter
-  namespace: monitoring
-spec:
-  selector:
-    app: ml-metrics-exporter
-  ports:
-  - port: 8000
-    targetPort: 8000
-EOF
-
-# 5. Access dashboards
-kubectl port-forward svc/grafana 3000:80 -n monitoring
-# Grafana: http://localhost:3000 (admin/admin123)
-
-kubectl port-forward svc/prometheus-server 9090:80 -n monitoring
-# Prometheus: http://localhost:9090
-```
-
-### Dashboard Configuration
-
-```json
-{
-  "dashboard": {
-    "title": "ML Model Monitoring Dashboard",
-    "uid": "ml-model-monitoring",
-    "panels": [
-      {
-        "title": "Model Accuracy Trend",
-        "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-        "targets": [
-          {
-            "expr": "ml_model_accuracy{model_name=\"text-classifier\"}",
-            "legendFormat": "{{model_version}}"
-          }
-        ],
-        "fieldConfig": {
-          "defaults": {
-            "thresholds": {
-              "steps": [
-                { "color": "red", "value": null },
-                { "color": "green", "value": 0.85 }
-              ]
-            }
-          }
-        }
-      },
-      {
-        "title": "Prediction Latency (P95)",
-        "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket{model_name=\"text-classifier\"}[5m]))",
-            "legendFormat": "P95 Latency"
-          }
-        ]
-      },
-      {
-        "title": "Data Drift Scores",
-        "type": "bargauge",
-        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-        "targets": [
-          {
-            "expr": "ml_data_drift_score{model_name=\"text-classifier\"}",
-            "legendFormat": "{{feature_name}}"
-          }
-        ]
-      },
-      {
-        "title": "GPU Utilization",
-        "type": "gauge",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-        "targets": [
-          {
-            "expr": "ml_gpu_utilization_percent",
-            "legendFormat": "GPU {{gpu_id}}"
-          }
-        ]
-      }
-    ],
-    "refresh": "30s",
-    "time": {
-      "from": "now-24h",
-      "to": "now"
-    }
-  }
-}
-```
+The Uber case study demonstrates that monitoring leading indicators can prevent problems before they affect business outcomes. The war story shows that monitoring only system health while ignoring prediction quality can lead to catastrophic failures.
 
 ---
 
-## Summary
+## 9.11 Discussion Questions
 
-**Key Takeaways:**
+1. **Monitoring Priority**: You have 100 models in production but can only implement comprehensive monitoring for 10. How do you decide which 10 to monitor? What criteria would you use?
 
-1. **Model drift** is inevitable — continuous monitoring is essential
-2. **Data drift detection** requires statistical rigor and proper baselines
-3. **Performance monitoring** must cover model quality, operational, and business metrics
-4. **Alerting** should be actionable and properly tiered
-5. **Observability** requires logs, metrics, and traces working together
+2. **Drift Detection**: A model shows PSI = 0.15 for one feature. This is in the "moderate drift" zone. What steps would you take before deciding to retrain?
 
-**Best Practices:**
+3. **Alert Design**: Your ML monitoring system generates 50 alerts per day, and the team is experiencing alert fatigue. How would you redesign the alerting strategy?
 
-- Establish clear baselines during model development
-- Implement automated drift detection with configurable thresholds
-- Build comprehensive dashboards that tell a story
-- Create runbooks for common issues
-- Regular review and update of monitoring rules
+4. **Ground Truth Delay**: For a fraud detection model, ground truth (confirmed fraud) is only available 30 days after the prediction. How do you monitor model performance in the interim?
 
-**Complete MLOps Architecture:**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Complete MLOps Architecture                    │
-│                                                                 │
-│  Chapter 6: MLOps Fundamentals                                  │
-│  ├── Maturity Model (Level 0-3)                                │
-│  ├── Toolchain Selection                                        │
-│  └── DevOps vs MLOps                                           │
-│                                                                 │
-│  Chapter 7: Model Training                                      │
-│  ├── Training Environment Design                               │
-│  ├── Distributed Training                                      │
-│  ├── HPO & Experiment Tracking                                 │
-│  └── Resource Management                                       │
-│                                                                 │
-│  Chapter 8: Model Deployment                                    │
-│  ├── Deployment Strategies                                     │
-│  ├── Model Serving (Seldon Core)                               │
-│  ├── A/B Testing & Canary                                      │
-│  └── Inference Optimization                                    │
-│                                                                 │
-│  Chapter 9: Model Monitoring                                    │
-│  ├── Drift Detection                                           │
-│  ├── Performance Monitoring                                    │
-│  ├── Alerting & Response                                       │
-│  └── Observability Platform                                    │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+5. **Cost vs. Coverage**: Comprehensive monitoring for one model costs $5K/year in infrastructure. Is this worth it for a model that generates $100K/year in business value? What about $10K/year?
 
 ---
 
-*End of Chapter 9*
-*End of Part III: MLOps Architecture*
+## 9.12 Exercises
+
+### Exercise 1: Monitoring Dashboard Design
+
+Design a Grafana dashboard for a credit risk scoring model that:
+- Serves 50,000 predictions per day
+- Uses 15 input features
+- Has 3 model versions (champion + 2 challengers)
+- Must meet regulatory requirements for audit trails
+
+**Tasks:**
+1. List the metrics you would monitor
+2. Design the dashboard layout (panel types and arrangement)
+3. Set alert thresholds for each metric
+4. Design the dashboard for different audiences (executive vs. operational)
+
+### Exercise 2: Drift Detection Pipeline
+
+Implement a drift detection pipeline that:
+- Receives 10,000 predictions per hour
+- Compares feature distributions against a training reference
+- Calculates PSI for each feature
+- Alerts when PSI > 0.25 for any feature
+
+**Tasks:**
+1. Write the Python code for PSI calculation
+2. Design the data storage for reference and current distributions
+3. Implement the alerting logic
+4. Estimate the computational cost
+
+### Exercise 3: Silent Failure Investigation
+
+You receive an alert that a recommendation model's confidence scores have dropped from 0.75 to 0.45 over the past week. No other alerts have been triggered.
+
+**Tasks:**
+1. List 5 hypotheses for why confidence scores dropped
+2. Design an investigation plan to identify the root cause
+3. Determine whether this is a data drift, concept drift, or system issue
+4. Make a recommendation: retrain, rollback, or continue monitoring?
+
+---
+
+## 9.13 References
+
+- **Prometheus Documentation**: https://prometheus.io/docs/introduction/overview/
+- **Prometheus Best Practices**: https://prometheus.io/docs/practices/naming/
+- **Grafana Documentation**: https://grafana.com/docs/
+- **Grafana ML Dashboard Examples**: https://grafana.com/grafana/dashboards/
+- **Seldon Core Monitoring**: https://docs.seldon.io/projects/seldon-core/en/latest/analytics/analytics.html
+- **Uber Engineering Blog**: https://eng.uber.com/
+- **Uber Michelangelo ML Platform**: https://www.uber.com/blog/michelangelo-machine-learning-platform/
+- **Evidently AI (Drift Detection)**: https://www.evidentlyai.com/
+- **NannyML (Performance Estimation)**: https://nannyml.readthedocs.io/
+- **Alibi Detect (Drift Detection)**: https://docs.seldon.io/projects/alibi-detect/en/latest/
+- **Great Expectations (Data Validation)**: https://docs.greatexpectations.io/
+- **Google ML Monitoring Best Practices**: https://cloud.google.com/architecture/ml-monitoring-strategy

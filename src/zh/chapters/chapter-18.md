@@ -1,996 +1,351 @@
 # 第18章：模型压缩与优化
 
-🟢 入门 | 🟡 中级 | 🔴 高级 | ⚫ 管理者
+## 学习目标
+
+完成本章学习后，你将能够：
+
+1. 应用量化技术（INT8、INT4、FP8）并测量其对模型准确性和推理速度的影响
+2. 实现知识蒸馏，将知识从大型教师模型转移到小型学生模型
+3. 使用剪枝和结构化稀疏度在保持可接受准确性的同时减小模型大小
+4. 使用ONNX Runtime和TensorRT针对特定硬件目标优化模型
+5. 设计平衡准确性、延迟和模型大小约束的压缩管道
 
 ---
 
-## 18.1 量化技术
+## 18.1 引言：压缩的必要性
 
-### 什么是量化
+现代AI模型对许多部署场景来说太大了。一个1750亿参数的GPT-3类模型在FP16中需要350 GB内存——远远超出边缘设备的范围，并且在云端大规模服务时成本昂贵。模型压缩减少了模型的计算和内存需求，同时尽可能保留准确性。
 
-量化将模型权重和激活的精度从浮点数（FP32）降低到低位表示（INT8、INT4 甚至二进制）。这减少了模型大小并加速了边缘硬件上的推理。
+压缩对于边缘部署不是可选的——它是先决条件。即使是云部署也通过减少推理成本和增加吞吐量受益于压缩。
 
-📌 **关键概念**：量化以少量精度损失换取模型大小缩减和推理速度的显著提升。
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    量化概览                                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  FP32（原始）：                                                 │
-│  ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐   │
-│  │0 10000010│10110100000000000000000│                       │   │
-│  │符号 │指数  │         尾数          │  = 23.5              │   │
-│  └──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘   │
-│  32 位                                                         │
-│                                                                 │
-│  INT8（量化后）：                                               │
-│  ┌──────┬──────────────────────────────────────────────┐      │
-│  │10010111│                                            │      │
-│  │符号 │  值    │  = 23（近似）                          │      │
-│  └──────┴──────────────────────────────────────────────┘      │
-│  8 位                                                          │
-│                                                                 │
-│  大小缩减：32 位 → 8 位 = 缩小 4 倍                            │
-│  速度提升：推理速度快 2-4 倍                                    │
-│  精度影响：通常下降 0.5-2%                                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 量化方法
-
-#### 训练后量化（PTQ）
-
-```python
-# PyTorch 训练后量化
-import torch
-import torch.quantization as quant
-import torchvision.models as models
-
-# 加载预训练模型
-model = models.resnet50(pretrained=True)
-model.eval()
-
-# 准备量化
-model_quantized = quant.quantize_dynamic(
-    model,
-    {torch.nn.Linear, torch.nn.Conv2d},  # 要量化的层
-    dtype=torch.qint8
-)
-
-# 或者使用校准的静态量化
-def calibrate(model, data_loader):
-    """静态量化的校准。"""
-    model.eval()
-    with torch.no_grad():
-        for images, _ in data_loader:
-            model(images)
-
-# 静态量化
-model_fp32 = models.resnet50(pretrained=True)
-model_fp32.eval()
-
-model_fp32.qconfig = quant.get_default_qconfig('fbgemm')
-model_prepared = quant.prepare(model_fp32)
-
-# 使用代表性数据进行校准
-calibrate(model_prepared, train_loader)
-
-# 转换为量化模型
-model_int8 = quant.convert(model_prepared)
-
-# 比较大小
-import os
-torch.save(model_fp32.state_dict(), 'model_fp32.pth')
-torch.save(model_int8.state_dict(), 'model_int8.pth')
-
-fp32_size = os.path.getsize('model_fp32.pth')
-int8_size = os.path.getsize('model_int8.pth')
-
-print(f"FP32 模型大小：{fp32_size / 1e6:.2f} MB")
-print(f"INT8 模型大小：{int8_size / 1e6:.2f} MB")
-print(f"压缩比：{fp32_size / int8_size:.2f}x")
-```
-
-#### 量化感知训练（QAT）
-
-```python
-# 量化感知训练
-import torch
-import torch.quantization as quant
-from torch.quantization import QuantStub, DeQuantStub
-
-class QuantizableResNet(torch.nn.Module):
-    def __init__(self, original_model):
-        super().__init__()
-        self.model = original_model
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
-    
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.model(x)
-        x = self.dequant(x)
-        return x
-
-# 准备 QAT 模型
-model = models.resnet50(pretrained=True)
-model_qat = QuantizableResNet(model)
-
-# 设置 QAT 配置
-model_qat.qconfig = quant.get_default_qat_qconfig('fbgemm')
-
-# 准备 QAT
-model_prepared = quant.prepare_qat(model_qat)
-
-# 使用 QAT 微调
-for epoch in range(10):
-    model_prepared.train()
-    for images, labels in train_loader:
-        outputs = model_prepared(images)
-        loss = criterion(outputs, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    
-    # 验证
-    model_prepared.eval()
-    # ... 验证代码 ...
-
-# 转换为最终量化模型
-model_final = quant.convert(model_prepared)
-```
-
-### 不同框架的量化
-
-```yaml
-# ONNX Runtime 量化配置
-quantization_config:
-  static_quantization:
-    data_reader: "calibration_data_reader.py"
-    calibration_method: "minmax"
-    weight_type: "int8"
-    activation_type: "int8"
-    per_channel: true
-    reduce_range: false
-    
-  dynamic_quantization:
-    weight_type: "int8"
-    activation_type: "float32"
-    
-  qdq_quantization:
-    # 用于 TensorRT 部署
-    op_types: ["Conv", "MatMul", "Attention"]
-    per_channel: true
-```
-
-```python
-# ONNX Runtime 量化示例
-import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType
-
-# 动态量化
-quantize_dynamic(
-    model_input='model.onnx',
-    model_output='model_quantized.onnx',
-    weight_type=QuantType.QInt8
-)
-
-# 静态量化
-from onnxruntime.quantization import quantize_static, CalibrationDataReader
-
-class CalibrationDataReaderImpl(CalibrationDataReader):
-    def __init__(self, data_loader):
-        self.data_loader = data_loader
-        self.enum_data = iter(data_loader)
-    
-    def get_next(self):
-        batch = next(self.enum_data, None)
-        if batch is None:
-            return None
-        return {"input": batch.numpy()}
-
-# 创建校准数据读取器
-calibration_data = CalibrationDataReaderImpl(calibration_loader)
-
-# 量化
-quantize_static(
-    model_input='model.onnx',
-    model_output='model_static_quantized.onnx',
-    calibration_data_reader=calibration_data,
-    per_channel=True,
-    reduce_range=False
-)
-```
+> **📌 真实数据框**
+> ONNX Runtime（Microsoft的跨平台推理引擎）通过图优化和硬件特定内核，相比默认PyTorch/TensorFlow运行时实现**2-4倍推理加速**（github.com/microsoft/onnxruntime，2026）。TensorRT通过层融合、内核自动调优和精度校准，在NVIDIA GPU上通常提供**3-10倍加速**（developer.nvidia.com/tensorrt）。
 
 ---
 
-## 18.2 知识蒸馏
+## 18.2 量化
 
-### 概念概览
+量化将模型权重和激活的精度从浮点数（FP32/FP16）降低到低比特表示（INT8、INT4、FP8）。
 
-知识蒸馏将知识从大型"教师"模型转移到小型"学生"模型。学生学习模仿教师的行为，用更少的参数实现相似的精度。
+### 18.2.1 量化级别
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              知识蒸馏                                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  教师模型（大型）：                                             │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  输入 → [Conv1] → [Conv2] → ... → [FC] → 输出         │   │
-│  │  参数：25.6M                                              │   │
-│  │  精度：95.2%                                              │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │  知识              │                      │
-│                    │  蒸馏              │                      │
-│                    │  （软标签）        │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  学生模型（小型）：                                             │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  输入 → [Conv1] → [Conv2] → ... → [FC] → 输出         │   │
-│  │  参数：2.5M                                               │   │
-│  │  精度：94.1%                                              │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  大小缩减：缩小 10 倍                                          │
-│  速度提升：快 5-10 倍                                           │
-│  精度保留：教师精度的 98-99%                                     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 精度 | 比特 | 内存减少 | 加速（典型） | 准确性影响 |
+|------|------|---------|-----------|-----------|
+| FP32 | 32 | 1.0x（基线） | 1.0x | 基线 |
+| FP16/BF16 | 16 | 2.0x | 1.5-2.0x | < 0.5%损失 |
+| FP8（E4M3/E5M2） | 8 | 4.0x | 2.0-3.0x | 0.5-1.5%损失 |
+| INT8 | 8 | 4.0x | 2.0-4.0x | 0.5-2.0%损失 |
+| INT4 | 4 | 8.0x | 3.0-6.0x | 1.0-5.0%损失 |
+| 二值（1位） | 1 | 32.0x | 10-20x | 5-15%损失 |
 
-### 实现
+### 18.2.2 量化方法
 
-```python
-# 知识蒸馏实现
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+**训练后量化（PTQ）：**
+- 训练完成后应用量化
+- 无需重新训练
+- 快速但准确性较低
+- 需要校准数据集（通常100-1000个样本）
 
-class DistillationLoss(nn.Module):
-    def __init__(self, temperature=4.0, alpha=0.7):
-        super().__init__()
-        self.temperature = temperature
-        self.alpha = alpha
-        self.kl_div = nn.KLDivLoss(reduction='batchmean')
-    
-    def forward(self, student_logits, teacher_logits, labels):
-        # 软目标损失（蒸馏损失）
-        soft_student = F.log_softmax(student_logits / self.temperature, dim=1)
-        soft_teacher = F.softmax(teacher_logits / self.temperature, dim=1)
-        distillation_loss = self.kl_div(soft_student, soft_teacher) * (self.temperature ** 2)
-        
-        # 硬目标损失（标准交叉熵）
-        student_loss = F.cross_entropy(student_logits, labels)
-        
-        # 组合损失
-        loss = self.alpha * distillation_loss + (1 - self.alpha) * student_loss
-        
-        return loss
+**量化感知训练（QAT）：**
+- 训练期间模拟量化
+- 模型学会补偿量化噪声
+- 更准确但需要训练资源
+- 通常比PTQ恢复0.5-1%准确性
 
-def distill(teacher_model, student_model, train_loader, optimizer, 
-            epochs=10, temperature=4.0, alpha=0.7):
-    """知识蒸馏训练循环。"""
-    
-    teacher_model.eval()
-    student_model.train()
-    
-    criterion = DistillationLoss(temperature, alpha)
-    
-    for epoch in range(epochs):
-        total_loss = 0
-        correct = 0
-        total = 0
-        
-        for batch_idx, (images, labels) in enumerate(train_loader):
-            images, labels = images.cuda(), labels.cuda()
-            
-            # 教师预测（不需要梯度）
-            with torch.no_grad():
-                teacher_logits = teacher_model(images)
-            
-            # 学生预测
-            student_logits = student_model(images)
-            
-            # 计算蒸馏损失
-            loss = criterion(student_logits, teacher_logits, labels)
-            
-            # 反向传播
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # 指标
-            total_loss += loss.item()
-            _, predicted = student_logits.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-            
-            if batch_idx % 100 == 0:
-                print(f'轮次：{epoch}，批次：{batch_idx}，'
-                      f'损失：{loss.item():.4f}，'
-                      f'精度：{100. * correct / total:.2f}%')
-        
-        # 保存检查点
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': student_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': total_loss / len(train_loader),
-        }, f'checkpoint_epoch_{epoch}.pth')
+**动态量化：**
+- 激活在运行时量化，权重预量化
+- 不需要校准数据集
+- 中等加速，可变的准确性影响
 
-# 使用示例
-# 教师：ResNet-101（44.5M 参数）
-# 学生：ResNet-18（11.7M 参数）
-teacher = models.resnet101(pretrained=True).cuda()
-student = models.resnet18(pretrained=False).cuda()
+### 18.2.3 量化基准测试（真实数据）
 
-optimizer = torch.optim.SGD(student.parameters(), lr=0.01, momentum=0.9)
-distill(teacher, student, train_loader, optimizer, epochs=50)
-```
+**ResNet-50 ImageNet量化结果：**
 
-### 基于特征的蒸馏
+| 方法 | INT8准确性 | FP32准确性 | 退化 | 加速（CPU） |
+|------|-----------|-----------|------|-----------|
+| PTQ（默认） | 75.3% | 76.1% | -0.8% | 2.8倍 |
+| PTQ（校准） | 75.8% | 76.1% | -0.3% | 2.8倍 |
+| QAT | 76.0% | 76.1% | -0.1% | 2.8倍 |
 
-```python
-# 基于特征的知识蒸馏
-class FeatureDistillation(nn.Module):
-    def __init__(self, teacher_feature_dims, student_feature_dims):
-        super().__init__()
-        # 投影层以匹配特征维度
-        self.projectors = nn.ModuleList([
-            nn.Linear(s_dim, t_dim)
-            for s_dim, t_dim in zip(student_feature_dims, teacher_feature_dims)
-        ])
-    
-    def forward(self, teacher_features, student_features):
-        loss = 0
-        for i, (t_feat, s_feat) in enumerate(zip(teacher_features, student_features)):
-            # 投影学生特征以匹配教师维度
-            s_projected = self.projectors[i](s_feat)
-            
-            # 特征间的 L2 距离
-            loss += F.mse_loss(s_projected, t_feat)
-        
-        return loss / len(teacher_features)
+**BERT-base GLUE量化结果：**
 
-# 使用特征蒸馏的修改训练
-class DistillationModel(nn.Module):
-    def __init__(self, teacher, student):
-        super().__init__()
-        self.teacher = teacher
-        self.student = student
-        self.feature_distill = FeatureDistillation(
-            teacher.feature_dims,
-            student.feature_dims
-        )
-    
-    def forward(self, x):
-        # 从两个模型获取特征
-        teacher_features = self.teacher.get_features(x)
-        student_features = self.student.get_features(x)
-        
-        # 获取 logits
-        teacher_logits = self.teacher(x)
-        student_logits = self.student(x)
-        
-        return student_logits, teacher_logits, teacher_features, student_features
-```
+| 方法 | INT8分数 | FP32分数 | 退化 | 加速（CPU） |
+|------|---------|---------|------|-----------|
+| PTQ | 79.2 | 80.5 | -1.3 | 2.1倍 |
+| QAT | 80.1 | 80.5 | -0.4 | 2.1倍 |
+
+**LLM INT4量化（LLaMA-7B）：**
+
+| 方法 | 困惑度（↓越好） | FP16困惑度 | 退化 |
+|------|---------------|-----------|------|
+| GPTQ INT4 | 5.82 | 5.68 | +0.14 |
+| AWQ INT4 | 5.73 | 5.68 | +0.05 |
+| GGUF Q4_K_M | 5.91 | 5.68 | +0.23 |
+| bitsandbytes INT4 | 5.88 | 5.68 | +0.20 |
+
+### 18.2.4 FP8：新前沿
+
+FP8（8位浮点数）在INT8和FP16之间提供中间方案，有两种格式：
+
+- **E4M3**（4位指数，3位尾数）：更高精度，用于权重
+- **E5M2**（5位指数，2位尾数）：更宽动态范围，用于激活
+
+FP8在NVIDIA H100 GPU上支持，正成为LLM推理的默认选择。它通常提供比FP16快2-3倍，准确性损失<0.5%——对于具有大激活范围的模型优于INT8。
 
 ---
 
-## 18.3 模型剪枝
+## 18.3 知识蒸馏
 
-### 剪枝类型
+知识蒸馏将知识从大型"教师"模型转移到较小的"学生"模型。学生学习模仿教师的软概率输出，这比硬标签包含更丰富的信息。
+
+### 18.3.1 蒸馏过程
+
+1. **训练教师模型**在目标任务上达到高准确性
+2. **设计学生模型**参数更少（通常是教师的1/5到1/50）
+3. **训练学生**使用组合损失：
+   - 硬标签损失（与真实值的交叉熵）
+   - 软标签损失（教师和学生logits之间的KL散度）
+4. **温度缩放**软化教师的概率分布，揭示类间关系
+
+**蒸馏损失公式：**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    模型剪枝类型                                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  1. 非结构化剪枝：                                              │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  原始：    [0.5, -0.3, 0.8, 0.1, -0.2, 0.6, 0.4]      │   │
-│  │  剪枝后：  [0.5,  0.0, 0.8, 0.0,  0.0, 0.6, 0.0]      │   │
-│  │             ↑     ↑    ↑    ↑     ↑    ↑    ↑          │   │
-│  │            保留  置零 保留 置零  置零 保留 置零          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│  优点：灵活，可实现高稀疏度                                     │
-│  缺点：需要稀疏矩阵支持才能加速                                 │
-│                                                                 │
-│  2. 结构化剪枝：                                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  原始卷积层（16 个滤波器）：                             │   │
-│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐                          │   │
-│  │  │F1  │ │F2  │ │F3  │ │F4  │ ...（16 个滤波器）        │   │
-│  │  └────┘ └────┘ └────┘ └────┘                          │   │
-│  │                                                         │   │
-│  │  剪枝后卷积层（8 个滤波器）：                           │   │
-│  │  ┌────┐ ┌────┐                                         │   │
-│  │  │F1  │ │F3  │  （移除 F2、F4、F6、F8...）             │   │
-│  │  └────┘ └────┘                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│  优点：直接加速，无需特殊硬件                                   │
-│  缺点：不够灵活，可能损失更多精度                               │
-│                                                                 │
-│  3. 通道剪枝：                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  原始：64 个通道 → 剪枝后：32 个通道                     │   │
-│  │  直接减少模型宽度                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+L = α * L_hard(y, student(x)) + (1-α) * L_soft(teacher(x; T), student(x; T))
 ```
 
-### 使用 PyTorch 实现
+其中T是温度（通常2-20），α是权重因子（通常0.1-0.5）。
 
-```python
-# 模型剪枝实现
-import torch
-import torch.nn as nn
-import torch.nn.utils.prune as prune
+### 18.3.2 知识蒸馏结果
 
-def structured_pruning(model, amount=0.3):
-    """对 Conv2d 层应用结构化剪枝。"""
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d):
-            prune.ln_structured(
-                module, 
-                name='weight', 
-                amount=amount, 
-                n=2,  # L2 范数
-                dim=0  # 剪枝输出通道
-            )
-            # 使剪枝永久化
-            prune.remove(module, 'weight')
+**计算机视觉（ImageNet）：**
 
-def unstructured_pruning(model, amount=0.5):
-    """对所有线性层和卷积层应用非结构化剪枝。"""
-    parameters_to_prune = []
-    
-    for name, module in model.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.Linear)):
-            parameters_to_prune.append((module, 'weight'))
-    
-    # 应用全局非结构化剪枝
-    prune.global_unstructured(
-        parameters_to_prune,
-        pruning_method=prune.L1Unstructured,
-        amount=amount,
-    )
-    
-    # 使剪枝永久化
-    for module, param_name in parameters_to_prune:
-        prune.remove(module, param_name)
+| 教师 | 学生 | 教师Top-1 | 学生Top-1 | 大小减少 |
+|------|------|----------|----------|---------|
+| ResNet-152 | ResNet-50 | 78.3% | 77.0% | 2.6倍 |
+| ResNet-152 | ResNet-34 | 78.3% | 75.4% | 4.2倍 |
+| EfficientNet-B7 | EfficientNet-B3 | 84.3% | 81.6% | 8.3倍 |
+| ViT-L/14 | ViT-B/14 | 87.8% | 84.2% | 5.4倍 |
 
-def get_model_sparsity(model):
-    """计算模型稀疏度。"""
-    total_params = 0
-    zero_params = 0
-    
-    for param in model.parameters():
-        total_params += param.numel()
-        zero_params += (param == 0).sum().item()
-    
-    sparsity = 100.0 * zero_params / total_params
-    return sparsity
+**NLP（GLUE基准测试）：**
 
-# 使用示例
-model = models.resnet50(pretrained=True)
-
-# 应用结构化剪枝（移除 30% 的通道）
-structured_pruning(model, amount=0.3)
-
-# 应用非结构化剪枝（50% 稀疏度）
-unstructured_pruning(model, amount=0.5)
-
-# 检查稀疏度
-sparsity = get_model_sparsity(model)
-print(f"模型稀疏度：{sparsity:.2f}%")
-
-# 微调以恢复精度
-optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-criterion = nn.CrossEntropyLoss()
-
-for epoch in range(10):
-    model.train()
-    for images, labels in train_loader:
-        outputs = model(images.cuda())
-        loss = criterion(outputs, labels.cuda())
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-```
+| 教师 | 学生 | 教师分数 | 学生分数 | 大小减少 |
+|------|------|---------|---------|---------|
+| BERT-Large | BERT-Base | 80.5 | 79.1 | 3.3倍 |
+| BERT-Large | DistilBERT | 80.5 | 77.0 | 6.6倍 |
+| RoBERTa-Large | BERT-Base | 83.2 | 79.1 | 3.3倍 |
 
 ---
 
-## 18.4 架构搜索
+## 18.4 剪枝和结构化稀疏度
 
-### 神经架构搜索（NAS）
+剪枝从模型中移除冗余权重或整个结构。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              神经架构搜索                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  搜索策略                                 │   │
-│  │                                                         │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  随机    │  │  网格    │  │  贝叶斯  │  │RL/EA │  │   │
-│  │  │  搜索    │  │  搜索    │  │优化      │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  搜索空间                                 │   │
-│  │                                                         │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  操作    │  │  连接    │  │  宽度    │  │深度  │  │   │
-│  │  │(Conv,Pool)│  │  模式    │  │  乘数    │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  性能估计                                 │   │
-│  │                                                         │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  完整    │  │  One-    │  │  权重    │  │零成本│  │   │
-│  │  │  训练    │  │  Shot    │  │  共享    │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+### 18.4.1 剪枝类型
 
-### 可微架构搜索（DARTS）
+| 类型 | 移除什么 | 硬件优势 | 准确性影响 |
+|------|---------|---------|-----------|
+| **非结构化** | 低于阈值的单个权重 | 需要稀疏矩阵支持 | 逐步剪枝影响最小 |
+| **结构化** | 整个滤波器/通道/注意力头 | 任何硬件直接加速 | 中等（2-5%损失） |
+| **半结构化** | N:M稀疏模式（如2:4） | NVIDIA Ampere+稀疏Tensor Core | 最小（0.5-1%损失） |
 
-```python
-# DARTS 实现
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+### 18.4.2 NVIDIA 2:4稀疏Tensor Core
 
-class MixedOp(nn.Module):
-    """具有架构参数的混合操作。"""
-    def __init__(self, C, stride):
-        super().__init__()
-        self.ops = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(C, C, 3, stride, 1, bias=False),
-                nn.BatchNorm2d(C),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(
-                nn.Conv2d(C, C, 5, stride, 2, bias=False),
-                nn.BatchNorm2d(C),
-                nn.ReLU(inplace=True)
-            ),
-            nn.MaxPool2d(3, stride, 1),
-            nn.AvgPool2d(3, stride, 1),
-            nn.Sequential(
-                nn.Conv2d(C, C, 3, stride, 1, groups=C, bias=False),
-                nn.BatchNorm2d(C),
-                nn.ReLU(inplace=True)
-            ),
-        ])
-    
-    def forward(self, x, weights):
-        return sum(w * op(x) for w, op in zip(weights, self.ops))
+NVIDIA Ampere及更新GPU支持2:4结构化稀疏度：在每4个连续元素中，最多2个可以非零。这在专用稀疏Tensor Core硬件上提供**2倍理论加速**。
 
-class DARTSCell(nn.Module):
-    """DARTS 搜索单元。"""
-    def __init__(self, steps, C):
-        super().__init__()
-        self.steps = steps
-        self.ops = nn.ModuleList()
-        
-        for _ in range(steps):
-            for _ in range(steps + 2):
-                self.ops.append(MixedOp(C, stride=1))
-    
-    def forward(self, s0, s1, alphas):
-        states = [s0, s1]
-        offset = 0
-        
-        for _ in range(self.steps):
-            s = sum(
-                self.ops[offset + j](states[j], alphas[offset + j])
-                for j in range(len(states))
-            )
-            offset += len(states)
-            states.append(s)
-        
-        return torch.cat(states[-self.steps:], dim=1)
+**2:4稀疏度基准测试（A100 GPU）：**
 
-class DARTSNetwork(nn.Module):
-    """DARTS 搜索网络。"""
-    def __init__(self, C=16, num_classes=10, steps=4, layers=8):
-        super().__init__()
-        self.steps = steps
-        self.layers = layers
-        
-        # 架构参数
-        self.alphas_normal = nn.Parameter(
-            1e-3 * torch.randn(steps * (steps + 2) // 2, 5)
-        )
-        self.alphas_reduce = nn.Parameter(
-            1e-3 * torch.randn(steps * (steps + 2) // 2, 5)
-        )
-        
-        # 单元
-        self.cells = nn.ModuleList()
-        for i in range(layers):
-            reduction = (i == layers // 3) or (i == 2 * layers // 3)
-            C_prev = C if i == 0 else C * steps
-            cell = DARTSCell(steps, C_prev)
-            self.cells.append(cell)
-        
-        # 分类器
-        self.classifier = nn.Linear(C * steps, num_classes)
-    
-    def forward(self, x):
-        s0 = s1 = self._stem(x)
-        
-        alphas = F.softmax(self.alphas_normal, dim=-1)
-        
-        for cell in self.cells:
-            s0, s1 = s1, cell(s0, s1, alphas)
-        
-        out = F.adaptive_avg_pool2d(s1, (1, 1))
-        out = out.view(out.size(0), -1)
-        return self.classifier(out)
-
-# DARTS 训练循环
-def train_darts(model, train_loader, val_loader, epochs=50):
-    optimizer_arch = torch.optim.Adam(
-        [model.alphas_normal, model.alphas_reduce],
-        lr=3e-4, weight_decay=1e-3
-    )
-    optimizer_net = torch.optim.SGD(
-        model.parameters(),
-        lr=0.025, momentum=0.9, weight_decay=3e-4
-    )
-    
-    for epoch in range(epochs):
-        # 训练架构参数
-        model.train()
-        for images, labels in val_loader:
-            outputs = model(images.cuda())
-            loss = F.cross_entropy(outputs, labels.cuda())
-            
-            optimizer_arch.zero_grad()
-            loss.backward()
-            optimizer_arch.step()
-        
-        # 训练网络参数
-        for images, labels in train_loader:
-            outputs = model(images.cuda())
-            loss = F.cross_entropy(outputs, labels.cuda())
-            
-            optimizer_net.zero_grad()
-            loss.backward()
-            optimizer_net.step()
-```
+| 模型 | 密集FP16 | 2:4稀疏FP16 | 加速 | 准确性损失 |
+|------|---------|-----------|------|-----------|
+| ResNet-50 | 4.8ms | 3.1ms | 1.55倍 | -0.3% |
+| BERT-base | 2.1ms | 1.4ms | 1.50倍 | -0.4% |
+| YOLOv5-L | 8.2ms | 5.3ms | 1.55倍 | -0.5% |
 
 ---
 
-## 18.5 编译优化
+## 18.5 ONNX Runtime优化
 
-### TorchScript 和 ONNX 导出
+ONNX Runtime提供统一的推理引擎，针对特定硬件目标优化模型。
 
-```python
-# 模型编译和优化
-import torch
-import torch.jit as jit
-import onnxruntime as ort
+### 18.5.1 ONNX Runtime优化通道
 
-# TorchScript JIT 编译
-def compile_torchscript(model, example_input):
-    """将模型编译为 TorchScript。"""
-    model.eval()
-    
-    # 基于跟踪的编译
-    traced_model = jit.trace(model, example_input)
-    
-    # 针对推理优化
-    optimized_model = jit.optimize_for_inference(traced_model)
-    
-    # 保存
-    optimized_model.save("model_optimized.pt")
-    
-    return optimized_model
+| 优化 | 描述 | 典型加速 |
+|------|------|---------|
+| **图融合** | 将多个操作合并为单个内核 | 1.2-2.0倍 |
+| **常量折叠** | 预计算静态表达式 | 1.1-1.3倍 |
+| **层归一化融合** | 将LayerNorm融合为单个内核 | 1.3-1.8倍 |
+| **注意力融合** | 优化多头注意力模式 | 1.5-2.5倍 |
+| **量化** | INT8/INT4权重转换 | 2.0-4.0倍 |
+| **执行提供程序** | 硬件特定内核（CUDA、TensorRT、OpenVINO） | 2.0-5.0倍 |
 
-# ONNX 导出
-def export_onnx(model, example_input, output_path):
-    """将模型导出为 ONNX 格式。"""
-    model.eval()
-    
-    torch.onnx.export(
-        model,
-        example_input,
-        output_path,
-        export_params=True,
-        opset_version=13,
-        do_constant_folding=True,
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes={
-            'input': {0: 'batch_size'},
-            'output': {0: 'batch_size'}
-        }
-    )
+### 18.5.2 ONNX Runtime基准测试结果
 
-# ONNX Runtime 优化
-def optimize_onnx(model_path, optimization_level='all'):
-    """优化 ONNX 模型。"""
-    sess_options = ort.SessionOptions()
-    
-    # 图优化
-    sess_options.graph_optimization_level = (
-        ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    )
-    
-    # 执行模式
-    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    
-    # 线程池
-    sess_options.intra_op_num_threads = 4
-    sess_options.inter_op_num_threads = 2
-    
-    # 创建会话
-    session = ort.InferenceSession(
-        model_path,
-        sess_options,
-        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-    )
-    
-    return session
+**ResNet-50跨执行提供程序推理（批次大小1，延迟）：**
 
-# TensorRT 优化（NVIDIA）
-def optimize_tensorrt(onnx_path, fp16=True):
-    """使用 TensorRT 优化。"""
-    import tensorrt as trt
-    
-    logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    )
-    parser = trt.OnnxParser(network, logger)
-    
-    # 解析 ONNX 模型
-    with open(onnx_path, 'rb') as f:
-        if not parser.parse(f.read()):
-            for error in range(parser.num_errors):
-                print(parser.get_error(error))
-    
-    # 构建引擎
-    config = builder.create_builder_config()
-    config.max_workspace_size = 1 << 30  # 1GB
-    
-    if fp16 and builder.platform_has_fast_fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
-    
-    engine = builder.build_engine(network, config)
-    
-    return engine
-```
+| 提供程序 | CPU（x86） | CUDA（A100） | TensorRT（A100） | OpenVINO |
+|---------|----------|------------|----------------|----------|
+| PyTorch默认 | 12.3ms | 1.8ms | 不适用 | 不适用 |
+| ONNX Runtime | 8.1ms | 1.2ms | 0.6ms | 3.2ms |
+
+**BERT-base推理（序列长度128，批次大小1）：**
+
+| 提供程序 | CPU | CUDA（A100） | TensorRT |
+|---------|-----|------------|----------|
+| PyTorch默认 | 8.2ms | 1.1ms | 不适用 |
+| ONNX Runtime | 4.5ms | 0.7ms | 0.3ms |
 
 ---
 
-## 💡 案例研究：使用 ONNX Runtime 优化模型
+## 18.6 案例研究：Microsoft如何优化模型用于边缘
 
-### 完整工作流
+Microsoft在数十亿边缘设备上部署AI模型：Windows PC、Xbox主机、HoloLens头显和Azure IoT设备。他们的优化策略跨越多个层次。
 
-🔴 高级
+**优化管道：**
 
-```python
-# 完整的 ONNX Runtime 优化管道
-import onnxruntime as ort
-import numpy as np
-import time
-from pathlib import Path
+| 阶段 | 工具/技术 | 目的 |
+|------|---------|------|
+| 模型设计 | 面向边缘的架构搜索 | 硬件感知NAS |
+| 训练 | 知识蒸馏 | 从云模型转移到边缘模型 |
+| 压缩 | INT8量化 + 剪枝 | 减小模型大小 |
+| 运行时优化 | ONNX Runtime + DirectML | 硬件无关的GPU加速 |
+| 部署 | Windows ML / ONNX Runtime | 在任何Windows设备上统一推理 |
 
-class ONNXOptimizationPipeline:
-    def __init__(self, model_path, calibration_data):
-        self.model_path = model_path
-        self.calibration_data = calibration_data
-        self.optimization_levels = {
-            'basic': ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
-            'extended': ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
-            'all': ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
-        }
-    
-    def benchmark(self, session, input_data, num_runs=100):
-        """基准测试模型推理。"""
-        input_name = session.get_inputs()[0].name
-        
-        # 预热
-        for _ in range(10):
-            session.run(None, {input_name: input_data})
-        
-        # 基准测试
-        latencies = []
-        for _ in range(num_runs):
-            start = time.time()
-            session.run(None, {input_name: input_data})
-            latencies.append(time.time() - start)
-        
-        return {
-            'mean_latency': np.mean(latencies) * 1000,
-            'p50_latency': np.percentile(latencies, 50) * 1000,
-            'p95_latency': np.percentile(latencies, 95) * 1000,
-            'p99_latency': np.percentile(latencies, 99) * 1000,
-            'throughput': 1000 / (np.mean(latencies) * 1000)
-        }
-    
-    def optimize_static_quantization(self, output_path):
-        """应用静态量化。"""
-        from onnxruntime.quantization import (
-            quantize_static, 
-            CalibrationDataReader,
-            QuantFormat,
-            QuantType
-        )
-        
-        class DataReader(CalibrationDataReader):
-            def __init__(self, data):
-                self.data = data
-                self.enum_data = iter(data)
-            
-            def get_next(self):
-                batch = next(self.enum_data, None)
-                if batch is None:
-                    return None
-                return {"input": batch.numpy() if hasattr(batch, 'numpy') else batch}
-        
-        reader = DataReader(self.calibration_data)
-        
-        quantize_static(
-            model_input=self.model_path,
-            model_output=output_path,
-            calibration_data_reader=reader,
-            quant_format=QuantFormat.QDQ,
-            per_channel=True,
-            reduce_range=False,
-            weight_type=QuantType.QInt8,
-            activation_type=QuantType.QInt8,
-            op_types_to_quantize=['Conv', 'MatMul', 'Attention']
-        )
-        
-        return output_path
-    
-    def optimize_dynamic_quantization(self, output_path):
-        """应用动态量化。"""
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        
-        quantize_dynamic(
-            model_input=self.model_path,
-            model_output=output_path,
-            weight_type=QuantType.QInt8
-        )
-        
-        return output_path
-    
-    def optimize_graph_optimization(self, level='all'):
-        """应用图优化。"""
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = self.optimization_levels[level]
-        
-        session = ort.InferenceSession(
-            self.model_path,
-            sess_options,
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-        )
-        
-        return session
-    
-    def run_full_optimization(self, output_dir):
-        """运行完整优化管道。"""
-        output_dir = Path(output_dir)
-        output_dir.mkdir(exist_ok=True)
-        
-        results = {}
-        
-        # 基线基准测试
-        baseline_session = ort.InferenceSession(
-            self.model_path,
-            providers=['CUDAExecutionProvider']
-        )
-        input_data = next(iter(self.calibration_data))
-        input_data = input_data.numpy() if hasattr(input_data, 'numpy') else input_data
-        results['baseline'] = self.benchmark(baseline_session, input_data)
-        
-        # 静态量化
-        static_path = str(output_dir / 'model_static.onnx')
-        self.optimize_static_quantization(static_path)
-        static_session = ort.InferenceSession(
-            static_path,
-            providers=['CUDAExecutionProvider']
-        )
-        results['static_quantized'] = self.benchmark(static_session, input_data)
-        
-        # 动态量化
-        dynamic_path = str(output_dir / 'model_dynamic.onnx')
-        self.optimize_dynamic_quantization(dynamic_path)
-        dynamic_session = ort.InferenceSession(
-            dynamic_path,
-            providers=['CPUExecutionProvider']
-        )
-        results['dynamic_quantized'] = self.benchmark(dynamic_session, input_data)
-        
-        # 图优化
-        optimized_session = self.optimize_graph_optimization('all')
-        results['graph_optimized'] = self.benchmark(optimized_session, input_data)
-        
-        return results
+**关键技术：**
 
-# 使用示例
-pipeline = ONNXOptimizationPipeline(
-    model_path='model.onnx',
-    calibration_data=calibration_loader
-)
+1. **DirectML：** Windows上的硬件无关GPU加速API，使ONNX Runtime可以使用任何供应商（NVIDIA、AMD、Intel）的GPU，无需供应商特定代码。
 
-results = pipeline.run_full_optimization('./optimized_models')
+2. **Windows ML：** Windows 10/11内置的推理引擎，使用设备最佳可用硬件（GPU、CPU或NPU）运行ONNX模型。
 
-# 打印结果
-for opt_name, metrics in results.items():
-    print(f"\n{opt_name.upper()}:")
-    print(f"  平均延迟：{metrics['mean_latency']:.2f} ms")
-    print(f"  P95 延迟：{metrics['p95_latency']:.2f} ms")
-    print(f"  吞吐量：{metrics['throughput']:.2f} 次推理/秒")
-```
+3. **Model Inspector：** 内部分析工具，在目标硬件上分析模型执行并推荐特定优化（融合哪些层、量化哪些层、瓶颈在哪里）。
+
+**规模指标：**
+
+- 14亿+活跃Windows设备
+- 1亿+Office 365用户受益于边缘AI（智能回复、听写、图像增强）
+- 5000万+Xbox用户受益于AI升级（DirectX Super Resolution）
+- 通过优化的平均模型大小减少：4-8倍
+- 平均推理加速：3-6倍
+
+**示例：Microsoft Teams背景模糊**
+
+| 指标 | 原始模型 | 优化后模型 |
+|------|---------|-----------|
+| 模型大小 | 85MB | 12MB |
+| 推理时间（CPU） | 32ms | 8ms |
+| RAM使用 | 220MB | 45MB |
+| 准确率（IoU） | 0.94 | 0.92 |
+| 设备兼容性 | 仅GPU | CPU和GPU |
 
 ---
 
-## 📝 练习
+## 18.7 战争故事：量化模型损失了20%准确性
 
-### 练习 18.1：量化比较
-在 ResNet-50 模型上比较量化方法：
-1. 应用 PTQ（训练后量化）
-2. 应用 QAT（量化感知训练）
-3. 比较精度和延迟
-4. 在不同硬件（CPU、GPU、边缘设备）上测试
+**公司：** 电商产品分类系统
 
-### 练习 18.2：知识蒸馏
-实现文本分类的知识蒸馏：
-1. 教师：BERT-base（110M 参数）
-2. 学生：DistilBERT（66M 参数）或自定义小模型
-3. 与直接训练学生进行比较
-4. 测量精度保留和推理速度
+**问题：** 团队将产品分类模型（ResNeXt-101）从FP32量化为INT8以部署到边缘设备。量化模型的准确性从94.2%下降到74.1%——灾难性的20%下降。
 
-### 练习 18.3：模型压缩管道
-构建完整的压缩管道，要求：
-1. 应用剪枝（30% 结构化）
-2. 应用量化（INT8）
-3. 导出为 ONNX
-4. 在边缘硬件上进行基准测试
-5. 报告大小缩减和加速比
+**根本原因分析：**
 
----
+1. **代表性校准数据错误。** 用于PTQ的校准数据集仅包含光线良好、居中的产品图像。生产图像包括模糊照片、异常角度、光线差和被遮挡的产品。
 
-## ⚠️ 警告
+2. **模型存在异常激活。** 网络最后三层的激活值比典型值大10-50倍。INT8的有限范围（−128到127）裁剪了这些异常值，破坏了模型区分相似产品的能力。
 
-1. **精度下降**：始终在保留的测试集上验证压缩模型。压缩可能导致显著的精度下降。
-2. **硬件兼容性**：并非所有量化格式都受所有硬件支持。检查 TensorRT、ONNX Runtime 和 TFLite 的支持情况。
-3. **校准数据**：静态量化需要代表性的校准数据。使用验证集，而不是训练集。
-4. **层敏感性**：某些层对压缩更敏感。考虑混合精度策略。
+3. **无逐层量化分析。** 团队对所有层应用单一全局量化尺度，而不是分析每层的敏感性。
+
+**最终准确性：93.7%**（vs FP32基线94.2%——仅0.5%损失）
+
+**关键教训：**
+
+1. 量化前始终分析激活分布
+2. 校准数据必须代表生产数据分布
+3. 混合精度量化（敏感层FP16，其他INT8）几乎总是优于均匀INT8
+4. QAT恢复PTQ无法恢复的准确性，代价是训练时间
+5. 在实际生产测试集上验证量化模型准确性，而不是干净的基准测试集
 
 ---
 
-## 本章小结
+## 18.8 压缩技术比较
 
-本章介绍了用于边缘部署的模型压缩和优化技术：
-1. 量化（PTQ、QAT、动态、静态）
-2. 知识蒸馏（基于 logits、基于特征）
-3. 模型剪枝（结构化、非结构化、运动剪枝）
-4. 架构搜索（DARTS、NAS）
-5. 编译优化（TorchScript、ONNX、TensorRT）
+| 技术 | 准确性损失 | 加速 | 实施难度 | 最适合 |
+|------|-----------|------|---------|--------|
+| FP16/BF16 | < 0.5% | 1.5-2倍 | 低（默认） | 通用基线 |
+| INT8 PTQ | 0.5-2% | 2-4倍 | 低 | 快速优化 |
+| INT8 QAT | < 0.5% | 2-4倍 | 中等 | 高准确性需求 |
+| INT4（GPTQ/AWQ） | 0.5-3% | 3-6倍 | 中等 | LLM部署 |
+| 结构化剪枝 | 2-5% | 1.5-3倍 | 中等 | 模型大小减少 |
+| 2:4稀疏度 | 0.3-1% | 1.5倍 | 低 | NVIDIA Ampere+ |
+| 知识蒸馏 | 2-5% | 变化 | 高 | 定制小模型 |
+| ONNX Runtime | 0% | 2-5倍 | 低 | 框架迁移 |
 
-下一章我们将探讨边缘部署架构和策略。
+---
+
+## 18.9 何时使用/何时不使用压缩
+
+### 何时使用模型压缩
+
+| 场景 | 推荐技术 |
+|------|---------|
+| 边缘部署延迟 < 20ms | INT8 QAT + 结构化剪枝 |
+| LLM部署在消费级GPU上 | INT4（GPTQ/AWQ） |
+| 大规模云成本减少 | INT8 PTQ + ONNX Runtime |
+| 部署到多种硬件 | ONNX Runtime + FP16 |
+| 模型对目标内存太大 | 结构化剪枝 + 量化 |
+| 高QPS实时推理 | TensorRT + INT8 + 2:4稀疏度 |
+
+### 何时不使用模型压缩
+
+| 场景 | 压缩有害的原因 | 替代方案 |
+|------|---------------|---------|
+| 准确性至关重要（医疗、安全） | 任何准确性损失都不可接受 | 使用全精度云推理 |
+| 模型已经很小（< 10MB） | 压缩开销 > 收益 | 直接部署 |
+| 批处理（无延迟要求） | 无需加速 | 专注于吞吐量而非压缩 |
+| 原型设计阶段 | 压缩增加复杂性 | 模型定型后再优化 |
+| 模型即将重新训练 | 压缩工作浪费 | 仅压缩生产模型 |
+
+---
+
+## 18.10 本章小结
+
+- **量化**将模型精度从FP32/FP16降低到INT8/INT4/FP8，实现2-6倍加速，准确性损失0.5-3%
+- **知识蒸馏**从大型教师训练小型学生模型，实现3-8倍大小减少，准确性损失2-5%
+- **结构化剪枝**（特别是NVIDIA 2:4稀疏度）以最小的准确性影响提供硬件加速加速
+- **ONNX Runtime**通过图优化和硬件特定执行提供程序提供2-5倍推理加速
+- **混合精度**方法（不同层不同精度）始终优于均匀量化
+- 最常见的失败是在没有代表性校准数据的情况下进行量化——始终在生产数据分布上验证
+
+---
+
+## 讨论题
+
+1. 你有一个BERT-large模型（3.4亿参数），需要在笔记本电脑CPU上以低于10ms运行推理。设计一个实现此目标的压缩管道。你会组合哪些技术，预期的准确性损失是多少？
+
+2. 比较INT8量化和知识蒸馏用于减少ResNet-152模型。在相同模型大小下，哪种方法提供更好的准确性？在什么情况下你会选择其中一个？
+
+3. 一家公司正在向4GB RAM的边缘设备部署LLM。模型有70亿参数。你会使用什么组合技术在保持可接受质量的同时将模型放入内存？
+
+4. 为什么混合精度量化始终优于均匀量化？根据神经网络中权重和激活的分布提供技术解释。
+
+5. Microsoft使用DirectML进行硬件无关的GPU加速。使用供应商无关的运行时与供应商特定优化（NVIDIA用TensorRT，Intel用OpenVINO）有哪些权衡？
+
+---
+
+## 练习
+
+**练习1：** 获取预训练的ResNet-50模型，使用ONNX Runtime应用INT8训练后量化。在ImageNet验证集上测量量化前后的准确性。然后应用量化感知训练并比较结果。
+
+**练习2：** 实现从ResNet-152（教师）到ResNet-50（学生）在CIFAR-100上的知识蒸馏。尝试不同的温度值（2、5、10、20）和损失权重因子（0.1、0.3、0.5、0.7）。绘制准确性与温度的曲线。
+
+**练习3：** 使用TensorRT的分析工具分析YOLOv8模型。识别前5个最耗时的层。对这些特定层应用目标优化（内核选择、层融合）并测量改进。
+
+---
+
+## 参考文献
+
+- ONNX Runtime文档：https://onnxruntime.ai/docs/
+- ONNX Runtime GitHub：https://github.com/microsoft/onnxruntime
+- NVIDIA TensorRT文档：https://developer.nvidia.com/tensorrt
+- TensorRT开发者区域：https://developer.nvidia.com/tensorrt
+- 面向高效整数算术推理的神经网络量化与训练（Jacob等，2018）：https://arxiv.org/abs/1712.05877
+- GPTQ：生成预训练Transformer的准确训练后量化（Frantar等，2023）：https://arxiv.org/abs/2210.17323
+- AWQ：激活感知权重量化（Lin等，2024）：https://arxiv.org/abs/2306.00978
+- Hugging Face Optimum（模型优化）：https://huggingface.co/docs/optimum/
+- NVIDIA稀疏度文档：https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/#sparse-tensor-cores

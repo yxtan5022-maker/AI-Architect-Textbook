@@ -4,16 +4,33 @@
 
 ---
 
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+1. Design end-to-end RAG pipelines using LangChain and Chroma
+2. Compare vector databases (Chroma, Pinecone, Weaviate, Qdrant) on performance, cost, and features
+3. Implement advanced retrieval strategies (hybrid search, re-ranking, query transformation)
+4. Evaluate RAG systems using the RAGAS framework with real metrics
+5. Identify and mitigate common RAG failure modes (hallucination, retrieval failure, context pollution)
+6. Build production-grade RAG systems with monitoring and feedback loops
+
+---
+
 ## Table of Contents
 
 - [12.1 RAG Principles & Architecture](#121-rag-principles--architecture)
-- [12.2 Vector Database Selection](#122-vector-database-selection)
+- [12.2 Vector Database Deep Dive](#122-vector-database-deep-dive)
 - [12.3 Retrieval Strategy Design](#123-retrieval-strategy-design)
 - [12.4 Generation Strategy Optimization](#124-generation-strategy-optimization)
 - [12.5 RAG Evaluation Framework](#125-rag-evaluation-framework)
 - [12.6 Advanced RAG Techniques](#126-advanced-rag-techniques)
-- [💡 Case: Enterprise Knowledge Base with LangChain + Chroma](#-case-enterprise-knowledge-base-with-langchain--chroma)
+- [💡 Case Study: How Notion Built Enterprise Knowledge Base with RAG](#-case-study-how-notion-built-enterprise-knowledge-base-with-rag)
+- [⚠️ War Story: The RAG That Hallucinated a $50K Legal Settlement](#️-war-story-the-rag-that-hallucinated-a-50k-legal-settlement)
+- [📝 When to Use / When Not to Use](#-when-to-use--when-not-to-use)
 - [Summary](#summary)
+- [Discussion Questions](#discussion-questions)
+- [Exercises](#exercises)
 - [References](#references)
 
 ---
@@ -23,6 +40,8 @@
 ### 12.1.1 What is RAG?
 
 Retrieval-Augmented Generation (RAG) combines the reasoning capabilities of large language models with external knowledge retrieval. Instead of relying solely on parametric knowledge (what the model learned during pre-training), RAG systems retrieve relevant documents at inference time and provide them as context to the LLM.
+
+📌 **Real Data**: LangChain (github.com/langchain-ai/langchain) is the most popular LLM application framework. Chroma (github.com/chroma-core/chroma) is an open-source vector database designed specifically for AI applications. Together, they form the most common open-source RAG stack.
 
 📌 **Key Concept**: RAG = Retrieve relevant documents → Augment prompt with context → Generate answer grounded in retrieved evidence.
 
@@ -79,622 +98,192 @@ Retrieval-Augmented Generation (RAG) combines the reasoning capabilities of larg
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 12.1.2 Why RAG over Fine-tuning?
+### 12.1.2 Why RAG Instead of Fine-tuning?
 
-| Aspect | RAG | Fine-tuning |
+| Factor | RAG | Fine-tuning |
 |--------|-----|-------------|
-| **Knowledge Updates** | Real-time (update documents) | Retraining required |
-| **Source Attribution** | ✅ Built-in citations | ❌ No source tracking |
-| **Hallucination** | Reduced (grounded in docs) | May hallucinate |
-| **Cost** | Lower (no retraining) | Higher (compute + data) |
-| **Data Privacy** | Documents stay external | Data baked into model |
-| **Complexity** | Infrastructure needed | Simpler pipeline |
-| **Multi-task** | Single model + different docs | Need per-task models |
+| **Knowledge updates** | Real-time (re-index documents) | Requires retraining |
+| **Cost** | Low (no GPU for training) | High (GPU hours) |
+| **Transparency** | Citable sources | Black box |
+| **Hallucination** | Reduced (grounded in docs) | Can still hallucinate |
+| **Data privacy** | Documents stay in your DB | Data baked into model |
+| **Multi-domain** | Easy (add more docs) | Need separate models |
+| **Latency** | Higher (retrieval step) | Lower (single forward pass) |
+| **Accuracy ceiling** | Depends on retrieval quality | Can be very high |
+
+### 12.1.3 RAG vs Fine-tuning Decision Framework
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              When to Use RAG vs Fine-tuning                    │
+│              RAG vs Fine-tuning Decision Tree                  │
 │                                                                │
-│  Use RAG when:                                                  │
-│  ├── Knowledge changes frequently                             │
-│  ├── You need source citations                                │
-│  ├── Data is too large to fit in model                       │
-│  ├── You need real-time information                          │
-│  └── Multiple domains with one model                         │
+│  Does the knowledge change frequently?                        │
+│  ├── YES → Use RAG (or RAG + fine-tuning)                     │
+│  └── NO ↓                                                     │
 │                                                                │
-│  Use Fine-tuning when:                                         │
-│  ├── Task requires specific behavior/style                   │
-│  ├── Knowledge is stable and small                           │
-│  ├── You need very low latency                               │
-│  └── RAG context doesn't capture needed patterns             │
+│  Is the knowledge private/confidential?                        │
+│  ├── YES → Use RAG (keep data in your DB, not in model)       │
+│  └── NO ↓                                                     │
 │                                                                │
-│  Best Practice: Combine both!                                  │
-│  Fine-tune for behavior + RAG for knowledge                    │
+│  Do you need citation/provenance?                              │
+│  ├── YES → Use RAG (retrieval provides source documents)       │
+│  └── NO ↓                                                     │
+│                                                                │
+│  Is the task about format/style, not knowledge?                │
+│  ├── YES → Use Fine-tuning (learn the pattern, not facts)     │
+│  └── NO ↓                                                     │
+│                                                                │
+│  Do you have limited compute budget?                           │
+│  ├── YES → Use RAG (cheaper to run)                           │
+│  └── NO → Use Fine-tuning + RAG (best of both worlds)         │
 └──────────────────────────────────────────────────────────────┘
-```
-
-### 12.1.3 RAG System Architecture Patterns
-
-```python
-# Basic RAG pipeline
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import DirectoryLoader
-from langchain.chains import RetrievalQA
-
-class BasicRAGPipeline:
-    """Simple RAG pipeline demonstrating core concepts."""
-
-    def __init__(self, docs_path, embedding_model="text-embedding-3-small"):
-        self.docs_path = docs_path
-        self.embedding_model = embedding_model
-        self.setup_pipeline()
-
-    def setup_pipeline(self):
-        # 1. Load documents
-        loader = DirectoryLoader(self.docs_path, glob="**/*.md")
-        documents = loader.load()
-        print(f"Loaded {len(documents)} documents")
-
-        # 2. Split into chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        self.chunks = text_splitter.split_documents(documents)
-        print(f"Split into {len(self.chunks)} chunks")
-
-        # 3. Create embeddings and vector store
-        embeddings = OpenAIEmbeddings(model=self.embedding_model)
-        self.vectorstore = Chroma.from_documents(
-            documents=self.chunks,
-            embedding=embeddings,
-            persist_directory="./chroma_db"
-        )
-
-        # 4. Create retriever
-        self.retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 5}
-        )
-
-        # 5. Create QA chain
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=self.retriever,
-            return_source_documents=True,
-            verbose=True
-        )
-
-    def query(self, question):
-        """Query the RAG system."""
-        result = self.qa_chain.invoke({"query": question})
-
-        print(f"\nAnswer: {result['result']}")
-        print(f"\nSources:")
-        for i, doc in enumerate(result['source_documents']):
-            print(f"  [{i+1}] {doc.metadata.get('source', 'unknown')} "
-                  f"(page {doc.metadata.get('page', 'N/A')})")
-
-        return result
-
-# Usage
-rag = BasicRAGPipeline("./knowledge_base")
-answer = rag.query("What is our return policy?")
 ```
 
 ---
 
-## 12.2 Vector Database Selection
+## 12.2 Vector Database Deep Dive
 
-### 12.2.1 Vector Database Landscape
+### 12.2.1 Vector Database Comparison
+
+| Feature | Chroma | Pinecone | Weaviate | Qdrant |
+|---------|--------|----------|----------|--------|
+| **Type** | Open-source | Managed | Open-source | Open-source |
+| **Deployment** | Local/Cloud | Cloud only | Self-host/Cloud | Self-host/Cloud |
+| **Index Type** | HNSW | Proprietary | HNSW + Flat | HNSW |
+| **Metadata Filtering** | ✅ | ✅ | ✅ | ✅ |
+| **Hybrid Search** | ❌ (coming) | ✅ | ✅ | ✅ |
+| **Multi-tenancy** | Limited | ✅ | ✅ | ✅ |
+| **Maximum Dimensions** | 65,535 | 20,000 | 65,535 | 65,535 |
+| **Pricing** | Free (self-host) | $70/mo起步 | Free (self-host) | Free (self-host) |
+| **Best For** | Prototyping, small apps | Enterprise managed | Complex queries | Performance at scale |
+
+### 12.2.2 Chroma Deep Dive
+
+Chroma is designed for simplicity and developer experience:
+
+```python
+import chromadb
+
+# Create a collection (vector database)
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection(
+    name="company_docs",
+    metadata={"hnsw:space": "cosine"}  # Distance metric
+)
+
+# Add documents with embeddings
+collection.add(
+    documents=["Our refund policy allows 30-day returns...", 
+               "Shipping takes 3-5 business days..."],
+    metadatas=[
+        {"source": "policy/refund.md", "department": "legal"},
+        {"source": "policy/shipping.md", "department": "operations"}
+    ],
+    ids=["doc1", "doc2"]
+)
+
+# Query
+results = collection.query(
+    query_texts=["Can I return a product?"],
+    n_results=3,
+    where={"department": "legal"}  # Metadata filter
+)
+```
+
+📌 **Real Data**: Chroma supports HNSW (Hierarchical Navigable Small World) indexing with cosine, L2, and IP (inner product) distance metrics. For 1M documents with 1536-dimensional embeddings (OpenAI ada-002), Chroma requires ~6GB storage and queries in <10ms on a modern laptop.
+
+### 12.2.3 Embedding Model Selection
+
+| Model | Dimensions | Speed | Quality | Cost |
+|-------|-----------|-------|---------|------|
+| OpenAI text-embedding-3-small | 1536 | Fast | Good | $0.02/1M tokens |
+| OpenAI text-embedding-3-large | 3072 | Fast | Excellent | $0.13/1M tokens |
+| Cohere embed-v3 | 1024 | Fast | Excellent | $0.10/1M tokens |
+| BGE-large-en-v1.5 | 1024 | Medium | Very Good | Free (self-host) |
+| E5-large-v2 | 1024 | Medium | Very Good | Free (self-host) |
+| Nomic Embed | 768 | Fast | Good | Free (self-host) |
+
+📌 **Real Data**: BGE-large-en-v1.5 (BAAI) achieves 64.23 on MTEB benchmark, comparable to OpenAI's text-embedding-3-large at 64.59, but runs free on local GPU (HuggingFace, 2024).
+
+### 12.2.4 Indexing Strategies
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Vector Database Comparison Matrix                  │
+│                    Vector Index Types                          │
 │                                                                │
-│  Database     │ Type    │ Scale   │ Filter │ perf │ Ease     │
-│  ─────────────│─────────│─────────│────────│──────│──────────│
-│  Chroma       │ Embed   │ Local   │ Basic  │ ★★★  │ ★★★★★   │
-│  FAISS        │ Library │ Single  │ Basic  │ ★★★★★│ ★★★     │
-│  Pinecone    │ Cloud   │ Global  │ Good   │ ★★★★ │ ★★★★★   │
-│  Weaviate    │ Server  │ Cluster │ Great  │ ★★★★ │ ★★★★    │
-│  Milvus      │ Server  │ Cluster │ Great  │ ★★★★ │ ★★★     │
-│  Qdrant      │ Server  │ Cluster │ Great  │ ★★★★ │ ★★★★    │
-│  pgvector    │ Plugin  │ Single  │ Good   │ ★★★  │ ★★★★★   │
-│  LanceDB     │ Embed   │ Local   │ Good   │ ★★★★ │ ★★★★    │
-│  Vespa       │ Server  │ Cluster │ Great  │ ★★★★ │ ★★★     │
-│  Algolia     │ Cloud   │ Global  │ Great  │ ★★★★ │ ★★★★★   │
+│  Flat Index (Brute Force):                                    │
+│  - Compare query against ALL vectors                          │
+│  - Time: O(n)                                                 │
+│  - Space: O(n × d)                                            │
+│  - Best for: <10K vectors                                     │
 │                                                                │
-│  Selection Criteria:                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Prototype/Small Data (<100K docs):                    │    │
-│  │  → Chroma, FAISS, pgvector                            │    │
-│  │                                                       │    │
-│  │  Production (100K-10M docs):                           │    │
-│  │  → Qdrant, Weaviate, Pinecone                         │    │
-│  │                                                       │    │
-│  │  Enterprise (10M+ docs):                               │    │
-│  │  → Milvus, Vespa, Weaviate (cluster mode)             │    │
-│  │                                                       │    │
-│  │  Managed/Serverless:                                   │    │
-│  │  → Pinecone, Weaviate Cloud, Qdrant Cloud              │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  HNSW (Hierarchical Navigable Small World):                   │
+│  - Graph-based approximate nearest neighbor                   │
+│  - Time: O(log n)                                             │
+│  - Space: O(n × d × m) where m = connections per node        │
+│  - Best for: 10K - 100M vectors                               │
+│  - Parameters: M=16 (connections), ef_construction=200        │
+│                                                                │
+│  IVF (Inverted File Index):                                   │
+│  - Cluster vectors, search only nearby clusters               │
+│  - Time: O(n/k) where k = number of clusters searched        │
+│  - Best for: >100M vectors                                    │
+│                                                                │
+│  Product Quantization (PQ):                                   │
+│  - Compress vectors into codebooks                            │
+│  - 8x-64x compression                                         │
+│  - Best for: Memory-constrained, massive scale                │
 └──────────────────────────────────────────────────────────────┘
-```
-
-### 12.2.2 Embedding Models
-
-```python
-# Embedding model comparison
-EMBEDDING_MODELS = {
-    # OpenAI
-    "text-embedding-3-small": {
-        "dimensions": 1536,
-        "max_tokens": 8191,
-        "cost_per_1m_tokens": "$0.02",
-        "performance": "Good",
-    },
-    "text-embedding-3-large": {
-        "dimensions": 3072,
-        "max_tokens": 8191,
-        "cost_per_1m_tokens": "$0.13",
-        "performance": "Great",
-    },
-
-    # Open Source
-    "BAAI/bge-large-en-v1.5": {
-        "dimensions": 1024,
-        "max_tokens": 512,
-        "cost_per_1m_tokens": "Free (self-hosted)",
-        "performance": "Great",
-    },
-    "BAAI/bge-m3": {
-        "dimensions": 1024,
-        "max_tokens": 8192,
-        "cost_per_1m_tokens": "Free (self-hosted)",
-        "performance": "Great (multilingual)",
-    },
-    "nomic-embed-text-v1.5": {
-        "dimensions": 768,
-        "max_tokens": 8192,
-        "cost_per_1m_tokens": "Free (self-hosted)",
-        "performance": "Good",
-    },
-    "jinaai/jina-embeddings-v3": {
-        "dimensions": 1024,
-        "max_tokens": 8192,
-        "cost_per_1m_tokens": "Free (self-hosted)",
-        "performance": "Great",
-    },
-}
-
-# Using different embedding providers
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# Option 1: OpenAI embeddings
-openai_embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    dimensions=1536,
-)
-
-# Option 2: Local HuggingFace embeddings
-local_embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-large-en-v1.5",
-    model_kwargs={"device": "cuda"},
-    encode_kwargs={"normalize_embeddings": True},
-)
-
-# Option 3: Ollama embeddings (for local deployment)
-from langchain_community.embeddings import OllamaEmbeddings
-ollama_embeddings = OllamaEmbeddings(
-    model="nomic-embed-text",
-    base_url="http://localhost:11434",
-)
-```
-
-### 12.2.3 Vector Database Setup
-
-```python
-# Complete vector database setup with Chroma
-import chromadb
-from chromadb.config import Settings
-from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-class VectorStoreManager:
-    """Manage vector database for RAG system."""
-
-    def __init__(self, persist_directory="./chroma_db"):
-        self.persist_directory = persist_directory
-        self.client = chromadb.PersistentClient(path=persist_directory)
-
-    def create_collection(self, collection_name, embedding_fn=None):
-        """Create or get a collection."""
-        return self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},  # or "l2", "ip"
-        )
-
-    def add_documents(self, collection, documents, metadatas=None,
-                      ids=None, batch_size=100):
-        """Add documents in batches."""
-        for i in range(0, len(documents), batch_size):
-            batch_docs = documents[i:i+batch_size]
-            batch_meta = metadatas[i:i+batch_size] if metadatas else None
-            batch_ids = ids[i:i+batch_size] if ids else None
-
-            collection.add(
-                documents=batch_docs,
-                metadatas=batch_meta,
-                ids=batch_ids or [f"doc_{j}" for j in range(i, i+len(batch_docs))],
-            )
-
-    def search(self, collection, query, n_results=5, where=None):
-        """Search with optional metadata filtering."""
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-        }
-        if where:
-            kwargs["where"] = where
-
-        results = collection.query(**kwargs)
-
-        return {
-            "documents": results["documents"][0],
-            "metadatas": results["metadatas"][0] if results["metadatas"] else None,
-            "distances": results["distances"][0] if results["distances"] else None,
-        }
-
-    def hybrid_search(self, collection, query, n_results=5,
-                      keyword_weight=0.3, semantic_weight=0.7):
-        """
-        Combine keyword (BM25) and semantic search.
-        In practice, use a dedicated hybrid search engine.
-        """
-        # Semantic search
-        semantic_results = self.search(collection, query, n_results * 2)
-
-        # For true hybrid, integrate with BM25
-        # Here we simulate with score fusion
-        return semantic_results
-
-    def get_stats(self, collection_name):
-        """Get collection statistics."""
-        collection = self.client.get_collection(collection_name)
-        count = collection.count()
-        return {
-            "collection": collection_name,
-            "document_count": count,
-            "persist_directory": self.persist_directory,
-        }
-
-# Usage
-manager = VectorStoreManager("./my_rag_db")
-collection = manager.create_collection("knowledge_base")
-
-# Add documents
-manager.add_documents(
-    collection,
-    documents=["Document 1 text...", "Document 2 text..."],
-    metadatas=[{"source": "file1.pdf"}, {"source": "file2.pdf"}],
-)
-
-# Search
-results = manager.search(collection, "What is machine learning?", n_results=5)
-print(f"Found {len(results['documents'])} results")
 ```
 
 ---
 
 ## 12.3 Retrieval Strategy Design
 
-### 12.3.1 Query Transformation Techniques
+### 12.3.1 Search Strategies
 
-The quality of retrieval depends heavily on how queries are processed:
+| Strategy | How It Works | Best For | Limitations |
+|----------|-------------|----------|-------------|
+| **Semantic Search** | Embed query + docs, cosine similarity | Conceptual queries | Misses exact keywords |
+| **Keyword Search (BM25)** | Term frequency + inverse doc frequency | Exact matches | Misses synonyms |
+| **Hybrid Search** | Combine semantic + keyword scores | General purpose | Needs score normalization |
+| **Re-ranking** | Cross-encoder scores query-doc pairs | High precision | Expensive, slow |
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Query Transformation Techniques                    │
-│                                                                │
-│  1. Query Rewriting                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Original: "What's that thing for making websites?"   │    │
-│  │  Rewritten: "What tools or frameworks are used for   │    │
-│  │             web development?"                         │    │
-│  │                                                       │    │
-│  │  Method: Use LLM to rewrite ambiguous queries         │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  2. HyDE (Hypothetical Document Embeddings)                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Query: "How does photosynthesis work?"               │    │
-│  │  Hypothetical answer (LLM-generated):                 │    │
-│  │  "Photosynthesis is the process by which plants      │    │
-│  │   convert sunlight into energy..."                   │    │
-│  │                                                       │    │
-│  │  Embed the HYPOTHETICAL answer, not the query         │    │
-│  │  Why? The hypothetical answer is closer in embedding  │    │
-│  │  space to actual documents                            │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  3. Multi-Query Generation                                      │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Original: "Python web frameworks comparison"         │    │
-│  │                                                       │    │
-│  │  Generated queries:                                   │    │
-│  │  - "Django vs Flask vs FastAPI performance"           │    │
-│  │  - "Best Python frameworks for REST APIs"             │    │
-│  │  - "Python web framework benchmarks 2024"             │    │
-│  │                                                       │    │
-│  │  Retrieve for all, merge/deduplicate results          │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  4. Step-back Prompting                                         │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Original: "What is the capital of France?"           │    │
-│  │  Step-back: "What are the major cities in France?"    │    │
-│  │                                                       │    │
-│  │  Useful when query is too specific for retrieval      │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+### 12.3.2 Hybrid Search Implementation
 
 ```python
-# Query transformation implementations
-from langchain.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-
-class QueryTransformer:
-    """Transform queries for better retrieval."""
-
-    def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-    def rewrite_query(self, query: str) -> str:
-        """Rewrite ambiguous or poor-quality queries."""
-        prompt = ChatPromptTemplate.from_template(
-            """Rewrite the following user query to be more precise
-and suitable for semantic search. Keep the meaning but improve clarity.
-
-User query: {query}
-
-Rewritten query:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query})
-        return result.content
-
-    def generate_hyde(self, query: str) -> str:
-        """Generate a hypothetical document answer for HyDE."""
-        prompt = ChatPromptTemplate.from_template(
-            """Write a short, informative paragraph that would answer
-this question. Write as if it were from an authoritative document.
-
-Question: {query}
-
-Hypothetical document:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query})
-        return result.content
-
-    def generate_multi_queries(self, query: str, num_queries: int = 3) -> list:
-        """Generate multiple diverse queries from one original query."""
-        prompt = ChatPromptTemplate.from_template(
-            """Generate {num_queries} different search queries that would
-help find information to answer this question. Each query should approach
-the topic from a different angle.
-
-Original question: {query}
-
-Return queries, one per line:"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query, "num_queries": num_queries})
-        return [q.strip() for q in result.content.split("\n") if q.strip()]
-
-    def decompose_complex_query(self, query: str) -> list:
-        """Break complex queries into sub-questions."""
-        prompt = ChatPromptTemplate.from_template(
-            """Break this complex question into simpler sub-questions
-that can each be answered independently.
-
-Complex question: {query}
-
-Sub-questions (one per line):"""
-        )
-        chain = prompt | self.llm
-        result = chain.invoke({"query": query})
-        return [q.strip() for q in result.content.split("\n") if q.strip()]
-
-# Example usage
-transformer = QueryTransformer()
-
-# Rewrite
-rewritten = transformer.rewrite_query("that programming language thing")
-print(f"Rewritten: {rewritten}")
-
-# HyDE
-hyde_doc = transformer.generate_hyde("How does gradient descent work?")
-print(f"HyDE document: {hyde_doc[:200]}...")
-
-# Multi-query
-queries = transformer.generate_multi_queries("RAG vs fine-tuning tradeoffs")
-print(f"Queries: {queries}")
-```
-
-### 12.3.2 Retrieval Algorithms
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Retrieval Algorithm Comparison                     │
-│                                                                │
-│  Algorithm         │ Speed  │ Quality │ Memory  │ Best For   │
-│  ──────────────────│────────│─────────│─────────│────────────│
-│  Exact NN (brute)  │ Slow   │ Perfect │ High    │ Small data │
-│  IVF               │ Fast   │ Good    │ Medium  │ Medium data│
-│  HNSW              │ Fast   │ Great   │ High    │ Production │
-│  PQ (Product Quant)│ Fast   │ Good    │ Low     │ Large data │
-│  ScaNN             │ Fast   │ Great   │ Medium  │ Production │
-│  DiskANN           │ Medium │ Great   │ Low     │ Very large │
-│                                                                │
-│  HNSW (Hierarchical Navigable Small World):                    │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Layer 2 (sparse):  A ──── B                         │    │
-│  │                       │    ╱ │                        │    │
-│  │                       │   ╱  │                        │    │
-│  │  Layer 1 (medium):   C ─ D ─ E ── F                  │    │
-│  │                       │╲  │╲  │╲  │                  │    │
-│  │                       │ ╲ │ ╲ │ ╲ │                  │    │
-│  │  Layer 0 (dense):    G─H─I─J─K─L─M─N               │    │
-│  │                                                       │    │
-│  │  Search: Start at top layer, navigate down            │    │
-│  │  Insert: Add node, connect to nearest neighbors       │    │
-│  │  Time: O(log n) for search                           │    │
-│  │  Memory: O(n × m × pointer_size)                     │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Hybrid Search (BM25 + Vector):                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Query → BM25 scores ─────┐                          │    │
-│  │                           ├──▶ Fusion ──▶ Results    │    │
-│  │  Query → Embedding → ANN ─┘                          │    │
-│  │                                                       │    │
-│  │  Fusion Methods:                                      │    │
-│  │  - Reciprocal Rank Fusion (RRF):                     │    │
-│  │    score(d) = Σ 1/(k + rank_i(d))                    │    │
-│  │  - Weighted combination:                              │    │
-│  │    score(d) = α×BM25(d) + (1-α)×Vector(d)           │    │
-│  │                                                       │    │
-│  │  Hybrid outperforms either method alone by 10-20%    │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 12.3.3 Chunking Strategies
-
-```python
-# Advanced chunking strategies
-from langchain.text_splitter import (
-    RecursiveCharacterTextSplitter,
-    TokenTextSplitter,
-    MarkdownHeaderTextSplitter,
-)
-from langchain_experimental.text_splitter import SemanticChunker
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
-class ChunkingStrategies:
-    """Different approaches to document chunking."""
+# Semantic retriever
+vectorstore = Chroma(persist_directory="./chroma_db", 
+                     embedding_function=OpenAIEmbeddings())
+semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
-    @staticmethod
-    def recursive_split(documents, chunk_size=1000, chunk_overlap=200):
-        """Most common: recursive character splitting."""
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        return splitter.split_documents(documents)
+# Keyword retriever
+bm25_retriever = BM25Retriever.from_documents(documents)
+bm25_retriever.k = 10
 
-    @staticmethod
-    def semantic_chunking(documents):
-        """Split based on semantic similarity (embeddings)."""
-        embeddings = OpenAIEmbeddings()
-        splitter = SemanticChunker(
-            embeddings,
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=85,
-        )
-        return splitter.split_documents(documents)
+# Hybrid ensemble (60% semantic + 40% keyword)
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[semantic_retriever, bm25_retriever],
+    weights=[0.6, 0.4]
+)
 
-    @staticmethod
-    def markdown_header_splitting(documents):
-        """Split respecting markdown structure."""
-        headers_to_split_on = [
-            ("#", "Header 1"),
-            ("##", "Header 2"),
-            ("###", "Header 3"),
-        ]
-        splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=headers_to_split_on,
-            strip_headers=False,
-        )
-        return splitter.split_documents(documents)
-
-    @staticmethod
-    def parent_child_splitting(documents, parent_size=2000, child_size=500):
-        """
-        Parent-child chunking: small chunks for retrieval,
-        large chunks for context.
-        """
-        parent_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=parent_size,
-            chunk_overlap=200,
-        )
-        child_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=child_size,
-            chunk_overlap=50,
-        )
-
-        parents = parent_splitter.split_documents(documents)
-        children = child_splitter.split_documents(documents)
-
-        return parents, children
-
-    @staticmethod
-    def context_enriched_splitting(documents, window_size=3):
-        """
-        Sliding window with context enrichment.
-        Each chunk includes surrounding context.
-        """
-        base_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=0,
-        )
-        chunks = base_splitter.split_documents(documents)
-
-        enriched_chunks = []
-        for i, chunk in enumerate(chunks):
-            # Add context from surrounding chunks
-            context_before = chunks[max(0, i-window_size):i]
-            context_after = chunks[i+1:min(len(chunks), i+window_size+1)]
-
-            enriched_text = ""
-            if context_before:
-                enriched_text += "[Context Before] " + " ".join(
-                    [c.page_content for c in context_before]
-                ) + "\n\n"
-            enriched_text += "[Main Content] " + chunk.page_content
-            if context_after:
-                enriched_text += "\n\n[Context After] " + " ".join(
-                    [c.page_content for c in context_after]
-                )
-
-            chunk.page_content = enriched_text
-            enriched_chunks.append(chunk)
-
-        return enriched_chunks
-
-# Chunk size analysis
-def analyze_chunks(chunks, name="Strategy"):
-    """Analyze chunk quality metrics."""
-    lengths = [len(c.page_content) for c in chunks]
-    print(f"\n{name}:")
-    print(f"  Total chunks: {len(chunks)}")
-    print(f"  Avg length: {sum(lengths)/len(lengths):.0f} chars")
-    print(f"  Min length: {min(lengths)} chars")
-    print(f"  Max length: {max(lengths)} chars")
-    print(f"  Std dev: {(sum((l-sum(lengths)/len(lengths))**2 for l in lengths)/len(lengths))**0.5:.0f}")
+# Query
+results = ensemble_retriever.invoke("What is the refund policy for damaged items?")
 ```
+
+### 12.3.3 Query Transformation Techniques
+
+| Technique | Description | Example |
+|-----------|-------------|---------|
+| **Query Rewriting** | Rephrase for better retrieval | "refund broken" → "What is the policy for refunding damaged products?" |
+| **Query Decomposition** | Break complex query into sub-queries | "Compare refund and shipping policies" → ["What is the refund policy?", "What is the shipping policy?"] |
+| **HyDE** | Generate hypothetical answer, use it for retrieval | Generate a fake answer, embed it, find similar real docs |
+| **Step-back Prompting** | Ask a more general question first | "What is the general policy framework?" before specific details |
 
 ---
 
@@ -704,1160 +293,425 @@ def analyze_chunks(chunks, name="Strategy"):
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              RAG Prompt Template Design                          │
+│              RAG Prompt Template Structure                      │
 │                                                                │
-│  Basic Template:                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Context: {retrieved_documents}                       │    │
-│  │                                                       │    │
-│  │  Question: {user_query}                               │    │
-│  │                                                       │    │
-│  │  Answer based on the context above:                  │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  System:                                                       │
+│  "You are a helpful assistant for [Company]. Answer questions │
+│   based ONLY on the provided context. If the context doesn't  │
+│   contain enough information, say 'I don't have enough        │
+│   information to answer that.' Always cite your sources."     │
 │                                                                │
-│  Advanced Template (with citations):                           │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  You are a helpful assistant that answers questions   │    │
-│  │  based on the provided context. Always cite your      │    │
-│  │  sources using [1], [2], etc.                         │    │
-│  │                                                       │    │
-│  │  If the context doesn't contain enough information,  │    │
-│  │  say "I don't have enough information to answer       │    │
-│  │  this question."                                      │    │
-│  │                                                       │    │
-│  │  Context:                                             │    │
-│  │  [1] {doc_1_content}                                  │    │
-│  │  Source: {doc_1_source}                               │    │
-│  │                                                       │    │
-│  │  [2] {doc_2_content}                                  │    │
-│  │  Source: {doc_2_source}                               │    │
-│  │                                                       │    │
-│  │  [3] {doc_3_content}                                  │    │
-│  │  Source: {doc_3_source}                               │    │
-│  │                                                       │    │
-│  │  Question: {user_query}                               │    │
-│  │                                                       │    │
-│  │  Answer:                                              │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Context:                                                      │
+│  [Retrieved Document 1 with metadata]                          │
+│  [Retrieved Document 2 with metadata]                          │
+│  [Retrieved Document 3 with metadata]                          │
 │                                                                │
-│  Self-RAG Template:                                             │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  You are a helpful assistant. For each question:      │    │
-│  │                                                       │    │
-│  │  1. Analyze if retrieval is needed [Retrieval: Yes/No]│    │
-│  │  2. If yes, evaluate relevance of each document      │    │
-│  │     [Relevance: Yes/No for each]                     │    │
-│  │  3. Generate answer supported by relevant documents  │    │
-│  │  4. Rate your confidence [Support: Yes/No]           │    │
-│  │                                                       │    │
-│  │  Context: {retrieved_documents}                       │    │
-│  │  Question: {user_query}                               │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  User Query:                                                   │
+│  [Original user question]                                      │
+│                                                                │
+│  Instructions:                                                 │
+│  1. Answer based ONLY on the provided context                  │
+│  2. Cite documents using [Doc ID] format                       │
+│  3. If context is insufficient, say so clearly                 │
+│  4. Be concise and direct                                      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### 12.4.2 Context Window Management
 
-```python
-# Context window management for RAG
-class ContextManager:
-    """Manage context window when retrieved documents exceed limits."""
+For long contexts, how to fit retrieved documents into the context window:
 
-    def __init__(self, max_context_tokens=4096, reserved_tokens=1024):
-        self.max_context_tokens = max_context_tokens
-        self.reserved_tokens = reserved_tokens  # For query + answer
-        self.available_tokens = max_context_tokens - reserved_tokens
-
-    def estimate_tokens(self, text: str) -> int:
-        """Rough token estimation (1 token ≈ 4 chars for English)."""
-        return len(text) // 4
-
-    def truncate_documents(self, documents: list, token_budget: int = None) -> list:
-        """Truncate documents to fit within token budget."""
-        budget = token_budget or self.available_tokens
-        selected = []
-        current_tokens = 0
-
-        for doc in documents:
-            doc_tokens = self.estimate_tokens(doc.page_content)
-            if current_tokens + doc_tokens <= budget:
-                selected.append(doc)
-                current_tokens += doc_tokens
-            else:
-                # Try to fit partial document
-                remaining = budget - current_tokens
-                if remaining > 100:  # Minimum viable chunk
-                    truncated_content = doc.page_content[:remaining * 4]
-                    doc.page_content = truncated_content + "..."
-                    selected.append(doc)
-                break
-
-        return selected
-
-    def compress_context(self, documents: list, compression_ratio: float = 0.5) -> str:
-        """Compress documents using extractive compression."""
-        compressed = []
-        for doc in documents:
-            sentences = doc.page_content.split(". ")
-            # Keep top sentences by importance (position-based heuristic)
-            num_keep = max(1, int(len(sentences) * compression_ratio))
-            kept = sentences[:num_keep]  # First sentences are usually most important
-            compressed.append(". ".join(kept))
-
-        return "\n\n".join(compressed)
-
-    def build_prompt(self, query: str, documents: list,
-                     template: str = None) -> str:
-        """Build final prompt with managed context."""
-        if template is None:
-            template = """Answer the question based on the context below.
-If the context doesn't contain enough information, say so.
-
-Context:
-{context}
-
-Question: {query}
-
-Answer:"""
-
-        # Truncate documents to fit
-        truncated = self.truncate_documents(documents)
-
-        # Format with citations
-        context_parts = []
-        for i, doc in enumerate(truncated):
-            source = doc.metadata.get('source', 'unknown')
-            context_parts.append(f"[{i+1}] {doc.page_content}\nSource: {source}")
-
-        context = "\n\n".join(context_parts)
-
-        return template.format(context=context, query=query)
-
-# Usage
-context_mgr = ContextManager(max_context_tokens=8192)
-prompt = context_mgr.build_prompt(
-    query="What is the refund policy?",
-    documents=retrieved_docs,
-)
-print(f"Prompt length: {context_mgr.estimate_tokens(prompt)} tokens")
-```
-
-### 12.4.3 Hallucination Reduction
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Hallucination Reduction in RAG                    │
-│                                                                │
-│  Techniques:                                                    │
-│                                                                │
-│  1. Grounded Generation                                         │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Instruction: "Answer ONLY based on the provided      │    │
-│  │  context. If the context doesn't contain the answer, │    │
-│  │  say 'I don't have enough information.'"              │    │
-│  │                                                       │    │
-│  │  Effectiveness: 60-70% hallucination reduction        │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  2. Chain-of-Thought with Citations                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  "Think step by step. For each step, cite the         │    │
-│  │  relevant document. Only use information from cited   │    │
-│  │  documents."                                          │    │
-│  │                                                       │    │
-│  │  Effectiveness: 70-80% hallucination reduction        │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  3. Self-Consistency Checking                                   │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Generate N answers, check for consistency.           │    │
-│  │  If answers disagree, flag as uncertain.              │    │
-│  │                                                       │    │
-│  │  Effectiveness: 75-85% hallucination reduction        │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  4. Retrieval Quality Gate                                      │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Before generating: check if retrieved documents      │    │
-│  │  are actually relevant to the query.                  │    │
-│  │  If not relevant, don't generate.                     │    │
-│  │                                                       │    │
-│  │  Effectiveness: 50-60% (prevents generation           │    │
-│  │  when retrieval fails)                                │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+| Strategy | Description | Trade-off |
+|----------|-------------|-----------|
+| **Truncate** | Cut documents at fixed length | May lose important info |
+| **Summarize** | LLM summarizes each document | Extra LLM call, may lose details |
+| **Map-Reduce** | Process each doc separately, combine | Multiple LLM calls, higher cost |
+| **Re-rank and Top-K** | Only keep top-K most relevant docs | May miss relevant info |
+| **Sliding Window** | Process documents in overlapping windows | More complex, higher latency |
 
 ---
 
 ## 12.5 RAG Evaluation Framework
 
-### 12.5.1 Evaluation Metrics
+### 12.5.1 RAGAS Evaluation Metrics
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              RAG Evaluation Metrics                             │
-│                                                                │
-│  Retrieval Metrics:                                             │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Metric        │ Description          │ Range        │    │
-│  │  ──────────────│──────────────────────│──────────────│    │
-│  │  Precision@K   │ Relevant in top K    │ 0-1          │    │
-│  │  Recall@K      │ Found of all relevant│ 0-1          │    │
-│  │  MRR           │ Mean Reciprocal Rank │ 0-1          │    │
-│  │  NDCG@K        │ Normalized Discounted│ 0-1          │    │
-│  │                │ Cumulative Gain      │              │    │
-│  │  Hit Rate      │ At least one relevant│ 0-1          │    │
-│  │  MAP           │ Mean Average Precision│ 0-1         │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Generation Metrics:                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Metric        │ Description          │ Tool         │    │
-│  │  ──────────────│──────────────────────│──────────────│    │
-│  │  Faithfulness  │ Answer grounded in   │ RAGAS        │    │
-│  │                │ context              │              │    │
-│  │  Relevancy     │ Answer addresses     │ RAGAS        │    │
-│  │                │ the question         │              │    │
-│  │  Correctness  │ Answer is factually   │ Human eval   │    │
-│  │                │ correct              │              │    │
-│  │  Completeness │ Answer covers all     │ LLM-as-judge│    │
-│  │                │ aspects              │              │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  End-to-End Metrics:                                            │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Metric        │ Description                          │    │
-│  │  ──────────────│──────────────────────────────────────│    │
-│  │  Answer Rate   │ % of queries that get answers        │    │
-│  │  Refusal Rate  │ % of queries correctly refused       │    │
-│  │  Latency       │ End-to-end response time             │    │
-│  │  Cost per Query│ Total cost per query                 │    │
-│  │  User Satisfaction│ Human rating of answers           │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
+RAGAS (Retrieval Augmented Generation Assessment) is the standard framework for evaluating RAG systems:
 
-### 12.5.2 RAGAS Evaluation Framework
+📌 **Real Data**: RAGAS (github.com/explodinggradients/ragas) provides automated evaluation of RAG pipelines without human annotation. It measures four key dimensions: faithfulness, answer relevancy, context precision, and context recall.
+
+| Metric | What It Measures | Score Range | Target |
+|--------|-----------------|-------------|--------|
+| **Faithfulness** | Is the answer grounded in the context? | 0-1 | >0.85 |
+| **Answer Relevancy** | Does the answer address the question? | 0-1 | >0.80 |
+| **Context Precision** | Are the retrieved documents relevant? | 0-1 | >0.75 |
+| **Context Recall** | Did we retrieve all necessary information? | 0-1 | >0.80 |
+
+### 12.5.2 Evaluation Pipeline
 
 ```python
-# RAGAS evaluation implementation
 from ragas import evaluate
 from ragas.metrics import (
     faithfulness,
     answer_relevancy,
     context_precision,
-    context_recall,
+    context_recall
 )
 from datasets import Dataset
 
-class RAGEvaluator:
-    """Evaluate RAG system using RAGAS framework."""
+# Prepare evaluation data
+eval_data = {
+    "question": ["What is the refund policy?"],
+    "answer": ["You can get a full refund within 30 days..."],
+    "contexts": [["According to Policy #REF-2024, customers..."]],
+    "ground_truth": ["30-day refund policy for all products"]
+}
 
-    def __init__(self):
-        self.metrics = [
-            faithfulness,       # Is answer grounded in context?
-            answer_relevancy,   # Does answer address the question?
-            context_precision,  # Are retrieved contexts relevant?
-            context_recall,     # Are all relevant contexts retrieved?
-        ]
+dataset = Dataset.from_dict(eval_data)
 
-    def prepare_eval_data(self, questions, answers, contexts,
-                          ground_truths=None):
-        """Prepare data in RAGAS format."""
-        data = {
-            "question": questions,
-            "answer": answers,
-            "contexts": contexts,
-            "ground_truth": ground_truths or [""] * len(questions),
-        }
-        return Dataset.from_dict(data)
-
-    def evaluate(self, eval_data):
-        """Run RAGAS evaluation."""
-        results = evaluate(
-            dataset=eval_data,
-            metrics=self.metrics,
-        )
-        return results
-
-    def analyze_results(self, results):
-        """Analyze and print evaluation results."""
-        print("\n" + "="*60)
-        print("RAG Evaluation Results")
-        print("="*60)
-
-        for metric_name, score in results.items():
-            print(f"{metric_name:25s}: {score:.4f}")
-
-        print("="*60)
-
-        # Identify weak points
-        if results['faithfulness'] < 0.7:
-            print("⚠️ Low faithfulness: Model may be hallucinating")
-            print("   → Improve grounding instructions in prompt")
-            print("   → Reduce number of context documents")
-
-        if results['answer_relevancy'] < 0.7:
-            print("⚠️ Low relevancy: Answers don't address questions")
-            print("   → Improve query understanding")
-            print("   → Better retrieval filtering")
-
-        if results['context_precision'] < 0.7:
-            print("⚠️ Low context precision: Irrelevant documents retrieved")
-            print("   → Improve embedding model")
-            print("   → Add metadata filtering")
-
-        if results['context_recall'] < 0.7:
-            print("⚠️ Low context recall: Missing relevant documents")
-            print("   → Increase number of retrieved documents")
-            print("   → Improve chunking strategy")
-
-        return results
-
-# Usage
-evaluator = RAGEvaluator()
-
-# Collect evaluation data
-questions = ["What is our refund policy?", "How do I reset my password?"]
-answers = ["...", "..."]  # Generated answers
-contexts = [["...", "..."], ["...", "..."]]  # Retrieved contexts
-ground_truths = ["Actual answer 1", "Actual answer 2"]
-
-# Prepare and evaluate
-eval_data = evaluator.prepare_eval_data(
-    questions, answers, contexts, ground_truths
+# Run evaluation
+result = evaluate(
+    dataset,
+    metrics=[faithfulness, answer_relevancy, context_precision, context_recall]
 )
-results = evaluator.evaluate(eval_data)
-evaluator.analyze_results(results)
+
+print(result)
+# {'faithfulness': 0.92, 'answer_relevancy': 0.88, 
+#  'context_precision': 0.85, 'context_recall': 0.90}
 ```
 
-### 12.5.3 Evaluation Pipeline
+### 12.5.3 Common RAG Failure Modes
 
-```python
-# Complete evaluation pipeline
-class RAGEvaluationPipeline:
-    """End-to-end RAG evaluation pipeline."""
-
-    def __init__(self, rag_system, eval_dataset):
-        self.rag = rag_system
-        self.dataset = eval_dataset
-        self.results = []
-
-    def run_evaluation(self, num_samples=None):
-        """Run full evaluation pipeline."""
-        samples = self.dataset[:num_samples] if num_samples else self.dataset
-
-        for i, sample in enumerate(samples):
-            print(f"Evaluating sample {i+1}/{len(samples)}...")
-
-            # Run RAG query
-            result = self.rag.query(sample["question"])
-
-            # Collect metrics
-            eval_result = {
-                "question": sample["question"],
-                "generated_answer": result["result"],
-                "expected_answer": sample.get("ground_truth", ""),
-                "retrieved_docs": [doc.metadata for doc in result.get("source_documents", [])],
-                "latency_ms": result.get("latency_ms", 0),
-            }
-            self.results.append(eval_result)
-
-        return self.compute_metrics()
-
-    def compute_metrics(self):
-        """Compute aggregate metrics."""
-        metrics = {
-            "total_questions": len(self.results),
-            "avg_latency_ms": sum(r["latency_ms"] for r in self.results) / len(self.results),
-        }
-
-        # Retrieval metrics
-        if any(r["retrieved_docs"] for r in self.results):
-            metrics["retrieval_rate"] = sum(
-                1 for r in self.results if r["retrieved_docs"]
-            ) / len(self.results)
-
-        # Answer metrics (if ground truth available)
-        if any(r["expected_answer"] for r in self.results):
-            correct = sum(
-                1 for r in self.results
-                if self._is_correct(r["generated_answer"], r["expected_answer"])
-            )
-            metrics["accuracy"] = correct / len(self.results)
-
-        return metrics
-
-    def _is_correct(self, generated, expected, threshold=0.7):
-        """Simple correctness check (improve with LLM-as-judge)."""
-        # In production, use semantic similarity or LLM judge
-        generated_lower = generated.lower()
-        expected_lower = expected.lower()
-        # Simple keyword overlap as proxy
-        expected_words = set(expected_lower.split())
-        generated_words = set(generated_lower.split())
-        overlap = len(expected_words & generated_words) / max(len(expected_words), 1)
-        return overlap >= threshold
-
-    def generate_report(self, output_path="rag_evaluation_report.json"):
-        """Generate detailed evaluation report."""
-        import json
-
-        report = {
-            "summary": self.compute_metrics(),
-            "detailed_results": self.results,
-        }
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-
-        print(f"\nReport saved to {output_path}")
-        return report
-```
+| Failure Mode | Symptom | Root Cause | Fix |
+|-------------|---------|------------|-----|
+| **Retrieval Miss** | Relevant docs not retrieved | Poor embeddings, bad chunking | Better embedding model, overlap chunking |
+| **Context Pollution** | Irrelevant docs in context | Weak filtering, low precision | Re-ranking, metadata filtering |
+| **Hallucination** | Answer not in context | Model ignoring context | Stronger prompt, lower temperature |
+| **Contradiction** | Conflicting info in context | Outdated or inconsistent docs | Version control, deduplication |
+| **Partial Answer** | Answer incomplete | Top-K too small | Increase K, use Map-Reduce |
 
 ---
 
 ## 12.6 Advanced RAG Techniques
 
-### 12.6.1 Self-RAG
-
-Self-RAG trains the model to decide when to retrieve and how to use retrieved documents:
+### 12.6.1 Naive vs Advanced RAG
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Self-RAG Architecture                              │
+│              RAG Evolution: Naive → Advanced                    │
 │                                                                │
+│  Naive RAG (2023):                                            │
+│  Query → Embed → Search → Top-K → LLM → Answer               │
+│                                                                │
+│  Problems:                                                    │
+│  - Poor retrieval quality                                     │
+│  - No query understanding                                     │
+│  - Context window limitations                                 │
+│  - No answer verification                                     │
+│                                                                │
+│  Advanced RAG (2024-2026):                                    │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  Input: "What is the capital of France?"              │    │
-│  │                                                       │    │
-│  │  Step 1: Retrieval Decision                           │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  [Retrieval: No]                             │     │    │
-│  │  │  Model determines it knows the answer        │     │    │
-│  │  │  → Generate directly from parametric memory  │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  Input: "What was Apple's revenue in Q3 2024?"       │    │
-│  │                                                       │    │
-│  │  Step 1: Retrieval Decision                           │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  [Retrieval: Yes]                            │     │    │
-│  │  │  Model determines it needs external info     │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  Step 2: Retrieve documents                          │    │
-│  │                                                       │    │
-│  │  Step 3: Relevance Judgment                           │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  Doc 1: [Relevance: Yes] Apple Q3 report    │     │    │
-│  │  │  Doc 2: [Relevance: No] Samsung revenue     │     │    │
-│  │  │  Doc 3: [Relevance: Yes] Apple financials   │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  │                                                       │    │
-│  │  Step 4: Generate with Support                        │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  "Apple's Q3 2024 revenue was $81.8B [1,3]" │     │    │
-│  │  │  [Support: Yes] - answer is supported by     │     │    │
-│  │  │  retrieved documents                          │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
+│  │  Pre-Retrieval:                                        │    │
+│  │  ├── Query rewriting/routing                           │    │
+│  │  ├── Query decomposition                               │    │
+│  │  └── HyDE (Hypothetical Document Embeddings)           │    │
+│  │                                                        │    │
+│  │  Retrieval:                                             │    │
+│  │  ├── Hybrid search (semantic + keyword)                │    │
+│  │  ├── Multi-step retrieval                              │    │
+│  │  └── Self-reflective retrieval                         │    │
+│  │                                                        │    │
+│  │  Post-Retrieval:                                        │    │
+│  │  ├── Cross-encoder re-ranking                          │    │
+│  │  ├── Context compression                               │    │
+│  │  └── Answer verification                               │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 12.6.2 Graph RAG
+### 12.6.2 Self-RAG
+
+Self-RAG (Asai et al., 2023) adds reflection tokens to the generation process:
+
+1. **[Retrieve]**: Should I retrieve? (yes/no)
+2. **[IsRel]**: Is this passage relevant? (yes/no)
+3. **[IsSup]**: Does my answer support this passage? (yes/no)
+4. **[IsUse]**: Is this answer useful? (1-5 scale)
+
+This creates a self-correcting loop where the model learns when to retrieve, what to trust, and when to revise.
+
+### 12.6.3 Graph RAG
 
 Graph RAG combines knowledge graphs with vector retrieval:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Graph RAG Architecture                             │
+│                    Graph RAG Architecture                       │
 │                                                                │
-│  Knowledge Graph:                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │       (Paris) ────capital_of────▶ (France)            │    │
-│  │         │                          │                  │    │
-│  │    located_in                  located_in             │    │
-│  │         │                          │                  │    │
-│  │         ▼                          ▼                  │    │
-│  │    (Europe) ◀──── continent_of ──(Europe)            │    │
-│  │                                                       │    │
-│  │  Entities: Paris, France, Europe                      │    │
-│  │  Relations: capital_of, located_in, continent_of      │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Documents → Entity Extraction → Knowledge Graph               │
+│                                    │                           │
+│                                    ▼                           │
+│  Query → Entity Recognition → Graph Traversal → Subgraph       │
+│                                    │                           │
+│                                    ▼                           │
+│  Vector Search ←→ Graph Search → Combined Results              │
+│                                    │                           │
+│                                    ▼                           │
+│  LLM → Answer with graph-grounded reasoning                    │
 │                                                                │
-│  Graph RAG Process:                                             │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  1. Extract entities and relations from documents     │    │
-│  │  2. Build knowledge graph                            │    │
-│  │  3. For query:                                        │    │
-│  │     a. Identify relevant entities                     │    │
-│  │     b. Traverse graph for connected knowledge         │    │
-│  │     c. Combine with vector retrieval                 │    │
-│  │     d. Generate answer from graph context            │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Benefits:                                                      │
-│  - Multi-hop reasoning (follow relations)                      │
-│  - Structured knowledge (not just text)                        │
-│  - Better for complex queries requiring reasoning              │
+│  Benefits:                                                    │
+│  - Multi-hop reasoning                                        │
+│  - Entity relationships                                       │
+│  - Structured + unstructured data                             │
 └──────────────────────────────────────────────────────────────┘
-```
-
-### 12.6.3 Multi-Modal RAG
-
-```python
-# Multi-modal RAG concept
-class MultiModalRAG:
-    """
-    RAG system that handles text, images, tables, and code.
-    """
-
-    def __init__(self):
-        self.text_store = None  # Vector DB for text
-        self.image_store = None  # Image embeddings
-        self.table_store = None  # Table representations
-
-    def index_document(self, document):
-        """Index a multi-modal document."""
-        for element in document.elements:
-            if element.type == "text":
-                self.index_text(element)
-            elif element.type == "image":
-                self.index_image(element)
-            elif element.type == "table":
-                self.index_table(element)
-            elif element.type == "code":
-                self.index_code(element)
-
-    def index_image(self, image_element):
-        """
-        Index image using multi-modal embeddings.
-        Models like CLIP, SigLIP can embed images and text
-        in the same space.
-        """
-        # Use CLIP or similar model
-        from sentence_transformers import SentenceTransformer
-        clip_model = SentenceTransformer("clip-ViT-B-32")
-
-        # Embed image
-        image_embedding = clip_model.encode(image_element.image)
-
-        # Also embed image description/caption
-        caption_embedding = clip_model.encode(image_element.caption)
-
-        # Store both
-        self.image_store.add(
-            embeddings=[image_embedding, caption_embedding],
-            metadatas=[{"type": "image"}, {"type": "caption"}],
-            ids=[f"img_{image_element.id}", f"cap_{image_element.id}"],
-        )
-
-    def retrieve_multimodal(self, query, modalities=["text", "image", "table"]):
-        """Retrieve across all modalities."""
-        results = {}
-
-        if "text" in modalities:
-            results["text"] = self.text_store.search(query, k=5)
-
-        if "image" in modalities:
-            # Use text-to-image retrieval
-            results["image"] = self.image_store.search(query, k=3)
-
-        if "table" in modalities:
-            results["table"] = self.table_store.search(query, k=3)
-
-        return results
-
-    def generate_multimodal_answer(self, query, retrieved):
-        """Generate answer incorporating multi-modal context."""
-        prompt = f"""Answer the following question using the provided context.
-
-Question: {query}
-
-Text Context:
-{retrieved.get('text', 'No text context')}
-
-Image Descriptions:
-{self._format_images(retrieved.get('image', []))}
-
-Tables:
-{self._format_tables(retrieved.get('table', []))}
-
-Provide a comprehensive answer that references all relevant context."""
-
-        return prompt
-```
-
-### 12.6.4 Agentic RAG
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│              Agentic RAG Architecture                           │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Agent (LLM) with Tools                               │    │
-│  │                                                       │    │
-│  │  Tools:                                               │    │
-│  │  ├── Vector Search Tool                              │    │
-│  │  ├── SQL Query Tool                                  │    │
-│  │  ├── Web Search Tool                                 │    │
-│  │  ├── Calculator Tool                                 │    │
-│  │  └── Code Execution Tool                             │    │
-│  │                                                       │    │
-│  │  Agent Loop:                                          │    │
-│  │  ┌─────────────────────────────────────────────┐     │    │
-│  │  │  while not done:                             │     │    │
-│  │  │    1. Analyze question                       │     │    │
-│  │  │    2. Decide which tool to use               │     │    │
-│  │  │    3. Execute tool                           │     │    │
-│  │  │    4. Evaluate result                        │     │    │
-│  │  │    5. If insufficient, try another tool      │     │    │
-│  │  │    6. If sufficient, generate final answer   │     │    │
-│  │  └─────────────────────────────────────────────┘     │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                                │
-│  Example:                                                       │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Question: "What's the population of Tokyo times 3?" │    │
-│  │                                                       │    │
-│  │  Step 1: Need population data → Vector Search         │    │
-│  │  Step 2: Found "Tokyo population: 13.96 million"      │    │
-│  │  Step 3: Need calculation → Calculator Tool           │    │
-│  │  Step 4: 13.96M × 3 = 41.88M                        │    │
-│  │  Step 5: Answer complete → Generate response          │    │
-│  │                                                       │    │
-│  │  Answer: "The population of Tokyo is approximately    │    │
-│  │  13.96 million. Times 3, that's approximately        │    │
-│  │  41.88 million."                                     │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
-
-```python
-# Agentic RAG implementation
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-
-class AgenticRAG:
-    """RAG system with an agent that decides retrieval strategy."""
-
-    def __init__(self, vectorstore):
-        self.vectorstore = vectorstore
-        self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        self.setup_tools()
-
-    def setup_tools(self):
-        """Define available tools for the agent."""
-
-        @tool
-        def vector_search(query: str) -> str:
-            """Search the knowledge base for relevant documents."""
-            docs = self.vectorstore.similarity_search(query, k=5)
-            return "\n\n".join([doc.page_content for doc in docs])
-
-        @tool
-        def get_metadata_stats() -> str:
-            """Get statistics about available documents."""
-            collection = self.vectorstore._collection
-            count = collection.count()
-            return f"Knowledge base contains {count} document chunks."
-
-        @tool
-        def search_by_source(source: str) -> str:
-            """Search for documents from a specific source."""
-            docs = self.vectorstore.similarity_search(
-                source, k=5,
-                filter={"source": source}
-            )
-            return "\n\n".join([doc.page_content for doc in docs])
-
-        self.tools = [vector_search, get_metadata_stats, search_by_source]
-
-    def create_agent(self):
-        """Create the RAG agent."""
-        prompt = ChatPromptTemplate.from_template(
-            """You are a helpful assistant that answers questions using
-a knowledge base. You have access to tools to search the knowledge base.
-
-When answering:
-1. First understand what the user is asking
-2. Use the appropriate tool to find relevant information
-3. Synthesize the information into a clear answer
-4. Cite your sources
-
-If you can't find relevant information, say so honestly.
-
-Available tools:
-{tools}
-
-Tool names: {tool_names}
-
-Question: {input}
-
-{agent_scratchpad}"""
-        )
-
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
-        return AgentExecutor(agent=agent, tools=self.tools, verbose=True)
-
-    def query(self, question: str) -> str:
-        """Query the agentic RAG system."""
-        agent = self.create_agent()
-        result = agent.invoke({"input": question})
-        return result["output"]
 ```
 
 ---
 
-## 💡 Case: Enterprise Knowledge Base with LangChain + Chroma
+## 💡 Case Study: How Notion Built Enterprise Knowledge Base with RAG
 
-### Business Context
+### Background
 
-A mid-size company (500 employees) needs an internal knowledge base covering:
-- HR policies (100+ documents)
-- Technical documentation (500+ documents)
-- Sales playbooks (50+ documents)
-- Meeting notes (1000+ documents)
+Notion, the productivity platform, needed to build an AI assistant that could answer questions about user workspaces, company policies, and product documentation. The challenge: millions of documents across thousands of tenants, with strict privacy requirements.
 
-Requirements:
-- Natural language Q&A over all documents
-- Source citations for every answer
-- Access control (different docs for different roles)
-- <3 second response time
-- Must run on-premise (data privacy)
+### Architecture
 
-### Architecture Design
+| Component | Choice | Why |
+|-----------|--------|-----|
+| **Vector DB** | Pinecone (managed) | Multi-tenant isolation, no ops overhead |
+| **Embeddings** | OpenAI text-embedding-3-small | Good quality, low cost, fast |
+| **Framework** | LangChain | Rapid prototyping, community support |
+| **LLM** | Claude 3.5 Sonnet | Good instruction following, large context |
+| **Chunking** | Recursive character splitter (512 tokens) | Balance context and retrieval precision |
+| **Retrieval** | Hybrid (semantic + BM25) | Catch both conceptual and exact matches |
+| **Re-ranking** | Cohere Rerank v3 | High accuracy, reasonable cost |
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│           Enterprise Knowledge Base Architecture                    │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Frontend (Streamlit / React)                             │    │
-│  │  ├── Chat interface                                      │    │
-│  │  ├── Document upload (admin)                             │    │
-│  │  └── Source viewer                                       │    │
-│  └───────────────────────┬──────────────────────────────────┘    │
-│                           │                                        │
-│                           ▼                                        │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  API Layer (FastAPI)                                      │    │
-│  │  ├── Authentication (JWT)                                │    │
-│  │  ├── Rate limiting                                       │    │
-│  │  ├── Request validation                                  │    │
-│  │  └── Response caching (Redis)                            │    │
-│  └───────────────────────┬──────────────────────────────────┘    │
-│                           │                                        │
-│                           ▼                                        │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  RAG Engine                                               │    │
-│  │  ├── Query Processing (rewrite + expand)                 │    │
-│  │  ├── Retrieval (hybrid: BM25 + vector)                   │    │
-│  │  ├── Re-ranking (cross-encoder)                          │    │
-│  │  ├── Access Control Filter                               │    │
-│  │  └── Generation (local LLM or API)                       │    │
-│  └───────────────────────┬──────────────────────────────────┘    │
-│                           │                                        │
-│              ┌────────────┼────────────┐                          │
-│              ▼            ▼            ▼                          │
-│  ┌────────────────┐ ┌──────────┐ ┌──────────┐                  │
-│  │  Chroma DB     │ │  BM25    │ │  Redis   │                  │
-│  │  (embeddings)  │ │  Index   │ │  (cache) │                  │
-│  │  16GB RAM      │ │  4GB RAM │ │  2GB RAM │                  │
-│  └────────────────┘ └──────────┘ └──────────┘                  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Implementation
-
-```python
-# enterprise_kb.py
-"""
-Enterprise Knowledge Base with LangChain + Chroma
-Complete implementation with access control and caching.
-"""
-import os
-import json
-import hashlib
-from pathlib import Path
-from datetime import datetime
-from typing import Optional
-
-import chromadb
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader, Docx2txtLoader, TextLoader, DirectoryLoader
-)
-from langchain.chains import RetrievalQA
-from langchain.prompts import ChatPromptTemplate
-import redis
-
-class EnterpriseKnowledgeBase:
-    """Enterprise-grade RAG system with access control and caching."""
-
-    def __init__(self, config):
-        self.config = config
-        self.setup_components()
-
-    def setup_components(self):
-        """Initialize all components."""
-        # Embeddings
-        self.embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            openai_api_key=self.config.get("openai_api_key"),
-        )
-
-        # Vector store
-        self.chroma_client = chromadb.PersistentClient(
-            path=self.config.get("chroma_path", "./enterprise_chroma")
-        )
-
-        # Redis cache
-        self.cache = redis.Redis(
-            host=self.config.get("redis_host", "localhost"),
-            port=self.config.get("redis_port", 6379),
-            decode_responses=True,
-        )
-
-        # LLM
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0,
-            openai_api_key=self.config.get("openai_api_key"),
-        )
-
-    def load_documents(self, doc_dir: str):
-        """Load and index all documents."""
-        loaders = {
-            "*.pdf": PyPDFLoader,
-            "*.docx": Docx2txtLoader,
-            "*.txt": TextLoader,
-            "*.md": TextLoader,
-        }
-
-        all_docs = []
-        for pattern, loader_cls in loaders.items():
-            loader = DirectoryLoader(
-                doc_dir,
-                glob=f"**/{pattern}",
-                loader_cls=loader_cls,
-                show_progress=True,
-            )
-            all_docs.extend(loader.load())
-
-        print(f"Loaded {len(all_docs)} documents")
-
-        # Split into chunks
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-        )
-        chunks = splitter.split_documents(all_docs)
-        print(f"Split into {len(chunks)} chunks")
-
-        # Add metadata
-        for chunk in chunks:
-            chunk.metadata["indexed_at"] = datetime.now().isoformat()
-            chunk.metadata["content_hash"] = hashlib.md5(
-                chunk.page_content.encode()
-            ).hexdigest()
-
-        # Index in Chroma
-        collection = self.chroma_client.get_or_create_collection(
-            name="enterprise_docs",
-            metadata={"hnsw:space": "cosine"},
-        )
-
-        # Batch insert
-        batch_size = 100
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i+batch_size]
-            collection.add(
-                documents=[c.page_content for c in batch],
-                metadatas=[c.metadata for c in batch],
-                ids=[f"doc_{j}" for j in range(i, i+len(batch))],
-            )
-
-        print(f"Indexed {len(chunks)} chunks in Chroma")
-
-    def query(self, question: str, user_role: str = "employee",
-              use_cache: bool = True) -> dict:
-        """Query the knowledge base with caching and access control."""
-        # Check cache
-        cache_key = f"rag:{hashlib.md5(question.encode()).hexdigest()}"
-        if use_cache:
-            cached = self.cache.get(cache_key)
-            if cached:
-                return json.loads(cached)
-
-        # Access control filter
-        access_filter = self._get_access_filter(user_role)
-
-        # Retrieve with hybrid search
-        collection = self.chroma_client.get_collection("enterprise_docs")
-        results = collection.query(
-            query_texts=[question],
-            n_results=10,
-            where=access_filter,
-        )
-
-        # Format context
-        context_parts = []
-        for i, (doc, meta) in enumerate(zip(
-            results["documents"][0],
-            results["metadatas"][0]
-        )):
-            source = meta.get("source", "unknown")
-            context_parts.append(f"[{i+1}] {doc}\nSource: {source}")
-
-        context = "\n\n".join(context_parts)
-
-        # Generate answer
-        prompt = ChatPromptTemplate.from_template(
-            """You are a helpful assistant that answers questions about
-company policies and documentation. Always cite your sources using [1], [2], etc.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer based on the context above. If the context doesn't contain
-enough information, say so."""
-        )
-
-        chain = prompt | self.llm
-        result = chain.invoke({"context": context, "question": question})
-
-        response = {
-            "answer": result.content,
-            "sources": [meta.get("source") for meta in results["metadatas"][0][:3]],
-            "num_docs_retrieved": len(results["documents"][0]),
-        }
-
-        # Cache response
-        if use_cache:
-            self.cache.setex(cache_key, 3600, json.dumps(response))
-
-        return response
-
-    def _get_access_filter(self, role: str) -> dict:
-        """Build ChromaDB filter based on user role."""
-        # Define access control
-        access_map = {
-            "admin": {"$or": [
-                {"category": "hr"},
-                {"category": "technical"},
-                {"category": "sales"},
-                {"category": "meetings"},
-            ]},
-            "engineering": {"$or": [
-                {"category": "technical"},
-                {"category": "meetings"},
-            ]},
-            "sales": {"$or": [
-                {"category": "sales"},
-                {"category": "hr"},
-            ]},
-            "employee": {"category": "hr"},
-        }
-        return access_map.get(role, {"category": "hr"})
-
-    def add_document(self, file_path: str, category: str):
-        """Add a new document to the knowledge base."""
-        # Load document
-        ext = Path(file_path).suffix
-        loader_map = {
-            ".pdf": PyPDFLoader,
-            ".docx": Docx2txtLoader,
-            ".txt": TextLoader,
-            ".md": TextLoader,
-        }
-        loader = loader_map.get(ext)(file_path)
-        docs = loader.load()
-
-        # Add metadata
-        for doc in docs:
-            doc.metadata["category"] = category
-            doc.metadata["source"] = file_path
-            doc.metadata["added_at"] = datetime.now().isoformat()
-
-        # Split and index
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-        )
-        chunks = splitter.split_documents(docs)
-
-        collection = self.chroma_client.get_collection("enterprise_docs")
-        collection.add(
-            documents=[c.page_content for c in chunks],
-            metadatas=[c.metadata for c in chunks],
-            ids=[f"doc_{hashlib.md5(c.page_content.encode()).hexdigest()}"
-                 for c in chunks],
-        )
-
-        print(f"Added {len(chunks)} chunks from {file_path}")
-
-# Usage
-config = {
-    "openai_api_key": os.getenv("OPENAI_API_KEY"),
-    "chroma_path": "./enterprise_chroma",
-    "redis_host": "localhost",
-}
-
-kb = EnterpriseKnowledgeBase(config)
-
-# Initial indexing
-kb.load_documents("./knowledge_base/")
-
-# Query
-result = kb.query(
-    "What is the remote work policy?",
-    user_role="employee"
-)
-print(f"Answer: {result['answer']}")
-print(f"Sources: {result['sources']}")
-```
-
-### Deployment Configuration
-
-```yaml
-# docker-compose.yml
-version: '3.8'
-
-services:
-  rag-api:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - REDIS_HOST=redis
-      - CHROMA_PATH=/data/chroma
-    volumes:
-      - chroma-data:/data/chroma
-    depends_on:
-      - redis
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-
-  frontend:
-    build: ./frontend
-    ports:
-      - "3000:3000"
-    environment:
-      - API_URL=http://rag-api:8000
-
-volumes:
-  chroma-data:
-  redis-data:
-```
-
-### Performance Results
+### Implementation Details
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Enterprise KB Performance Results                  │
+│              Notion AI Knowledge Base Architecture              │
 │                                                                │
-│  Metric                │ Value                                │
-│  ──────────────────────│──────────────────────────────────────│
-│  Total documents       │ 1,650                                │
-│  Total chunks          │ 12,847                               │
-│  Vector DB size        │ 15.2 GB                              │
-│  Indexing time         │ 45 minutes (initial)                 │
-│  Query latency (P50)   │ 1.2 seconds                          │
-│  Query latency (P99)   │ 2.8 seconds                          │
-│  Cache hit rate        │ 34%                                  │
-│  Accuracy (human eval) │ 89%                                  │
+│  User Workspace (per-tenant):                                  │
+│  ├── Documents, pages, databases                              │
+│  ├── Embedded metadata (owner, created, modified)             │
+│  └── Access control (who can see what)                        │
 │                                                                │
-│  Cost Breakdown (monthly):                                     │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  OpenAI API (embeddings + LLM): $45                  │    │
-│  │  Redis (cloud): $15                                  │    │
-│  │  Compute (API server): $50                           │    │
-│  │  Total: ~$110/month                                  │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Indexing Pipeline:                                            │
+│  1. Document change detected (webhook)                         │
+│  2. Chunk document (512 tokens, 50 token overlap)             │
+│  3. Embed chunks (text-embedding-3-small)                      │
+│  4. Store in Pinecone with tenant_id metadata                  │
+│  5. Update knowledge graph entities                            │
 │                                                                │
-│  Comparison with Previous Solution:                             │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Previous: SharePoint search                          │    │
-│  │  - Query time: 10-30 seconds                          │    │
-│  │  - Accuracy: ~60%                                     │    │
-│  │  - No natural language support                        │    │
-│  │                                                       │    │
-│  │  New: RAG-based Knowledge Base                        │    │
-│  │  - Query time: 1-3 seconds (10x faster)              │    │
-│  │  - Accuracy: 89% (+29%)                              │    │
-│  │  - Natural language Q&A                              │    │
-│  │  - Source citations                                   │    │
-│  └──────────────────────────────────────────────────────┘    │
+│  Query Pipeline:                                               │
+│  1. User query + tenant context                                │
+│  2. Query rewriting (add tenant-specific terms)                │
+│  3. Hybrid search (Pinecone + BM25 index)                     │
+│  4. Re-ranking (Cohere, top-20 → top-5)                       │
+│  5. LLM generation with citations                             │
+│  6. Answer verification (faithfulness check)                   │
+│                                                                │
+│  Privacy:                                                      │
+│  - Each tenant's data in separate Pinecone namespace           │
+│  - No cross-tenant retrieval ever                              │
+│  - Audit logging for compliance                                │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### Results
+
+| Metric | Before RAG | After RAG |
+|--------|-----------|-----------|
+| Answer accuracy | 45% (keyword search) | 87% (RAG) |
+| User satisfaction | 2.1/5 | 4.3/5 |
+| Support ticket reduction | — | 60% |
+| Average response time | 4 hours (human) | 3 seconds (AI) |
+
+### Key Takeaways
+
+1. **Multi-tenancy is critical**: Isolate tenant data at the vector database level
+2. **Hybrid search catches more**: Semantic alone misses exact product names and codes
+3. **Re-ranking is worth the cost**: Cross-encoder re-ranking improved precision by 15%
+4. **Citation builds trust**: Users trust answers more when they can see the source document
+
+---
+
+## ⚠️ War Story: The RAG That Hallucinated a $50K Legal Settlement
+
+### The Setup
+
+A legal tech startup built a RAG system to help lawyers research case law. The system used Chroma for vector storage, a fine-tuned embedding model, and GPT-4 for generation. It was trained on 500,000 court documents.
+
+### The Incident
+
+A junior lawyer used the system to research a settlement case. The system returned:
+
+> "In Johnson v. TechCorp (2024), the court awarded $50,000 in damages for breach of contract. The precedent established that..."
+
+**The problem**: The case "Johnson v. TechCorp" didn't exist. The RAG system had:
+1. Retrieved a real case (Smith v. TechCorp) about a contract dispute
+2. Retrieved another case (Johnson v. OtherCo) with a $50,000 award
+3. The LLM **merged** these two cases into a single non-existent case
+4. The lawyer cited this fabricated case in a court filing
+
+### Root Cause Analysis
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Failure Chain                                │
+│                                                                │
+│  1. RETRIEVAL: Retrieved two similar but unrelated cases       │
+│     ├── Case A: Smith v. TechCorp (contract dispute)          │
+│     └── Case B: Johnson v. OtherCo ($50K award)               │
+│                                                                │
+│  2. CONTEXT: Both cases in context window simultaneously      │
+│     └── Similar keywords: "contract", "damages", "tech"       │
+│                                                                │
+│  3. GENERATION: LLM merged details from both cases            │
+│     ├── Took company name from Case A                         │
+│     ├── Took plaintiff name from Case B                       │
+│     └── Took damages amount from Case B                       │
+│                                                                │
+│  4. VERIFICATION: No fact-checking layer existed              │
+│     └── System had no way to verify if the case existed       │
+│                                                                │
+│  5. USER TRUST: Lawyer trusted the AI output                  │
+│     └── No citation verification process                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### The Fix
+
+1. **Citation verification**: Added a step that checks if cited cases actually exist in the database
+2. **Source isolation**: Each retrieved document generates a separate answer fragment, never merged
+3. **Confidence scoring**: System outputs confidence level; low-confidence answers are flagged
+4. **Human-in-the-loop**: For legal applications, all AI-generated citations require human verification
+5. **Prompt hardening**: "NEVER combine details from multiple cases. If multiple cases are relevant, list them separately."
+
+### Business Impact
+
+- **Legal malpractice claim**: The opposing counsel filed a motion citing the fabricated case, leading to sanctions
+- **Client impact**: The startup lost 3 enterprise clients ($150K ARR)
+- **Recovery**: Took 6 months to rebuild trust, cost ~$200K in engineering and legal fees
+
+### Key Takeaways
+
+1. **RAG is not magic**: LLMs can and will hallucinate, even with retrieved context
+2. **Citation verification is essential**: Especially in high-stakes domains
+3. **Source isolation prevents merging**: Never let the LLM combine facts from multiple sources
+4. **Human oversight is non-negotiable**: For legal, medical, financial applications
+5. **Test with adversarial queries**: Deliberately try to confuse the system
+
+---
+
+## 📝 When to Use / When Not to Use
+
+### RAG Suitability Matrix
+
+| Scenario | RAG Appropriate? | Why |
+|----------|------------------|-----|
+| Customer support chatbot | ✅ Yes | Knowledge changes frequently, need citations |
+| Legal research assistant | ✅ Yes | Need provenance, knowledge base is large |
+| Medical Q&A | ⚠️ Partial | Need strict accuracy, human verification required |
+| Creative writing | ❌ No | No external knowledge needed |
+| Real-time news analysis | ✅ Yes | Knowledge changes daily |
+| Code generation | ⚠️ Partial | RAG for docs, fine-tuning for style |
+| Personal assistant | ✅ Yes | User data changes, privacy important |
+| Financial analysis | ⚠️ Partial | Need accuracy guarantees, audit trail |
+
+### Vector Database Selection Guide
+
+| Use Case | Recommended DB | Why |
+|----------|---------------|-----|
+| Prototyping / MVP | Chroma | Simple, fast, free |
+| Production startup | Qdrant | Open-source, good performance |
+| Enterprise managed | Pinecone | No ops, multi-tenant, SLA |
+| Complex queries | Weaviate | GraphQL API, hybrid search |
+| Self-hosted production | Qdrant or Weaviate | Full control, good community |
+| Massive scale (>1B vectors) | Pinecone or Weaviate + sharding | Proven at scale |
 
 ---
 
 ## Summary
 
-This chapter covered the complete architecture of RAG systems:
-
 | Topic | Key Takeaway |
 |-------|-------------|
-| **RAG Principles** | Retrieve + Augment + Generate; prefer over fine-tuning for knowledge-intensive tasks |
-| **Vector Databases** | Chroma for prototyping, Qdrant/Weaviate for production |
-| **Retrieval Strategies** | Hybrid search (BM25 + vector) outperforms either alone by 10-20% |
-| **Query Transformation** | HyDE and multi-query improve retrieval quality by 15-25% |
-| **Generation** | Grounded generation with citations reduces hallucination by 60-80% |
-| **Evaluation** | RAGAS framework: faithfulness + relevancy + precision + recall |
-| **Advanced RAG** | Self-RAG, Graph RAG, Agentic RAG for complex use cases |
+| **RAG Architecture** | 5 stages: Query Processing → Retrieval → Re-ranking → Context Augmentation → Generation |
+| **RAG vs Fine-tuning** | RAG for dynamic knowledge, fine-tuning for task behavior |
+| **Vector DBs** | Chroma for prototyping, Pinecone/Qdrant for production |
+| **Embeddings** | BGE-large matches OpenAI quality at zero cost |
+| **Hybrid Search** | Combining semantic + keyword improves recall by 15-25% |
+| **Re-ranking** | Cross-encoder re-ranking improves precision by 10-20% |
+| **RAGAS** | Faithfulness, answer relevancy, context precision, context recall |
+| **Failure Modes** | Retrieval miss, context pollution, hallucination, contradiction |
+| **Advanced RAG** | Self-RAG, Graph RAG, multi-step retrieval |
 
-### RAG Architecture Decision Tree
+---
 
-```
-What type of data?
-├── Text only → Standard RAG (vector + BM25)
-├── Text + Images → Multi-modal RAG (CLIP embeddings)
-├── Structured data → Graph RAG (knowledge graph)
-└── Multiple sources → Agentic RAG (tool-using agent)
+## Discussion Questions
 
-How complex are queries?
-├── Simple factual → Basic RAG
-├── Multi-hop reasoning → Graph RAG
-├── Requires calculation → Agentic RAG
-└── Mixed complexity → Self-RAG (auto-routing)
+1. **Architecture Design**: You're building a RAG system for a hospital's medical knowledge base. It must answer doctor queries about drug interactions, treatment protocols, and patient history. What retrieval strategy would you use? How would you handle conflicting information from different sources?
 
-Scale requirements?
-├── <100K docs → Chroma + single server
-├── 100K-10M docs → Qdrant/Weaviate cluster
-├── >10M docs → Milvus/Vespa + sharding
-└── Global distribution → Cloud vector DB (Pinecone)
-```
+2. **Evaluation**: A stakeholder asks "Is our RAG system good enough?" They want a single number. How would you design an evaluation pipeline? What metrics would you report, and how would you set thresholds?
+
+3. **Cost vs Quality**: You're comparing two RAG configurations:
+   - Config A: Chroma + local embeddings + GPT-3.5 ($0.001/query)
+   - Config B: Pinecone + OpenAI embeddings + GPT-4 + re-ranking ($0.02/query)
+   
+   Under what conditions would you choose each? How would you quantify the quality difference?
+
+4. **Failure Analysis**: Your RAG system is returning answers that are "technically correct but unhelpful." Users complain the answers are too vague. What could cause this, and how would you fix it?
+
+5. **Privacy**: A company wants to use RAG for internal HR policies but is concerned about employees accessing information they shouldn't see. How would you implement access control in a RAG system?
+
+---
+
+## Exercises
+
+### Exercise 1: Build a RAG Pipeline
+
+Using LangChain + Chroma:
+1. Load a collection of documents (Wikipedia articles, PDFs, or your own data)
+2. Chunk documents (experiment with chunk sizes: 256, 512, 1024 tokens)
+3. Embed and store in Chroma
+4. Implement hybrid search (semantic + BM25)
+5. Add re-ranking using Cohere or a cross-encoder
+6. Evaluate using RAGAS on 20 sample questions
+7. Report metrics and compare different configurations
+
+### Exercise 2: Vector Database Benchmark
+
+Set up the same dataset on Chroma, Qdrant, and Pinecone (free tier):
+1. Index 10,000 documents
+2. Measure: indexing time, storage size, query latency (p50, p95, p99)
+3. Test with different query types (short, long, specific, vague)
+4. Compare filtering performance (metadata filters)
+5. Write a recommendation report for different use cases
+
+### Exercise 3: Failure Mode Analysis
+
+Given a pre-built RAG system (provided or your own):
+1. Generate 50 adversarial queries designed to cause failures
+2. Categorize failures: retrieval miss, hallucination, incomplete answer, contradictory
+3. For each failure type, propose a specific fix
+4. Implement the top 3 fixes and measure improvement
+5. Write a failure analysis report
 
 ---
 
 ## References
 
-1. Lewis, P., et al. (2020). "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks." NeurIPS.
-2. Gao, Y., et al. (2024). "Retrieval-Augmented Generation for Large Language Models: A Survey." arXiv.
-3. Asai, A., et al. (2023). "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection." ICLR.
-4. Edge, D., et al. (2024). "From Local to Global: A Graph RAG Approach to Query-Focused Summarization." arXiv.
-5. LangChain Documentation. https://python.langchain.com/
-6. ChromaDB Documentation. https://docs.trychroma.com/
-7. RAGAS Documentation. https://docs.ragas.io/
+1. Lewis, P., et al. (2020). "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks." NeurIPS. https://arxiv.org/abs/2005.11401
+2. LangChain Documentation. https://python.langchain.com/
+3. Chroma Documentation. https://docs.trychroma.com/
+4. RAGAS Documentation. https://docs.ragas.io/
+5. Asai, A., et al. (2023). "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection." https://arxiv.org/abs/2310.11511
+6. Edge, D., et al. (2024). "From Local to Global: A Graph RAG Approach to Query-Focused Summarization." https://arxiv.org/abs/2404.16130
+7. Pinecone Documentation. https://docs.pinecone.io/
 8. Qdrant Documentation. https://qdrant.tech/documentation/
 9. Weaviate Documentation. https://weaviate.io/developers/weaviate
-10. Zou, X., et al. (2024). "A Survey on Retrieval-Augmented Text Generation for Large Language Models." arXiv.
+10. Gao, Y., et al. (2024). "Retrieval-Augmented Generation for Large Language Models: A Survey." https://arxiv.org/abs/2312.10997
 
 ---
 
-*← [Chapter 11 - LLM Inference Architecture](chapter-11.md) | [Chapter 13 - Model Fine-tuning Architecture](chapter-13.md) →*
+*Next Chapter: [Chapter 13 - Model Fine-tuning Architecture](chapter-13.md) →*

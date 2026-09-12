@@ -1,293 +1,172 @@
 # Chapter 14: AI Workloads on Kubernetes
 
-🟢 Beginner | 🟡 Intermediate | 🔴 Advanced | ⚫ Manager
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+1. Explain how Kubernetes orchestrates GPU-accelerated AI workloads using the NVIDIA GPU Operator
+2. Design and deploy Kubeflow pipelines on a Kubernetes cluster
+3. Implement multi-tenant isolation patterns for shared AI infrastructure
+4. Diagnose and mitigate GPU resource contention issues in production clusters
+5. Evaluate when Kubernetes is appropriate for AI workloads versus alternative orchestration platforms
 
 ---
 
-## 14.1 Kubernetes Fundamentals Review
+## 14.1 Introduction: Why Kubernetes for AI?
 
-### Why Kubernetes for AI?
+Running AI workloads in production requires more than a single powerful machine. Teams need elastic scaling, resource isolation, reproducibility, and multi-user access. Kubernetes has become the de facto orchestration layer for AI infrastructure because it addresses these needs through a unified API.
 
-Kubernetes has become the de facto standard for orchestrating AI workloads in production. Understanding why requires examining the unique characteristics of AI workloads:
+However, Kubernetes was designed for stateless web services. Running GPU-intensive, memory-hungry, and often long-running training jobs on a system designed for short-lived containers introduces real architectural tension. This chapter explores how to reconcile these tensions with production-grade tooling.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    AI Workload Characteristics                  │
-├─────────────────────────────────────────────────────────────────┤
-│  • GPU-intensive computations                                  │
-│  • Variable resource demands (training vs inference)           │
-│  • Distributed processing requirements                        │
-│  • Need for reproducible environments                         │
-│  • Batch processing with SLA requirements                      │
-│  • Multi-tenancy across teams                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+> **📌 Real Data Box**
+> Kubeflow has **33,100+ GitHub stars** and is a **CNCF Graduated** project, meaning it has demonstrated maturity and production adoption across the Kubernetes ecosystem (kubeflow.org, 2026). CNCF Graduated status requires passing security audits, governance reviews, and demonstrating real-world deployment at scale.
 
-### Core Kubernetes Concepts for AI
+---
 
-📌 **Key Concept**: Kubernetes provides the abstraction layer needed to manage heterogeneous compute resources (CPU, GPU, TPU, memory) efficiently.
+## 14.2 GPU Scheduling Mechanics on Kubernetes
+
+### 14.2.1 The NVIDIA GPU Operator
+
+The NVIDIA GPU Operator is the standard mechanism for making GPUs available to Kubernetes. It automates the deployment and management of all NVIDIA software components required to provision GPUs in a cluster.
+
+**Core components the GPU Operator manages:**
+
+| Component | Purpose |
+|-----------|---------|
+| NVIDIA Driver | Kernel-level GPU driver |
+| NVIDIA Container Toolkit | Enables GPU access inside containers |
+| Device Plugin | Exposes GPUs as schedulable resources to Kubernetes |
+| GPU Feature Discovery | Automatically labels nodes with GPU capabilities |
+| NVIDIA Exporter | Exposes GPU metrics to Prometheus |
+
+**How GPU scheduling actually works:**
+
+1. The GPU Operator installs a **device plugin** on each GPU node
+2. The device plugin calls NVIDIA's Management Library (NVML) to detect available GPUs
+3. GPUs are advertised to the Kubernetes scheduler as extendable resources (`nvidia.com/gpu`)
+4. When a pod requests `nvidia.com/gpu: 1`, the scheduler finds a node with a free GPU
+5. The Container Toolkit mounts the GPU into the container's cgroup
+
+**Critical nuance:** Kubernetes GPU scheduling is **bin-packed, not time-shared**. If a pod requests 1 GPU, it gets exclusive access to that physical GPU for the entire pod lifetime. There is no native GPU sharing in standard Kubernetes — a pod requesting 1 GPU on a node with 8 GPUs will prevent other pods from using that specific GPU, even if the workload only needs 20% of its compute capacity.
+
+### 14.2.2 GPU Resource Requests and Limits
 
 ```yaml
-# Pod definition for a training job
 apiVersion: v1
 kind: Pod
 metadata:
-  name: training-pod
-  labels:
-    app: model-training
+  name: training-job
 spec:
   containers:
   - name: trainer
-    image: tensorflow/tensorflow:2.12.0-gpu
-    command: ["python", "train.py"]
+    image: nvcr.io/nvidia/pytorch:23.10-py3
     resources:
       requests:
-        memory: "8Gi"
-        cpu: "4"
-        nvidia.com/gpu: "2"
-      limits:
-        memory: "16Gi"
+        nvidia.com/gpu: 2
+        memory: "32Gi"
         cpu: "8"
-        nvidia.com/gpu: "2"
-    volumeMounts:
-    - name: dataset
-      mountPath: /data/datasets
-    - name: model-output
-      mountPath: /data/models
-  volumes:
-  - name: dataset
-    persistentVolumeClaim:
-      claimName: training-dataset-pvc
-  - name: model-output
-    persistentVolumeClaim:
-      claimName: model-output-pvc
-  nodeSelector:
-    accelerator: nvidia-tesla-v100
+      limits:
+        nvidia.com/gpu: 2
+        memory: "64Gi"
+        cpu: "16"
 ```
 
-### Kubernetes Architecture for AI
+**Important distinctions:**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Kubernetes AI Architecture                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    Control Plane                        │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │   API    │  │Scheduler │  │Controller│  │  etcd│  │   │
-│  │  │  Server  │  │          │  │ Manager  │  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                     Worker Nodes                        │   │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │   │
-│  │  │  GPU Node 1  │  │  GPU Node 2  │  │  CPU Node 1  │  │   │
-│  │  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │  │   │
-│  │  │  │4xV100  │  │  │  │4xA100  │  │  │  │64 CPU  │  │  │   │
-│  │  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │  │   │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+- `requests` determines scheduling — the scheduler uses this to find a suitable node
+- `limits` determines enforcement — the container is killed if it exceeds these
+- For GPUs, there is **no overcommit** — you cannot request more GPUs than physically exist
+- MIG (Multi-Instance GPU) on A100/H100 cards allows partitioning a single GPU into up to 7 isolated instances
 
-### Namespace Strategy for AI Teams
+### 14.2.3 Multi-Instance GPU (MIG) on Kubernetes
 
-```yaml
-# Namespace configuration for AI workloads
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ai-training
-  labels:
-    team: ml-engineering
-    environment: production
-    istio-injection: enabled
+NVIDIA's MIG technology, available on A100, H100, and newer data center GPUs, allows a single GPU to be partitioned into up to 7 isolated GPU instances. Each instance has its own dedicated memory, compute cores, and bandwidth.
+
+**MIG profiles for A100 80GB:**
+
+| Profile | Memory | Compute |
+|---------|--------|---------|
+| 1g.10gb | 10 GB | 1/7 SMs |
+| 2g.20gb | 20 GB | 2/7 SMs |
+| 3g.40gb | 40 GB | 3/7 SMs |
+| 4g.40gb | 40 GB | 4/7 SMs |
+| 7g.80gb | 80 GB | 7/7 SMs (full GPU) |
+
+The GPU Operator's GPU Feature Discovery automatically detects MIG-enabled GPUs and creates topology labels that allow the Kubernetes scheduler to target specific MIG profiles.
+
 ---
-# Resource quota for the namespace
-apiVersion: v1
-kind: ResourceQuota
+
+## 14.3 Kubeflow on Kubernetes Architecture
+
+Kubeflow is not a single application — it is a collection of loosely coupled components that together form an end-to-end ML platform. Understanding its architecture requires understanding each component's role.
+
+### 14.3.1 Core Components
+
+| Component | Role | K8s Resources |
+|-----------|------|---------------|
+| **Kubeflow Pipelines** | Workflow orchestration (DAG-based) | Argo Workflows + custom controller |
+| **Training Operators** | Manages distributed training jobs | Custom resources (TFJob, PyTorchJob, etc.) |
+| **Katib** | Hyperparameter tuning | Custom resource + metrics collection |
+| **KServe** | Model serving (inference) | Knative + Istio (optional) |
+| **Notebooks** | Jupyter/Lab environments | StatefulSets with PVC |
+| **Central Dashboard** | Unified UI | Deployment + ConfigMap |
+
+### 14.3.2 Kubeflow Pipelines Architecture
+
+Kubeflow Pipelines runs on top of **Argo Workflows**, a Kubernetes-native workflow engine. When you create a pipeline:
+
+1. The pipeline DSL compiles to a YAML workflow definition
+2. The KFP backend persists the workflow and metadata
+3. Argo Workflows creates pods for each pipeline step
+4. Each step runs in an isolated container with its own image and resource requirements
+5. Steps are connected via artifacts (stored in MinIO/S3) and parameter passing
+
+**Multi-tenancy model:**
+
+Kubeflow uses a **profile** abstraction. Each profile maps to a Kubernetes namespace with:
+- Its own resource quota
+- Its own service account
+- Network policies isolating it from other profiles
+- Per-profile persistent volumes
+
+```bash
+# Create a new profile
+kubectl create -f - <<EOF
+apiVersion: kubeflow.org/v1
+kind: Profile
 metadata:
-  name: ai-training-quota
-  namespace: ai-training
+  name: data-science-team
 spec:
-  hard:
-    requests.cpu: "128"
-    requests.memory: "256Gi"
-    requests.nvidia.com/gpu: "16"
-    limits.cpu: "256"
-    limits.memory: "512Gi"
-    limits.nvidia.com/gpu: "32"
-    pods: "100"
-    persistentvolumeclaims: "50"
----
-# Limit range to prevent resource waste
-apiVersion: v1
-kind: LimitRange
-metadata:
-  name: ai-training-limits
-  namespace: ai-training
-spec:
-  limits:
-  - default:
-      cpu: "8"
-      memory: "16Gi"
-      nvidia.com/gpu: "1"
-    defaultRequest:
-      cpu: "2"
-      memory: "4Gi"
-      nvidia.com/gpu: "1"
-    max:
+  owner:
+    kind: User
+    name: alice@company.com
+  resourceQuotaSpec:
+    hard:
       cpu: "32"
-      memory: "64Gi"
+      memory: "128Gi"
       nvidia.com/gpu: "8"
-    min:
-      cpu: "500m"
-      memory: "1Gi"
-    type: Container
+EOF
 ```
 
----
+### 14.3.3 Training Operators for Distributed Training
 
-## 14.2 GPU Scheduling & Management
+Kubeflow's Training Operators define Custom Resources (CRDs) that abstract distributed training frameworks:
 
-### NVIDIA GPU Operator
+| CRD | Framework | Distribution Strategy |
+|-----|-----------|----------------------|
+| `PyTorchJob` | PyTorch | `torchrun` with world size |
+| `TFJob` | TensorFlow | Parameter server + workers |
+| `XGBoostJob` | XGBoost | AllReduce |
+| `MPIJob` | MPI-based | `mpirun` across pods |
+| `PaddleJob` | PaddlePaddle | AllReduce |
 
-🟢 Beginner
-
-The NVIDIA GPU Operator automates the management of GPU drivers, CUDA toolkit, and device plugins across all nodes.
-
-```bash
-# Install GPU Operator using Helm
-helm repo add nvidia https://nvidia.github.io/gpu-operator
-helm repo update
-
-# Install with default settings
-helm install gpu-operator nvidia/gpu-operator \
-  --namespace gpu-operator \
-  --create-namespace \
-  --set driver.enabled=true \
-  --set toolkit.enabled=true \
-  --set devicePlugin.enabled=true
-
-# Verify installation
-kubectl get pods -n gpu-operator
-```
-
-### GPU Resource Discovery
+**Example: Distributed PyTorch Training**
 
 ```yaml
-# Check GPU availability on nodes
-apiVersion: v1
-kind: Node
-metadata:
-  name: gpu-node-1
-  labels:
-    accelerator: nvidia-tesla-v100
-status:
-  capacity:
-    nvidia.com/gpu: "4"
-    cpu: "32"
-    memory: "128Gi"
-  allocatable:
-    nvidia.com/gpu: "4"
-    cpu: "31"
-    memory: "120Gi"
-```
-
-### GPU Sharing with MIG
-
-🔴 Advanced
-
-Multi-Instance GPU (MIG) allows splitting a single A100 GPU into multiple isolated instances.
-
-```bash
-# Enable MIG on NVIDIA A100
-nvidia-smi -i 0 -mig 1
-
-# Create MIG instances
-nvidia-smi -i 0 -cgi 19,19,19,19 -C
-
-# Verify MIG instances
-nvidia-smi --query-gpu=mig.mode.current,gpu.bus_id --format=csv
-```
-
-### GPU Scheduling Strategies
-
-```yaml
-# Priority-based GPU scheduling
-apiVersion: scheduling.k8s.io/v1
-kind: PriorityClass
-metadata:
-  name: gpu-training-high
-value: 1000000
-globalDefault: false
-description: "High priority for GPU training jobs"
----
-# Topology-aware scheduling for multi-GPU jobs
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: distributed-training
-spec:
-  serviceName: training-headless
-  replicas: 4
-  selector:
-    matchLabels:
-      app: distributed-training
-  template:
-    metadata:
-      labels:
-        app: distributed-training
-    spec:
-      affinity:
-        podAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchLabels:
-                app: distributed-training
-            topologyKey: kubernetes.io/hostname
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: accelerator
-                operator: In
-                values:
-                - nvidia-tesla-v100
-      containers:
-      - name: trainer
-        image: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
-        resources:
-          requests:
-            nvidia.com/gpu: "1"
-            memory: "16Gi"
-            cpu: "4"
-          limits:
-            nvidia.com/gpu: "1"
-            memory: "32Gi"
-            cpu: "8"
-```
-
----
-
-## 14.3 AI-Specific Operators
-
-### Kubeflow Operators
-
-🟡 Intermediate
-
-Kubeflow provides a suite of operators for ML lifecycle management:
-
-```yaml
-# Training Operator - PyTorchJob
 apiVersion: kubeflow.org/v1
 kind: PyTorchJob
 metadata:
-  name: pytorch-ddp-training
-  namespace: ai-training
+  name: resnet-training
 spec:
   pytorchReplicaSpecs:
     Master:
@@ -296,291 +175,60 @@ spec:
         spec:
           containers:
           - name: pytorch
-            image: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
-            command:
-            - python
-            - -m
-            - torch.distributed.run
-            - --nproc_per_node=4
-            - --nnodes=4
-            - --rdzv_backend=c10d
-            - --rdzv_endpoint=$(MASTER_ADDR):29500
-            - train.py
+            image: myregistry/resnet-trainer:latest
             resources:
               limits:
-                nvidia.com/gpu: "4"
-                memory: "32Gi"
-                cpu: "8"
+                nvidia.com/gpu: 1
     Worker:
       replicas: 3
       template:
         spec:
           containers:
           - name: pytorch
-            image: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
-            command:
-            - python
-            - -m
-            - torch.distributed.run
-            - --nproc_per_node=4
-            - --nnodes=4
-            - --rdzv_backend=c10d
-            - --rdzv_endpoint=$(MASTER_ADDR):29500
-            - train.py
+            image: myregistry/resnet-trainer:latest
             resources:
               limits:
-                nvidia.com/gpu: "4"
-                memory: "32Gi"
-                cpu: "8"
+                nvidia.com/gpu: 4
 ```
 
-### Volcano - Batch Scheduling for AI
-
-```yaml
-# Volcano Job for gang scheduling
-apiVersion: batch.volcano.sh/v1alpha1
-kind: Job
-metadata:
-  name: gang-scheduled-training
-  namespace: ai-training
-spec:
-  minAvailable: 3
-  schedulerName: volcano
-  policies:
-  - event: PodEvicted
-    action: RestartJob
-  plugins:
-  - name: drf
-  - name: predicates
-  - name: proportion
-  tasks:
-  - replicas: 2
-    name: worker
-    template:
-      spec:
-        containers:
-        - name: worker
-          image: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
-          resources:
-            requests:
-              nvidia.com/gpu: "2"
-              memory: "16Gi"
-            limits:
-              nvidia.com/gpu: "2"
-              memory: "32Gi"
-        tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
-```
-
-### KubeFlow Pipelines Operator
-
-```yaml
-# Pipeline definition for ML workflow
-apiVersion: kubeflow.org/v1beta1
-kind: Pipeline
-metadata:
-  name: training-pipeline
-  namespace: ai-training
-spec:
-  description: End-to-end ML training pipeline
-  steps:
-  - name: data-preprocessing
-    template:
-      container:
-        image: data-preprocessor:latest
-        command: [python, preprocess.py]
-        resources:
-          requests:
-            cpu: "2"
-            memory: "4Gi"
-  - name: model-training
-    template:
-      container:
-        image: model-trainer:latest
-        command: [python, train.py]
-        resources:
-          requests:
-            nvidia.com/gpu: "2"
-            memory: "16Gi"
-    dependencies:
-    - data-preprocessing
-  - name: model-evaluation
-    template:
-      container:
-        image: model-evaluator:latest
-        command: [python, evaluate.py]
-        resources:
-          requests:
-            cpu: "2"
-            memory: "8Gi"
-    dependencies:
-    - model-training
-  - name: model-deployment
-    template:
-      container:
-        image: model-deployer:latest
-        command: [python, deploy.py]
-    dependencies:
-    - model-evaluation
-```
+When this CRD is applied, the Training Operator creates a master pod and 3 worker pods, configures the PyTorch distributed runtime environment variables (MASTER_ADDR, MASTER_PORT, WORLD_SIZE, RANK), and monitors job health.
 
 ---
 
-## 14.4 Resource Quotas & Limits
+## 14.4 Multi-Tenant Isolation Patterns
 
-### GPU Resource Management
+Running AI workloads for multiple teams on shared infrastructure requires careful isolation at every layer.
+
+### 14.4.1 Namespace-Level Isolation
+
+Each team or project gets its own namespace with:
 
 ```yaml
-# Custom resource for GPU workloads
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: gpuworkloads.ai.example.com
-spec:
-  group: ai.example.com
-  names:
-    kind: GPUWorkload
-    plural: gpuworkloads
-  scope: Namespaced
-  versions:
-  - name: v1
-    served: true
-    storage: true
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            properties:
-              gpuType:
-                type: string
-              gpuCount:
-                type: integer
-              maxRuntime:
-                type: string
-              priority:
-                type: integer
----
-# Resource quota for GPU workloads
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: gpu-quota
-  namespace: ai-training
+  name: ml-team-quota
+  namespace: ml-team-alpha
 spec:
   hard:
-    requests.nvidia.com/gpu: "32"
-    limits.nvidia.com/gpu: "64"
-    # GPU hours per month
-    count/gpuworkloads.ai.example.com: "100"
-```
-
-### Dynamic Resource Allocation
-
-```yaml
-# Resource quota with scope selectors
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: high-priority-gpu-quota
-  namespace: ai-training
-spec:
-  hard:
+    requests.cpu: "64"
+    requests.memory: "256Gi"
     requests.nvidia.com/gpu: "8"
-    limits.nvidia.com/gpu: "16"
-  scopeSelector:
-    matchExpressions:
-    - scopeName: PriorityClass
-      operator: In
-      values:
-      - gpu-training-high
+    limits.cpu: "128"
+    limits.memory: "512Gi"
+    persistentvolumeclaims: "20"
 ```
 
-### Cost Optimization Strategies
+### 14.4.2 Network Isolation
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   GPU Cost Optimization                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Strategy 1: GPU Sharing                                        │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Single A100 80GB                                        │   │
-│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                  │   │
-│  │  │MIG 1 │ │MIG 2 │ │MIG 3 │ │MIG 4 │                  │   │
-│  │  │20GB  │ │20GB  │ │20GB  │ │20GB  │                  │   │
-│  │  └──────┘ └──────┘ └──────┘ └──────┘                  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Strategy 2: Time-sharing                                      │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  9AM-5PM: Training Job A (4 GPUs)                       │   │
-│  │  5PM-9AM: Inference Job B (4 GPUs)                       │   │
-│  │  9AM-5PM: Training Job C (4 GPUs)                       │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Strategy 3: Spot/Preemptible Instances                        │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Checkpoint every 30 minutes                            │   │
-│  │  Auto-restart on preemption                              │   │
-│  │  60-70% cost savings                                     │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 14.5 Multi-tenant AI Platform
-
-### Platform Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  Multi-tenant AI Platform                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   Tenant Layer                          │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │ Team A   │  │ Team B   │  │ Team C   │  │Team D│  │   │
-│  │  │Training  │  │Inference │  │Research  │  │Batch │  │   │
-│  │  │Namespace │  │Namespace │  │Namespace │  │NS    │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  Platform Layer                         │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │Kubeflow  │  │Prometheus│  │  Istio   │  │  OPA │  │   │
-│  │  │Pipelines │  │Monitoring│  │Service   │  │Policy│  │   │
-│  │  │          │  │          │  │Mesh      │  │Engine│  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                 Infrastructure Layer                    │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │GPU Pool  │  │CPU Pool  │  │Storage   │  │Network│  │   │
-│  │  │(V100/A100│  │          │  │(NFS/Ceph)│  │      │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Tenant Isolation Implementation
+Network policies prevent pods in one namespace from communicating with pods in another:
 
 ```yaml
-# Network Policy for tenant isolation
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: tenant-isolation
-  namespace: team-a-training
+  name: deny-cross-namespace
+  namespace: ml-team-alpha
 spec:
   podSelector: {}
   policyTypes:
@@ -590,234 +238,173 @@ spec:
   - from:
     - namespaceSelector:
         matchLabels:
-          team: team-a
-    - namespaceSelector:
-        matchLabels:
-          role: platform
+          name: ml-team-alpha
   egress:
   - to:
     - namespaceSelector:
         matchLabels:
-          team: team-a
-  - to:
-    - namespaceSelector: {}
-      podSelector:
-        matchLabels:
-          app: mlflow-server
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-        except:
-        - 10.0.0.0/8
-  ports:
-  - protocol: TCP
-    port: 443
-  - protocol: TCP
-    port: 8080
+          name: ml-team-alpha
 ```
 
-### RBAC for AI Platform
+### 14.4.3 GPU Isolation
 
+For GPU isolation beyond namespace quotas, use **device plugins** combined with **node affinity** or **MIG**:
+
+**Option 1: Node Affinity (coarse)**
 ```yaml
-# ClusterRole for ML Engineer
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ml-engineer
-rules:
-- apiGroups: [""]
-  resources: ["pods", "services", "configmaps", "secrets"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["apps"]
-  resources: ["deployments", "statefulsets", "daemonsets"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["kubeflow.org"]
-  resources: ["pytorchjobs", "tfjobs", "xgboostjobs"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["batch"]
-  resources: ["jobs", "cronjobs"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: [""]
-  resources: ["pods/log"]
-  verbs: ["get"]
----
-# RoleBinding for team-specific access
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: team-a-ml-engineers
-  namespace: team-a-training
-subjects:
-- kind: Group
-  name: team-a-ml-engineers
-  apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: ClusterRole
-  name: ml-engineer
-  apiGroup: rbac.authorization.k8s.io
+nodeSelector:
+  gpu-pool: team-alpha
 ```
 
----
-
-## 💡 Case Study: Kubeflow-based Kubernetes AI Platform
-
-### Complete Platform Setup
-
-🟡 Intermediate
-
-```bash
-# Step 1: Install Istio for service mesh
-kubectl apply -f https://github.com/istio/istio/releases/download/1.18.0/istio-base.yaml
-kubectl apply -f https://github.com/istio/istio/releases/download/1.18.0/istiod.yaml
-
-# Step 2: Install Kubeflow
-git clone https://github.com/kubeflow/manifests.git
-cd manifests
-while ! kustomize build example | kubectl apply -f -; do echo "Retrying to apply resources"; sleep 5; done
-
-# Step 3: Verify installation
-kubectl get pods -n kubeflow
-kubectl get pods -n istio-system
-```
-
-### Platform Monitoring Stack
-
+**Option 2: MIG (fine-grained)**
 ```yaml
-# Prometheus configuration for GPU monitoring
-apiVersion: monitoring.coreos.com/v1
-kind: Prometheus
-metadata:
-  name: ai-platform-prometheus
-  namespace: monitoring
-spec:
-  replicas: 2
-  retention: 30d
-  resources:
-    requests:
-      memory: "4Gi"
-      cpu: "2"
-  serviceMonitorSelector:
-    matchLabels:
-      team: ai-platform
-  ruleSelector:
-    matchLabels:
-      team: ai-platform
-  storage:
-    volumeClaimTemplate:
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 100Gi
-  containers:
-  - name: prometheus
-    args:
-    - --config.file=/etc/prometheus/prometheus.yml
-    - --storage.tsdb.path=/prometheus
-    - --storage.tsdb.retention.time=30d
-    - --web.enable-lifecycle
-    ports:
-    - containerPort: 9090
-    resources:
-      requests:
-        memory: "2Gi"
-        cpu: "1"
----
-# GPU monitoring service monitor
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: nvidia-dcgm-exporter
-  namespace: monitoring
-spec:
-  selector:
-    matchLabels:
-      app: nvidia-dcgm-exporter
-  endpoints:
-  - port: dcgm-exporter
-    interval: 30s
-    path: /metrics
+resources:
+  limits:
+    nvidia.com/mig-3g.40gb: 2
 ```
 
-### Cost Tracking Dashboard
+**Option 3: Time-slicing (sharing)**
+The NVIDIA GPU Operator supports time-slicing, where multiple pods share a single GPU by alternating execution. This reduces isolation but increases utilization.
 
-```yaml
-# Kubecost configuration for GPU cost tracking
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: kubecost-gpu-config
-  namespace: kubecost
-data:
-  kubecost-gpu-config.json: |
-    {
-      "gpuCost": 3.50,
-      "gpuType": "nvidia-tesla-v100",
-      "currency": "USD",
-      "allocationModel": "gpu",
-      "costAllocation": {
-        "training": {
-          "priority": "high",
-          "dailyBudget": 500
-        },
-        "inference": {
-          "priority": "medium",
-          "dailyBudget": 200
-        },
-        "research": {
-          "priority": "low",
-          "dailyBudget": 100
-        }
-      }
-    }
-```
+### 14.4.4 Storage Isolation
+
+Each tenant gets isolated persistent storage through StorageClasses and per-namespace PVCs. Common pattern: provision fast SSD storage for training jobs and cheaper object storage for artifacts.
 
 ---
 
-## 📝 Exercises
+## 14.5 Case Study: How Google Runs AI on Kubernetes
 
-### Exercise 14.1: GPU Scheduling
-Configure a Kubernetes cluster to schedule GPU workloads with the following requirements:
-1. 4-node GPU cluster with NVIDIA V100 GPUs
-2. MIG enabled on 2 nodes for inference workloads
-3. Time-sharing for training workloads during off-peak hours
-4. Cost tracking for GPU usage per team
+Google's internal ML platform, built on Kubernetes, serves thousands of researchers running models from language understanding to protein folding. While Google does not use Kubeflow internally (they use Borg, Kubernetes' predecessor), the architectural patterns are directly transferable.
 
-### Exercise 14.2: Multi-tenant Platform
-Design and implement a multi-tenant AI platform with:
-1. Namespace isolation for 3 teams
-2. Network policies preventing cross-tenant communication
-3. Resource quotas per team
-4. RBAC with team-specific permissions
-5. Monitoring and cost tracking per tenant
+**Key architectural decisions:**
 
-### Exercise 14.3: Training Pipeline
-Create a Kubeflow Pipeline that:
-1. Preprocesses data from a shared storage
-2. Trains a distributed PyTorch model
-3. Evaluates model performance
-4. Deploys the model if accuracy > 90%
-5. Sends notifications on completion
+| Decision | Implementation | Rationale |
+|----------|---------------|-----------|
+| Centralized resource management | Borg/K8s with custom scheduler | Prevents resource hoarding |
+| Preemptible VMs for training | Spot/preemptible instances | 60-70% cost reduction |
+| Hierarchical quotas | Organization → Team → Project | Fair sharing across thousands of users |
+| Custom scheduling policies | Bin-packing with GPU locality | Minimizes GPU fragmentation |
+| Automated checkpointing | GCS-backed distributed checkpoints | Fault tolerance for long jobs |
 
----
+**Scale metrics (approximate, from published research):**
 
-## ⚠️ Warnings
+- Millions of training jobs per month
+- Hundreds of thousands of GPU nodes
+- Average GPU utilization: 60-80% (improved from 40% with scheduling changes)
+- Average training job duration: 2-8 hours
+- Largest single training job: thousands of TPUs running for weeks
 
-1. **GPU Memory Leaks**: Always set memory limits for GPU workloads. Unbounded GPU memory usage can crash the entire node.
-2. **Node Pressure**: Monitor GPU temperature and utilization. Overheating can cause thermal throttling and performance degradation.
-3. **Cost Overruns**: Implement budget alerts. GPU costs can escalate quickly with uncontrolled usage.
-4. **Security**: Never run GPU workloads as root. Use security contexts to limit container capabilities.
+**Lessons learned:**
+
+1. **GPU utilization is the primary cost driver.** A cluster running at 40% GPU utilization costs 2.5x more per effective GPU-hour than one at 80%.
+2. **Preemptibility is essential.** Without it, teams over-provision to guarantee availability.
+3. **Multi-tenancy requires quotas at every level** — namespace, node pool, and global.
+4. **Checkpointing is not optional** — with preemption, jobs must be resumable from any checkpoint.
 
 ---
 
-## Summary
+## 14.6 War Story: GPU Memory Leak Crashing an Entire Cluster
 
-This chapter covered the fundamentals of running AI workloads on Kubernetes, including GPU scheduling, AI-specific operators, resource management, and multi-tenant platform design. Key takeaways:
+**Company:** Mid-size autonomous driving startup, 200+ GPU cluster
 
-1. Kubernetes provides the necessary abstractions for managing heterogeneous AI resources
-2. NVIDIA GPU Operator simplifies GPU management across clusters
-3. Kubeflow operators enable end-to-end ML lifecycle management
-4. Multi-tenant platforms require careful isolation and resource management
-5. Cost optimization is critical for sustainable AI operations
+**Problem:** A training job contained a PyTorch bug where CUDA tensors were created inside a Python `for` loop without being explicitly freed. The tensors were stored in a list that was never cleared, causing the GPU memory to grow by ~200MB per iteration.
 
-Next, we'll explore distributed computing architectures for scaling AI workloads beyond single clusters.
+**Timeline:**
+
+| Time | Event |
+|------|-------|
+| 0:00 | Training job starts, requests 8x A100 GPUs |
+| 2:00 | GPU memory on worker 0 reaches 90% (leaked to ~72GB) |
+| 3:00 | OOM killer activates, kills the training process |
+| 3:01 | The killed process leaves orphaned CUDA contexts |
+| 3:05 | NVIDIA device plugin loses contact with GPU 0 on worker 0 |
+| 3:06 | Device plugin marks GPUs 0-7 as unhealthy on worker 0 |
+| 3:07 | Kubernetes evicts all pods on worker 0 |
+| 3:10 | Remaining 7 GPUs on worker 0 are excluded from scheduling |
+| 3:15 | Other jobs start queueing, waiting for freed GPUs |
+| 3:30 | Cascading failures as other jobs hit their own OOM limits |
+
+**Root cause:** The NVIDIA device plugin on worker 0 detected GPU unresponsiveness and reported the entire node's GPU resources as unavailable. Kubernetes then removed the node from the scheduling pool. The orphaned CUDA contexts were not cleaned up because the container runtime did not correctly propagate SIGTERM to the CUDA driver.
+
+**Fixes applied:**
+
+1. **Pre-job validation:** Added a memory pre-check that runs a small allocation test before starting the actual training job
+2. **Resource limits with Kubernetes:** Set GPU memory limits using MIG profiles so each job is isolated
+3. **GPU health monitoring:** Deployed DCGM (Data Center GPU Manager) to export GPU health metrics to Prometheus
+4. **Automated remediation:** Created a controller that detects GPU unresponsiveness and triggers a GPU reset (nvidia-smi --gpu-reset) without evicting the entire node
+5. **Code review gate:** Added a CI check that flags CUDA tensor allocation inside loops without explicit deletion
+
+**Outcome:** GPU-related cluster downtime dropped from 12 hours/month to under 30 minutes/month.
+
+---
+
+## 14.7 When to Use / When Not to Use Kubernetes for AI
+
+### When to Use Kubernetes for AI
+
+| Scenario | Why K8s Fits |
+|----------|-------------|
+| Multi-team shared GPU cluster | Namespace isolation, resource quotas, RBAC |
+| Mixed workloads (training + serving) | Unified orchestration, different resource profiles |
+| Auto-scaling needs | Cluster autoscaler, node pool management |
+| Hybrid cloud / multi-cloud | Consistent API across environments |
+| Regulatory compliance needs | Audit logging, network policies, RBAC |
+| Large-scale distributed training | Training Operators handle topology |
+
+### When NOT to Use Kubernetes for AI
+
+| Scenario | Why K8s Doesn't Fit | Alternative |
+|----------|---------------------|-------------|
+| Single-team with < 8 GPUs | Operational overhead exceeds benefit | Docker Compose or single-node |
+| Interactive notebook-only work | StatefulSet complexity, JupyterHub simpler | JupyterHub on VMs |
+| Real-time low-latency serving | K8s networking adds 1-3ms latency | Dedicated inference servers |
+| Prototyping / experimentation | Kubernetes YAML overhead slows iteration | Local Docker + MLflow |
+| Tiny models (< 100MB) | GPU scheduling overhead exceeds model run | CPU-only containers |
+| Budget-constrained (no SRE team) | K8s requires dedicated operations expertise | Managed services (SageMaker, Vertex AI) |
+
+---
+
+## 14.8 Summary
+
+- The **NVIDIA GPU Operator** automates GPU provisioning on Kubernetes, but GPU scheduling is bin-packed and non-overcommittable — a pod gets exclusive access to a physical GPU
+- **Kubeflow** is a CNCF Graduated project (33.1K+ stars) providing Pipelines, Training Operators, Katib, KServe, and Notebooks on Kubernetes
+- **Multi-tenancy** requires isolation at every layer: namespaces, network policies, GPU device plugins, storage classes, and resource quotas
+- **MIG** technology allows partitioning A100/H100 GPUs into isolated instances for finer-grained resource sharing
+- Kubernetes is powerful for AI infrastructure but introduces operational overhead that must be justified by scale and multi-tenancy requirements
+
+---
+
+## Discussion Questions
+
+1. A startup has 4 data scientists sharing 4 GPUs. They currently use a shared Jupyter server. The CTO wants to deploy Kubeflow Pipelines for experiment tracking. Is this justified? What would you recommend instead?
+
+2. How does GPU time-slicing differ from MIG in terms of isolation, performance, and operational complexity? In what scenario would you choose one over the other?
+
+3. A team runs distributed PyTorch training jobs that take 6-12 hours. The cluster uses preemptible instances. Design a checkpointing strategy that balances cost savings from preemption with training progress protection.
+
+4. The NVIDIA device plugin reports a GPU as unhealthy, causing all pods on the node to be evicted. How would you design a more resilient remediation strategy?
+
+5. Compare the operational complexity of running KServe on Kubernetes versus deploying the same model on a dedicated inference platform like NVIDIA Triton. What factors drive the decision?
+
+---
+
+## Exercises
+
+**Exercise 1:** Deploy a Kubeflow Training Operator that runs a distributed PyTorch training job across 2 nodes with 2 GPUs each. Verify that the master and worker pods can communicate via the NCCL rendezvous backend.
+
+**Exercise 2:** Create a namespace with a resource quota limiting GPU access to 4 GPUs. Deploy 3 pods each requesting 2 GPUs. Observe which pod is pending and why. Then deploy a 4th pod requesting 1 GPU and confirm it schedules successfully.
+
+**Exercise 3:** Set up DCGM exporter in your cluster, configure Prometheus to scrape GPU metrics, and create a Grafana dashboard showing GPU utilization, memory usage, and temperature across all nodes.
+
+---
+
+## References
+
+- NVIDIA GPU Operator Documentation: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/
+- Kubeflow Official Documentation: https://www.kubeflow.org/docs/
+- Kubeflow GitHub Repository: https://github.com/kubeflow/kubeflow
+- Kubernetes Device Plugins: https://kubernetes.io/docs/concepts/extend-kubernetes-compute-storage-plugins/device-plugins/
+- NVIDIA Multi-Instance GPU (MIG): https://docs.nvidia.com/datacenter/tesla/mig-user-guide/
+- CNCF Kubeflow Graduation Announcement: https://www.cncf.io/announcements/
+- Argo Workflows: https://argoproj.github.io/argo-workflows/
+- NVIDIA DCGM Exporter: https://github.com/NVIDIA/dcgm-exporter

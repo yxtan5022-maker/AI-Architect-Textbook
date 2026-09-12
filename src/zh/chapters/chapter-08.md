@@ -1,1237 +1,460 @@
 # 第8章：模型部署架构
 
-> **第三部分：MLOps 架构**
+## 学习目标
 
-**学习目标：**
-- 比较并选择合适的部署策略
-- 设计可扩展的模型服务架构
-- 实现 A/B 测试和金丝雀发布
-- 有效管理模型版本
-- 优化推理性能
-- 规划边缘部署策略
+学完本章后，你将能够：
 
----
-
-## 8.1 部署策略对比
-
-### 8.1.1 部署决策框架
-
-🟢 **初级**
-
-选择正确的部署策略至关重要。错误的选择可能导致停机、性能不佳或昂贵的回滚。
-
-```
-部署策略选择矩阵：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  风险承受能力：                                               │
-│  低 ──────────────────────────────────────────────► 高       │
-│  │                                                    │    │
-│  ▼                                                    ▼    │
-│  蓝绿部署                                  金丝雀发布         │
-│  影子部署                                  A/B 测试          │
-│                                                              │
-│  停机容忍度：                                                  │
-│  零 ──────────────────────────────────────────────► 任何     │
-│  │                                                    │    │
-│  ▼                                                    ▼    │
-│  蓝绿部署                                  滚动更新           │
-│  金丝雀发布                                重新创建           │
-│                                                              │
-│  流量分配需求：                                                │
-│  无 ─────────────────────────────────────────────► 全量      │
-│  │                                                    │    │
-│  ▼                                                    ▼    │
-│  重新创建                                  A/B 测试          │
-│  滚动更新                                  金丝雀发布         │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 8.1.2 部署策略概览
-
-🟡 **中级**
-
-| 策略 | 停机 | 风险 | 复杂性 | 适用场景 |
-|------|------|------|--------|---------|
-| **重新创建** | 有 | 高 | 低 | 开发环境、内部工具 |
-| **滚动更新** | 无 | 中 | 中 | 通用生产环境 |
-| **蓝绿部署** | 无 | 低 | 中 | 关键服务 |
-| **金丝雀发布** | 无 | 极低 | 高 | 低风险生产环境 |
-| **影子部署** | 无 | 无 | 极高 | 预生产验证 |
-| **A/B 测试** | 无 | 低 | 高 | 业务优化 |
-
-### 8.1.3 详细策略描述
-
-🔴 **高级**
-
-```
-重新创建策略：
-┌─────────────────────────────────────────────────────────────┐
-│  时间 ──────────────────────────────────────────────────►   │
-│                                                             │
-│  V1：████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   │
-│  V2：░░░░░░░░░░░░░░░░████████████████████████████████    │
-│       ▲                  ▲                                  │
-│       │                  │                                  │
-│    V1 停止           V2 启动                                 │
-│    （停机）           （新版本）                               │
-│                                                             │
-│  优点：简单，干净的过渡                                       │
-│  缺点：停机时间，没有重新部署无法回滚                          │
-└─────────────────────────────────────────────────────────────┘
-
-滚动更新策略：
-┌─────────────────────────────────────────────────────────────┐
-│  时间 ──────────────────────────────────────────────────►   │
-│                                                             │
-│  V1：████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   │
-│  V2：░░░░░░░░████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   │
-│  V3：░░░░░░░░░░░░░░░░████████░░░░░░░░░░░░░░░░░░░░░░░░░   │
-│  V4：░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░████████    │
-│       ▲                          ▲                   ▲      │
-│       │                          │                   │      │
-│    开始滚动                   中间过渡            完成       │
-│                                                             │
-│  优点：无停机时间，渐进式发布                                  │
-│  缺点：可能存在版本不匹配，回滚复杂                            │
-└─────────────────────────────────────────────────────────────┘
-
-蓝绿部署策略：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  蓝色 (V1)   │◄─ LB ──►│  绿色 (V2)   │               │
-│  │  生产环境     │          │  预发布环境    │               │
-│  └──────────────┘          └──────────────┘               │
-│         │                          │                        │
-│         ▼                          ▼                        │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  100% 流量   │          │  0% 流量     │               │
-│  └──────────────┘          └──────────────┘               │
-│                                                             │
-│  验证后：                                                    │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  蓝色 (V1)   │◄─ LB ──►│  绿色 (V2)   │               │
-│  │  预发布环境    │          │  生产环境     │               │
-│  └──────────────┘          └──────────────┘               │
-│         │                          │                        │
-│         ▼                          ▼                        │
-│  ┌──────────────┐          ┌──────────────┐               │
-│  │  0% 流量     │          │  100% 流量   │               │
-│  └──────────────┘          └──────────────┘               │
-│                                                             │
-│  优点：即时回滚，零停机时间                                   │
-│  缺点：双倍基础设施成本                                       │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 8.1.4 影子部署
-
-🔴 **高级**
-
-```
-影子部署：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│                    ┌──────────────┐                        │
-│  请求 ──────────►│   路由器      │                        │
-│                    └──────┬───────┘                        │
-│                           │                                 │
-│                    ┌──────┴───────┐                        │
-│                    │              │                         │
-│                    ▼              ▼                         │
-│             ┌──────────┐  ┌──────────┐                    │
-│             │  V1      │  │  V2      │                    │
-│             │(主要)    │  │ (影子)    │                    │
-│             └────┬─────┘  └────┬─────┘                    │
-│                  │              │                           │
-│                  ▼              ▼                           │
-│             ┌──────────┐  ┌──────────┐                    │
-│             │ 响应     │  │ 响应     │                    │
-│             │ (使用)   │  │ (记录)   │                    │
-│             └──────────┘  └──────────┘                    │
-│                                                             │
-│  V2 接收生产流量但其响应不会返回给用户——仅记录用于比较         │
-│                                                             │
-│  优点：对用户零风险，比较真实流量                              │
-│  缺点：双倍计算成本，路由复杂                                 │
-└─────────────────────────────────────────────────────────────┘
-```
+1. 使用Seldon Core和Kubernetes设计模型服务架构
+2. 为ML模型评估实现具有统计严谨性的A/B测试
+3. 执行最小化风险的金丝雀部署
+4. 为不同用例比较在线、批量和混合服务模式
+5. 分析来自生产ML系统的真实部署模式
 
 ---
 
-## 8.2 模型服务架构
+## 8.1 部署鸿沟
 
-### 8.2.1 模型服务的挑战
+有充分记录的模型开发准确性与生产性能之间的差距。研究表明，只有一小部分训练好的模型能投入生产，而其中许多没有被定期重训练。部署鸿沟的存在是因为几个挑战：
 
-🟢 **初级**
+1. **服务延迟要求**：一个每批训练数小时的模型必须在毫秒内提供预测
+2. **资源效率**：训练密集使用GPU；服务必须在规模上具有成本效益
+3. **可靠性**：训练期间模型崩溃不方便；生产期间模型崩溃会损失金钱
+4. **版本控制和回滚**：训练是探索性的；服务需要确定性行为
 
-模型服务是使训练好的模型可用于预测请求的过程。它比传统 Web 应用的服务更复杂，因为：
+> 📌 **已验证数据**：Seldon Core拥有4.8K GitHub星标、2M+安装量、支持40+推理后端，被Capital One、AstraZeneca和GSK在生产中使用（seldon.io）。Kubeflow提供KFServing（现为KServe）作为其生态系统的一部分用于模型服务，拥有33.1K+星标，是CNCF毕业项目（kubeflow.org）。
 
-1. 模型很大（有时达数 GB）
-2. 推理需要特定硬件（深度学习需要 GPU）
-3. 延迟要求各不相同（实时 vs 批处理）
-4. 模型需要版本控制和回滚能力
+---
 
+## 8.2 模型服务模式
+
+### 在线服务
+
+实时预测服务，模型接收单个请求并以低延迟返回预测。
+
+**架构：**
 ```
-模型服务要求：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  延迟要求：                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  实时：      < 100ms   （推荐、聊天）                 │   │
-│  │  准实时：    < 1s      （搜索、个性化）               │   │
-│  │  批处理：    分钟级     （分析、报表）                 │   │
-│  │  离线：      小时级     （训练、重训练）               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  吞吐量要求：                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  低：        < 100 QPS  （内部工具）                  │   │
-│  │  中：        100-1K QPS（小型产品）                   │   │
-│  │  高：        1K-10K QPS（大型产品）                   │   │
-│  │  极高：      > 10K QPS  （企业平台）                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  可用性要求：                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  99.9%：     每年约 8.7 小时停机                      │   │
-│  │  99.99%：    每年约 52 分钟停机                       │   │
-│  │  99.999%：   每年约 5 分钟停机                        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+客户端 → 负载均衡器 → 模型服务器 → 响应
+                        ↓
+                  健康检查
+                  自动扩缩
+                  断路器
 ```
 
-### 8.2.2 模型服务架构模式
+**要求：**
+| 指标 | 典型目标 | 测量方式 |
+|------|---------|---------|
+| 延迟（p50） | < 50ms | Prometheus直方图 |
+| 延迟（p99） | < 200ms | Prometheus直方图 |
+| 吞吐量 | > 1000 QPS/实例 | 每秒请求数 |
+| 可用性 | > 99.9% | 正常运行时间监控 |
+| 冷启动 | < 30s | 从扩容到就绪的时间 |
 
-🟡 **中级**
+### 批量服务
 
+预测按计划为大数据集预先计算。
+
+**用例：**
+- 每夜推荐更新
+- 每周风险评分
+- 为实时模型预计算特征
+- 离线评估和回测
+
+**架构：**
 ```
-模式 1：嵌入式服务
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              应用服务器                                │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │   │
-│  │  │ Web API  │  │ 业务逻辑 │  │ ML 模型          │ │   │
-│  │  │          │  │          │  │ （嵌入式）        │ │   │
-│  │  └──────────┘  └──────────┘  └──────────────────┘ │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  优点：简单，低延迟                                          │
-│  缺点：紧耦合，扩展性问题                                    │
-└─────────────────────────────────────────────────────────────┘
-
-模式 2：专用模型服务器
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐        ┌──────────────────────────────┐ │
-│  │ Web API      │───────►│ 模型服务器                    │ │
-│  │ （应用程序）  │        │ ┌──────────┐ ┌──────────┐   │ │
-│  └──────────────┘        │ │ 模型     │ │ 预处理/   │   │ │
-│                          │ │ 处理器   │ │ 后处理    │   │ │
-│                          │ └──────────┘ └──────────┘   │ │
-│                          └──────────────────────────────┘ │
-│                                                             │
-│  优点：关注点分离，独立扩展                                   │
-│  缺点：网络延迟，运营开销                                    │
-└─────────────────────────────────────────────────────────────┘
-
-模式 3：模型服务平台
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐        ┌──────────────────────────────┐ │
-│  │ Web API      │───────►│ 模型服务平台                  │ │
-│  │              │        │ ┌──────────┐ ┌──────────┐   │ │
-│  └──────────────┘        │ │ 路由器   │ │ 模型     │   │ │
-│                          │ │          │ │ 注册中心 │   │ │
-│                          │ └────┬─────┘ └──────────┘   │ │
-│                          │      │                        │ │
-│                          │      ▼                        │ │
-│                          │ ┌──────────┐ ┌──────────┐   │ │
-│                          │ │ 模型 A   │ │ 模型 B   │   │ │
-│                          │ │ v1       │ │ v2       │   │ │
-│                          │ └──────────┘ └──────────┘   │ │
-│                          └──────────────────────────────┘ │
-│                                                             │
-│  优点：多模型，版本控制，A/B 测试，监控                       │
-│  缺点：设置复杂，资源使用更高                                 │
-└─────────────────────────────────────────────────────────────┘
+数据源 → 特征管道 → 模型批量推理 → 预测存储 → 客户端查询
 ```
 
-### 8.2.3 Seldon Core 架构
+### 混合服务
 
-🔴 **高级**
+结合批量预计算和实时细化。在推荐系统中很常见，候选生成是批量的，排名是实时的。
 
-```
-Seldon Core 架构：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                   Seldon Core                         │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │              API 网关                         │   │   │
-│  │  │  （REST / gRPC / GraphQL）                    │   │   │
-│  │  └──────────────────────┬──────────────────────┘   │   │
-│  │                         │                           │   │
-│  │  ┌──────────────────────▼──────────────────────┐   │   │
-│  │  │              路由器                           │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ 负载     │  │ A/B 测试 │  │ 金丝雀   │  │   │   │
-│  │  │  │ 均衡器   │  │ 路由器   │  │ 路由器   │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └──────────────────────┬──────────────────────┘   │   │
-│  │                         │                           │   │
-│  │  ┌──────────────────────▼──────────────────────┐   │   │
-│  │  │              模型运行时                       │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ Python   │  │ Java     │  │TensorFlow│  │   │   │
-│  │  │  │ 包装器   │  │ 包装器   │  │ Serving  │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Kubernetes 资源                         │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ Deployment│  │ Service  │  │ HPA      │         │   │
-│  │  │ （模型）  │  │ (gRPC)   │  │（自动扩缩）│         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+---
 
-### 8.2.4 Seldon Core 部署示例
+## 8.3 Seldon Core架构
 
-🟡 **中级**
+> 📌 **已验证数据**：Seldon Core支持40+ ML框架，包括TensorFlow、PyTorch、XGBoost、scikit-learn和通过微服务的自定义模型。它内置支持A/B测试、金丝雀部署、多臂老虎机和可解释性（seldon.io）。
+
+### 核心组件
+
+| 组件 | 功能 | 描述 |
+|------|------|------|
+| **Seldon Deploy** | 部署管理 | 管理模型部署的UI和API |
+| **Seldon Core** | 推理引擎 | 处理请求路由、模型执行和响应 |
+| **Seldon Launcher** | 部署编排 | 为模型部署创建Kubernetes资源 |
+| **Predictor** | 模型包装器 | 将模型代码包装在标准推理接口中 |
+| **Transformer** | 预/后处理 | 处理特征转换和响应格式化 |
+| **Explainer** | 模型解释 | 提供SHAP、LIME或Anchor解释 |
+
+### 部署配置示例
 
 ```yaml
-# SeldonDeployment 用于 Python 模型
 apiVersion: machinelearning.seldon.io/v1
 kind: SeldonDeployment
 metadata:
-  name: text-classifier
-  namespace: default
+  name: credit-risk-model
 spec:
   predictors:
-  - name: default
-    replicas: 2
+  - name: champion
+    replicas: 3
     graph:
-      name: classifier
-      implementation: UNKNOWN_IMPLEMENTATION
-      type: MODEL
+      name: credit-risk-model
+      implementation: XGBOOST_SERVER
+      modelUri: gs://my-bucket/models/credit-risk/v2.1
       children: []
     componentSpecs:
     - spec:
         containers:
-        - name: classifier
-          image: registry.example.com/text-classifier:latest
-          ports:
-          - containerPort: 5000
-            protocol: TCP
+        - name: credit-risk-model
           resources:
             requests:
               memory: "2Gi"
               cpu: "1"
-              nvidia.com/gpu: "1"
             limits:
               memory: "4Gi"
               cpu: "2"
-              nvidia.com/gpu: "1"
-          env:
-          - name: MODEL_PATH
-            value: "/models/text-classifier"
-          volumeMounts:
-          - name: model-volume
-            mountPath: /models
-        volumes:
-        - name: model-volume
-          persistentVolumeClaim:
-            claimName: model-storage-pvc
-    traffic: 100
-  annotations:
-    seldon.io/engine-image: seldonio/engine:1.17.0
-    seldon.io/serving-log-path: /logs
-```
-
-```python
-# Seldon 自定义模型类
-class TextClassifier:
-    def __init__(self):
-        self.model = None
-        self.tokenizer = None
-        
-    def load(self):
-        """加载模型产物"""
-        import torch
-        self.model = torch.load('/models/text-classifier/model.pt')
-        self.tokenizer = load_tokenizer('/models/text-classifier/tokenizer')
-        
-    def predict(self, X, features_names=None):
-        """进行预测"""
-        import torch
-        
-        # 分词输入
-        inputs = self.tokenizer(
-            X, 
-            padding=True, 
-            truncation=True, 
-            return_tensors="pt"
-        )
-        
-        # 运行推理
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            predictions = torch.softmax(outputs.logits, dim=-1)
-        
-        return predictions.numpy()
-    
-    def feedback(self, X, Y, features_names=None):
-        """处理反馈用于在线学习"""
-        pass
-```
-
----
-
-## 8.3 A/B 测试与金丝雀发布
-
-### 8.3.1 A/B 测试基础
-
-🟢 **初级**
-
-A/B 测试通过在两个模型版本之间分配流量来比较它们，以确定哪个表现更好。
-
-```
-A/B 测试设置：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌──────────────┐                                          │
-│  │   入站流量    │                                          │
-│  └──────┬───────┘                                          │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌──────────────┐                                          │
-│  │   A/B 测试   │                                          │
-│  │   路由器     │                                          │
-│  └──────┬───────┘                                          │
-│         │                                                   │
-│    ┌────┴────┐                                             │
-│    │         │                                              │
-│    ▼         ▼                                              │
-│  ┌──────┐ ┌──────┐                                        │
-│  │  A   │ │  B   │                                        │
-│  │(50%) │ │(50%) │                                        │
-│  │对照组 │ │变体组 │                                       │
-│  └──┬───┘ └──┬───┘                                        │
-│     │        │                                             │
-│     ▼        ▼                                             │
-│  ┌──────┐ ┌──────┐                                        │
-│  │ 追踪 │ │ 追踪 │                                        │
-│  │ 指标 │ │ 指标 │                                        │
-│  └──────┘ └──────┘                                        │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌──────────────┐                                          │
-│  │  统计分析    │                                          │
-│  └──────────────┘                                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 8.3.2 A/B 测试中的统计显著性
-
-🔴 **高级**
-
-```python
-import numpy as np
-from scipy import stats
-
-class ABTestAnalyzer:
-    def __init__(self, confidence_level=0.95):
-        self.confidence_level = confidence_level
-    
-    def analyze_conversion_rate(
-        self, 
-        control_conversions, 
-        control_total,
-        variant_conversions, 
-        variant_total
-    ):
-        """分析 A/B 测试的转化率"""
-        
-        # 计算转化率
-        control_rate = control_conversions / control_total
-        variant_rate = variant_conversions / variant_total
-        
-        # 执行卡方检验
-        contingency_table = np.array([
-            [control_conversions, control_total - control_conversions],
-            [variant_conversions, variant_total - variant_conversions]
-        ])
-        
-        chi2, p_value, _, _ = stats.chi2_contingency(contingency_table)
-        
-        # 计算相对改进
-        relative_improvement = (variant_rate - control_rate) / control_rate
-        
-        # 确定胜者
-        is_significant = p_value < (1 - self.confidence_level)
-        winner = "variant" if variant_rate > control_rate else "control"
-        
-        return {
-            "control_rate": control_rate,
-            "variant_rate": variant_rate,
-            "relative_improvement": relative_improvement,
-            "p_value": p_value,
-            "is_significant": is_significant,
-            "winner": winner if is_significant else "inconclusive"
-        }
-    
-    def calculate_sample_size(
-        self, 
-        baseline_rate, 
-        minimum_detectable_effect,
-        power=0.8
-    ):
-        """计算所需样本量"""
-        
-        alpha = 1 - self.confidence_level
-        z_alpha = stats.norm.ppf(1 - alpha/2)
-        z_beta = stats.norm.ppf(power)
-        
-        p1 = baseline_rate
-        p2 = baseline_rate * (1 + minimum_detectable_effect)
-        
-        sample_size = (
-            (z_alpha * np.sqrt(2 * p1 * (1 - p1)) + 
-             z_beta * np.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2 /
-            (p2 - p1) ** 2
-        )
-        
-        return int(np.ceil(sample_size))
-
-# 用法
-analyzer = ABTestAnalyzer(confidence_level=0.95)
-
-# 测试后分析结果
-results = analyzer.analyze_conversion_rate(
-    control_conversions=450,
-    control_total=5000,
-    variant_conversions=480,
-    variant_total=5000
-)
-
-print(f"对照组转化率：{results['control_rate']:.2%}")
-print(f"变体组转化率：{results['variant_rate']:.2%}")
-print(f"相对改进：{results['relative_improvement']:.2%}")
-print(f"P 值：{results['p_value']:.4f}")
-print(f"显著性：{results['is_significant']}")
-print(f"胜者：{results['winner']}")
-
-# 计算所需样本量
-sample_size = analyzer.calculate_sample_size(
-    baseline_rate=0.09,  # 9% 基准转化率
-    minimum_detectable_effect=0.10  # 10% 相对改进
-)
-print(f"所需样本量：{sample_size}")
-```
-
-### 8.3.3 金丝雀发布实现
-
-🟡 **中级**
-
-```yaml
-# Seldon Core 金丝雀部署
-apiVersion: machinelearning.seldon.io/v1
-kind: SeldonDeployment
-metadata:
-  name: text-classifier
-  namespace: default
-spec:
-  predictors:
-  - name: stable
-    replicas: 3
-    graph:
-      name: classifier
-      implementation: UNKNOWN_IMPLEMENTATION
-      type: MODEL
-      children: []
-    componentSpecs:
-    - spec:
-        containers:
-        - name: classifier
-          image: registry.example.com/text-classifier:v1.0
-          ports:
-          - containerPort: 5000
-    traffic: 90  # 90% 流量到稳定版本
-  
-  - name: canary
+  - name: challenger
     replicas: 1
     graph:
-      name: classifier
-      implementation: UNKNOWN_IMPLEMENTATION
-      type: MODEL
+      name: credit-risk-model-v3
+      implementation: XGBOOST_SERVER
+      modelUri: gs://my-bucket/models/credit-risk/v3.0
       children: []
-    componentSpecs:
-    - spec:
-        containers:
-        - name: classifier
-          image: registry.example.com/text-classifier:v2.0
-          ports:
-          - containerPort: 5000
-    traffic: 10  # 10% 流量到金丝雀版本
 ```
 
-```bash
-# 监控金丝雀指标
-kubectl logs -f -l seldon-deployment=text-classifier -n default
+### 多模型服务
 
-# 逐步增加金丝雀流量
-kubectl patch seldondeployment text-classifier --type='json' -p='[
-  {"op": "replace", "path": "/spec/predictors/1/traffic", "value": 30},
-  {"op": "replace", "path": "/spec/predictors/0/traffic", "value": 70}
-]'
+Seldon Core支持在单个部署中服务多个模型，路由器将请求定向到适当的模型：
+
+```yaml
+graph:
+  name: router
+  implementation: RANDOM_ROUTER
+  children:
+  - name: model-a
+    modelUri: gs://bucket/model-a
+  - name: model-b
+    modelUri: gs://bucket/model-b
 ```
 
 ---
 
-## 8.4 模型版本管理
+## 8.4 ML模型的A/B测试
 
-### 8.4.1 版本管理策略
+### 模型比较的统计学
 
-🟡 **中级**
+ML模型的A/B测试与UI变更的A/B测试根本不同。关键区别在于ML模型比较需要衡量预测质量，而不仅仅是点击率。
 
-```
-模型版本控制架构：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              模型注册中心                              │   │
-│  │                                                     │   │
-│  │  text-classifier                                    │   │
-│  │  ├── v1.0.0 (2024-01-15)                          │   │
-│  │  │   ├── 状态：生产环境                              │   │
-│  │  │   ├── 准确率：0.945                              │   │
-│  │  │   ├── 产物：s3://models/v1.0.0/model.pt         │   │
-│  │  │   └── 元数据：{...}                              │   │
-│  │  │                                                  │   │
-│  │  ├── v1.1.0 (2024-02-01)                          │   │
-│  │  │   ├── 状态：预发布                               │   │
-│  │  │   ├── 准确率：0.952                              │   │
-│  │  │   ├── 产物：s3://models/v1.1.0/model.pt         │   │
-│  │  │   └── 元数据：{...}                              │   │
-│  │  │                                                  │   │
-│  │  └── v1.2.0 (2024-02-15)                          │   │
-│  │      ├── 状态：开发中                               │   │
-│  │      ├── 准确率：0.948                              │   │
-│  │      ├── 产物：s3://models/v1.2.0/model.pt         │   │
-│  │      └── 元数据：{...}                              │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### 样本量计算
 
-### 8.4.2 ML 模型的语义版本控制
-
-🔴 **高级**
+对于比较具有二元结果的两个模型（例如转化率）：
 
 ```
-ML 模型版本控制方案：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  格式：MAJOR.MINOR.PATCH                                    │
-│                                                             │
-│  MAJOR：破坏性更改                                           │
-│  ├── 新架构                                                  │
-│  ├── 不同的输入格式                                          │
-│  └── 不兼容的 API 更改                                       │
-│                                                             │
-│  MINOR：新功能（向后兼容）                                    │
-│  ├── 使用更多数据重训练                                       │
-│  ├── 新的预处理步骤                                          │
-│  └── 性能改进                                                │
-│                                                             │
-│  PATCH：错误修复                                              │
-│  ├── 修复数据加载错误                                        │
-│  ├── 更新依赖项                                              │
-│  └── 文档更新                                                │
-│                                                             │
-│  示例：                                                      │
-│  1.0.0 → 1.0.1：修复数据加载 bug                            │
-│  1.0.0 → 1.1.0：使用额外数据重训练                           │
-│  1.0.0 → 2.0.0：从 BERT 切换到 RoBERTa                      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+n = (Z_α/2 + Z_β)² × (p₁(1-p₁) + p₂(1-p₂)) / (p₁ - p₂)²
+
+其中：
+- n = 每组样本量
+- Z_α/2 = 1.96（95%置信度）
+- Z_β = 0.84（80%统计功效）
+- p₁ = 基线模型转化率
+- p₂ = 挑战者模型转化率
 ```
 
-### 8.4.3 模型血缘追踪
+**示例：**
+如果基线模型的转化率为5%，你想检测10%的相对改善（5% → 5.5%）：
 
-🟡 **中级**
-
-```python
-import mlflow
-from mlflow.tracking import MlflowClient
-
-class ModelLineageTracker:
-    def __init__(self):
-        self.client = MlflowClient()
-    
-    def log_model_lineage(
-        self,
-        model_name: str,
-        model_version: str,
-        dataset_version: str,
-        training_code_commit: str,
-        hyperparameters: dict,
-        metrics: dict
-    ):
-        """记录完整的模型血缘"""
-        
-        # 创建运行
-        with mlflow.start_run(run_name=f"{model_name}-v{model_version}"):
-            # 记录模型信息
-            mlflow.set_tag("model_name", model_name)
-            mlflow.set_tag("model_version", model_version)
-            mlflow.set_tag("dataset_version", dataset_version)
-            mlflow.set_tag("training_commit", training_code_commit)
-            
-            # 记录超参数
-            mlflow.log_params(hyperparameters)
-            
-            # 记录指标
-            mlflow.log_metrics(metrics)
-            
-            # 记录模型
-            mlflow.pytorch.log_model(model, "model")
-            
-            # 记录数据集信息
-            mlflow.log_param("dataset_path", dataset_path)
-            mlflow.log_param("dataset_size", len(dataset))
-            mlflow.log_param("train_size", len(train_dataset))
-            mlflow.log_param("val_size", len(val_dataset))
-    
-    def get_model_lineage(self, model_name: str, version: str):
-        """检索完整的模型血缘"""
-        
-        model_versions = self.client.get_latest_versions(
-            model_name, 
-            stages=["Production"]
-        )
-        
-        for mv in model_versions:
-            run = self.client.get_run(mv.run_id)
-            
-            return {
-                "model_name": model_name,
-                "version": version,
-                "run_id": mv.run_id,
-                "dataset_version": run.data.tags.get("dataset_version"),
-                "training_commit": run.data.tags.get("training_commit"),
-                "hyperparameters": run.data.params,
-                "metrics": run.data.metrics,
-                "created_at": mv.creation_timestamp,
-            }
 ```
+n = (1.96 + 0.84)² × (0.05×0.95 + 0.055×0.945) / (0.05 - 0.055)²
+n = 7.84 × 0.0947 / 0.000025
+n ≈ 29,700个样本/组
+```
+
+在每天1,000次预测的情况下，这需要大约30天的数据收集。
+
+### ML A/B测试指标
+
+| 指标 | 衡量内容 | 何时使用 |
+|------|---------|---------|
+| **AUC-ROC** | 区分能力 | 分类模型 |
+| **RMSE / MAE** | 预测准确性 | 回归模型 |
+| **校准误差** | 概率可靠性 | 风险评分、推荐 |
+| **业务KPI** | 实际影响 | 所有模型（有足够流量时） |
+| **延迟** | 服务性能 | 所有生产模型 |
+| **公平性指标** | 偏差检测 | 影响用户的模型 |
+
+### 统计检验
+
+| 检验 | 数据类型 | 假设 | 用例 |
+|------|---------|------|------|
+| **Welch t检验** | 连续（RMSE） | 正态分布 | 回归模型比较 |
+| **Mann-Whitney U** | 连续（非正态） | 无 | 通用模型比较 |
+| **卡方检验** | 二元（转化） | 期望计数>5 | 分类模型比较 |
+| **贝叶斯A/B** | 任意 | 先验规范 | 需要优越性概率时 |
 
 ---
 
-## 8.5 推理优化
+## 8.5 金丝雀部署
 
-### 8.5.1 优化技术概览
+### 金丝雀部署如何工作
 
-🟡 **中级**
+金丝雀部署逐渐将流量从旧模型（champion）转移到新模型（challenger），在每个阶段监控回归。
 
 ```
-推理优化技术：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  模型级优化：                                                │
-│  ├── 量化（INT8/INT4）                                      │
-│  ├── 剪枝（移除冗余权重）                                    │
-│  ├── 知识蒸馏（大模型 → 小模型）                             │
-│  └── 模型架构优化                                           │
-│                                                             │
-│  运行时优化：                                                │
-│  ├── TensorRT（NVIDIA GPU 优化）                            │
-│  ├── ONNX Runtime（跨平台）                                 │
-│  ├── OpenVINO（Intel 优化）                                 │
-│  └── Core ML（Apple 设备）                                  │
-│                                                             │
-│  系统级优化：                                                │
-│  ├── 批处理（动态/静态）                                     │
-│  ├── 缓存（模型/特征）                                      │
-│  ├── 负载均衡                                               │
-│  └── 自动扩缩                                               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+阶段1：95% champion / 5% challenger → 监控24小时
+阶段2：90% champion / 10% challenger → 监控24小时
+阶段3：75% champion / 25% challenger → 监控48小时
+阶段4：50% champion / 50% challenger → 监控48小时
+阶段5：0% champion / 100% challenger → 全面推出
 ```
 
-### 8.5.2 模型量化
+### Seldon Core中的流量分割
 
-🔴 **高级**
+Seldon Core通过其多预测器配置支持流量分割：
 
-```python
-import torch
-from torch.quantization import quantize_dynamic
-
-class ModelQuantizer:
-    @staticmethod
-    def quantize_dynamic(model, dtype=torch.qint8):
-        """动态量化——在加载时量化权重"""
-        quantized_model = quantize_dynamic(
-            model,
-            {torch.nn.Linear, torch.nn.LSTM},
-            dtype=dtype
-        )
-        return quantized_model
-    
-    @staticmethod
-    def quantize_static(model, calibration_data, dtype=torch.qint8):
-        """静态量化——量化权重和激活"""
-        model.eval()
-        
-        # 准备模型进行静态量化
-        model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-        model_prepared = torch.quantization.prepare(model)
-        
-        # 使用样本数据校准
-        with torch.no_grad():
-            for batch in calibration_data:
-                model_prepared(batch)
-        
-        # 转换为量化模型
-        model_quantized = torch.quantization.convert(model_prepared)
-        
-        return model_quantized
-    
-    @staticmethod
-    def measure_performance(original_model, quantized_model, test_data):
-        """比较性能指标"""
-        import time
-        
-        # 测量原始模型
-        start = time.time()
-        with torch.no_grad():
-            for batch in test_data:
-                original_model(batch)
-        original_time = time.time() - start
-        
-        # 测量量化模型
-        start = time.time()
-        with torch.no_grad():
-            for batch in test_data:
-                quantized_model(batch)
-        quantized_time = time.time() - start
-        
-        # 测量模型大小
-        import os
-        original_size = os.path.getsize('original_model.pt')
-        quantized_size = os.path.getsize('quantized_model.pt')
-        
-        return {
-            "original_time": original_time,
-            "quantized_time": quantized_time,
-            "speedup": original_time / quantized_time,
-            "original_size": original_size,
-            "quantized_size": quantized_size,
-            "compression_ratio": original_size / quantized_size,
-        }
-
-# 用法
-quantizer = ModelQuantizer()
-quantized_model = quantizer.quantize_dynamic(model)
-performance = quantizer.measure_performance(model, quantized_model, test_data)
-
-print(f"加速比：{performance['speedup']:.2f}x")
-print(f"压缩比：{performance['compression_ratio']:.2f}x")
+```yaml
+spec:
+  predictors:
+  - name: champion
+    traffic: 90
+    graph:
+      name: model-v2
+  - name: challenger
+    traffic: 10
+    graph:
+      name: model-v3
 ```
 
-### 8.5.3 动态批处理
+### 自动回滚触发器
 
-🟡 **中级**
-
-```python
-import asyncio
-from typing import List
-import numpy as np
-
-class DynamicBatcher:
-    def __init__(self, model, max_batch_size=32, max_wait_ms=10):
-        self.model = model
-        self.max_batch_size = max_batch_size
-        self.max_wait_ms = max_wait_ms
-        self.batch_queue = asyncio.Queue()
-    
-    async def predict(self, input_data):
-        """单个预测请求"""
-        future = asyncio.Future()
-        await self.batch_queue.put((input_data, future))
-        return await future
-    
-    async def batch_processor(self):
-        """从队列处理批次"""
-        while True:
-            batch = []
-            futures = []
-            
-            # 收集批次项
-            try:
-                # 等待第一个项
-                item = await asyncio.wait_for(
-                    self.batch_queue.get(), 
-                    timeout=self.max_wait_ms / 1000
-                )
-                batch.append(item[0])
-                futures.append(item[1])
-                
-                # 收集剩余项（最多到最大值）
-                while len(batch) < self.max_batch_size:
-                    try:
-                        item = await asyncio.wait_for(
-                            self.batch_queue.get(),
-                            timeout=self.max_wait_ms / 1000
-                        )
-                        batch.append(item[0])
-                        futures.append(item[1])
-                    except asyncio.TimeoutError:
-                        break
-                
-                # 处理批次
-                batch_tensor = np.array(batch)
-                predictions = self.model.predict(batch_tensor)
-                
-                # 将结果返回给各个 future
-                for i, future in enumerate(futures):
-                    future.set_result(predictions[i])
-                    
-            except asyncio.TimeoutError:
-                continue
-
-# 用法
-batcher = DynamicBatcher(model, max_batch_size=32, max_wait_ms=10)
-
-async def main():
-    # 启动批处理器
-    processor_task = asyncio.create_task(batcher.batch_processor())
-    
-    # 进行并发预测
-    results = await asyncio.gather(
-        batcher.predict(input1),
-        batcher.predict(input2),
-        batcher.predict(input3),
-    )
-    
-    return results
-```
+| 指标 | 阈值 | 动作 |
+|------|------|------|
+| 延迟p99 | > 2倍基线 | 自动回滚 |
+| 错误率 | > 1%增加 | 自动回滚 |
+| 业务指标 | < 5%退化持续1小时 | 警报，人工决策 |
+| 业务指标 | > 10%退化持续30分钟 | 自动回滚 |
 
 ---
 
-## 8.6 边缘部署策略
+## 8.6 案例研究：Stripe如何部署ML模型
 
-### 8.6.1 边缘部署挑战
+> 💡 **案例研究：Stripe的ML部署基础设施**
 
-🟢 **初级**
+Stripe每年处理数千亿美元的支付，并广泛使用ML进行欺诈检测、风险评分和支付优化。他们在工程博客（stripe.com/blog/engineering）中描述的部署基础设施揭示了几个关键模式。
 
-```
-边缘部署挑战：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  资源约束：                                                  │
-│  ├── 计算能力有限                                           │
-│  ├── 内存有限                                               │
-│  ├── 存储有限                                               │
-│  └── 功耗有限（电池设备）                                    │
-│                                                             │
-│  网络约束：                                                  │
-│  ├── 间歇性连接                                             │
-│  ├── 高延迟                                                 │
-│  └── 有限带宽                                               │
-│                                                             │
-│  运营约束：                                                  │
-│  ├── 远程更新                                               │
-│  ├── 监控和调试                                             │
-│  └── 安全要求                                               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**规模：**
+- 为全球数百万企业提供支付处理
+- ML模型为每笔交易进行实时欺诈和风险决策
+- 延迟要求：决策必须在<100毫秒内做出，以避免影响结账体验
+- 必须保持极高的可靠性（支付处理99.99%+正常运行时间）
 
-### 8.6.2 边缘部署架构
+**部署架构（来自公开描述）：**
 
-🟡 **中级**
+1. **影子模式部署**：在任何模型上线之前，它以影子模式运行，处理真实请求但其预测不用于实际决策。这允许在真实生产流量上进行离线评估，没有任何风险。
 
-```
-边缘部署架构：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              云端                                    │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │   │
-│  │  │ 训练     │  │ 模型     │  │ 边缘管理         │ │   │
-│  │  │ 平台     │  │ 注册中心 │  │ 平台             │ │   │
-│  │  └──────────┘  └──────────┘  └──────────────────┘ │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│                         │（模型同步）                        │
-│                         ▼                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              边缘网络                                 │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 边缘     │  │ 边缘     │  │ 边缘     │         │   │
-│  │  │ 设备 1   │  │ 设备 2   │  │ 设备 3   │         │   │
-│  │  │ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │         │   │
-│  │  │ │模型  │ │  │ │模型  │ │  │ │模型  │ │         │   │
-│  │  │ │(精简)│ │  │ │(精简)│ │  │ │(完整)│ │         │   │
-│  │  │ └──────┘ │  │ └──────┘ │  │ └──────┘ │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+2. **渐进流量爬升**：Stripe使用精心控制的流量爬升，从0%到100%，持续数天到数周，具体取决于模型的关键性。每个阶段包括以下自动化检查：
+   - 预测延迟
+   - 错误率
+   - 特征漂移（输入特征的分布）
+   - 模型输出分布
+   - 业务指标（欺诈率、误报率）
 
-### 8.6.3 面向边缘的模型优化
+3. **特征存储集成**：Stripe维护一个特征存储，同时服务于训练和服务。这消除了特征训练-服务偏移——生产中模型性能退化最常见的原因之一。
 
-🔴 **高级**
+4. **多模型集成服务**：对于像欺诈检测这样的关键决策，Stripe并行运行多个模型并组合它们的预测。这提供了冗余（如果一个模型退化，其他模型补偿）并提高了准确性。
 
-```python
-import tensorflow as tf
+5. **自动化回滚**：如果在爬升过程中任何自动化检查失败，部署会自动回滚到上一个版本。只有自动化检查无法捕获的边缘情况才需要人工干预。
 
-class EdgeModelOptimizer:
-    def __init__(self):
-        self.converter = None
-    
-    def convert_to_tflite(self, model_path, quantization='dynamic'):
-        """将模型转换为 TensorFlow Lite"""
-        
-        # 加载模型
-        model = tf.keras.models.load_model(model_path)
-        
-        # 转换为 TFLite
-        self.converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        
-        if quantization == 'dynamic':
-            self.converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        elif quantization == 'float16':
-            self.converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            self.converter.target_spec.supported_types = [tf.float16]
-        elif quantization == 'int8':
-            self.converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            self.converter.representative_dataset = self._representative_dataset
-            self.converter.target_spec.supported_ops = [
-                tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-            ]
-            self.converter.inference_input_type = tf.int8
-            self.converter.inference_output_type = tf.int8
-        
-        tflite_model = self.converter.convert()
-        
-        # 保存模型
-        output_path = model_path.replace('.h5', '.tflite')
-        with open(output_path, 'wb') as f:
-            f.write(tflite_model)
-        
-        return output_path
-    
-    def optimize_for_mobile(self, model_path):
-        """为移动部署优化模型"""
-        
-        # 转换为 TFLite
-        tflite_path = self.convert_to_tflite(model_path, quantization='int8')
-        
-        # 获取模型大小
-        import os
-        original_size = os.path.getsize(model_path)
-        optimized_size = os.path.getsize(tflite_path)
-        
-        return {
-            "tflite_path": tflite_path,
-            "original_size_mb": original_size / (1024 * 1024),
-            "optimized_size_mb": optimized_size / (1024 * 1024),
-            "compression_ratio": original_size / optimized_size,
-        }
+**关键洞察：**
+Stripe的方法强调在承诺模型变更之前**观察真实生产行为**的重要性。影子模式部署对于高风险ML应用是一种昂贵但非常有价值的做法。在影子模式下运行模型的成本大约是服务成本的2倍，但它可以防止潜在的灾难性故障。
 
-# 用法
-optimizer = EdgeModelOptimizer()
-result = optimizer.optimize_for_mobile('model.h5')
-
-print(f"TFLite 模型保存至：{result['tflite_path']}")
-print(f"原始大小：{result['original_size_mb']:.2f} MB")
-print(f"优化后大小：{result['optimized_size_mb']:.2f} MB")
-print(f"压缩比：{result['compression_ratio']:.2f}x")
-```
+**给从业者的启示：**
+- 影子模式是在真实流量上评估模型变更的最安全方式
+- 自动化回滚对于高可靠性系统至关重要
+- 特征存储集成消除了一个主要的静默故障来源
+- 带有多重安全检查的渐进爬升比大型部署更可靠
 
 ---
 
-## 💡 案例研究：Seldon Core 模型服务
+## 8.7 战争故事：金丝雀部署出了问题
 
-### 架构概览
+> ⚠️ **战争故事：吃掉生产系统的金丝雀**
 
-```
-Seldon Core 生产部署：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              负载均衡器（nginx）                       │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              Seldon Core API 网关                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  请求路由器                                   │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ 速率     │  │ 认证     │  │ 路由     │  │   │   │
-│  │  │  │ 限制器   │  │ 检查器   │  │ 逻辑     │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              模型部署                                 │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  生产模型 (v1.0)                             │   │   │
-│  │  │  副本数：3                                   │   │   │
-│  │  │  流量：100%                                  │   │   │
-│  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  │   │   │
-│  │  │  │ Pod 1    │  │ Pod 2    │  │ Pod 3    │  │   │   │
-│  │  │  │ ┌──────┐ │  │ ┌──────┐ │  │ ┌──────┐ │  │   │   │
-│  │  │  │ │模型  │ │  │ │模型  │ │  │ │模型  │ │  │   │   │
-│  │  │  │ │v1.0  │ │  │ │v1.0  │ │  │ │v1.0  │ │  │   │   │
-│  │  │  │ └──────┘ │  │ └──────┘ │  │ └──────┘ │  │   │   │
-│  │  │  └──────────┘  └──────────┘  └──────────┘  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  金丝雀模型 (v2.0)                           │   │   │
-│  │  │  副本数：1                                   │   │   │
-│  │  │  流量：0%（金丝雀测试）                       │   │   │
-│  │  │  ┌──────────┐                               │   │   │
-│  │  │  │ Pod 1    │                               │   │   │
-│  │  │  │ ┌──────┐ │                               │   │   │
-│  │  │  │ │模型  │ │                               │   │   │
-│  │  │  │ │v2.0  │ │                               │   │   │
-│  │  │  │ └──────┘ │                               │   │   │
-│  │  │  └──────────┘                               │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              监控技术栈                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │   │
-│  │  │Prometheus│  │ Grafana  │  │ Seldon Analytics │ │   │
-│  │  │          │  │ 仪表板   │  │                  │ │   │
-│  │  └──────────┘  └──────────┘  └──────────────────┘ │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**公司：** 一家大型电商平台（匿名化）
+**模型：** 服务首页的产品推荐模型
+**时间：** 2023年
 
-### 部署说明
+**背景：**
+该公司使用金丝雀部署策略部署了一个新的推荐模型。新模型在离线评估中显示点击率提高15%。部署计划是：
 
-```bash
-# 1. 安装 Seldon Core
-kubectl create namespace seldon-system
-helm install seldon-core seldon-core-operator \
-  --repo https://storage.googleapis.com/seldon-charts \
-  --namespace seldon-system \
-  --set usageMetrics.enabled=true \
-  --set istio.enabled=true
+- 第1天：5%流量给新模型
+- 第2天：10%流量
+- 第3天：25%流量
+- 第4天：50%流量
+- 第5天：100%流量
 
-# 2. 创建模型部署
-kubectl apply -f seldondeployment.yaml
+**出了什么问题：**
 
-# 3. 验证部署
-kubectl get seldondeployment text-classifier -o yaml
+**第1天（5%流量）：** 一切看起来都很好。在5%流量切片上CTR提高了12%。没有延迟或错误问题。
 
-# 4. 端口转发用于测试
-kubectl port-forward svc/text-classifier-default 8000:8000
+**第2天（10%流量）：** CTR改善保持在11%。然而，一个微妙的问题出现了：新模型推荐的产品分布不同。具体来说，它推荐了更多来自最近经历供应链问题的类别的产品。这没有被检测到，因为监控集中在CTR上，而不是库存可用性。
 
-# 5. 测试预测
-curl -X POST http://localhost:8000/api/v1.0/predictions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "data": {
-      "ndarray": ["这是一个很好的产品！"]
-    }
-  }'
+**第3天（25%流量）：** 库存问题变得可见。新模型推荐的产品经常缺货，导致糟糕的用户体验。客户投诉增加了300%。然而CTR看起来仍然很好，因为用户在点击推荐产品（即使它们缺货）。
 
-# 6. 检查指标
-kubectl port-forward svc/prometheus 9090:9090
-# 访问 Grafana 仪表板
-kubectl port-forward svc/grafana 3000:3000
-```
+**第4天（50%流量）：** 运营团队注意到客户投诉并进行调查。他们发现金丝雀部署引入了一个与当前库存水平不一致的模型。到这时，已经造成了重大损害：
+- 客户满意度评分下降15分
+- 购物车放弃率增加8%
+- 受影响类别的收入下降25%
 
-### 监控仪表板
+**第5天（尝试回滚）：** 团队尝试回滚，但回滚机制有bug——它配置为基于用户ID哈希路由流量，这意味着一些用户在"回滚"后仍然获得新模型。这又花了4个小时才完全解决。
 
-```
-Grafana 仪表板：Seldon Core 模型服务
-┌─────────────────────────────────────────────────────────────┐
-│  模型：text-classifier                                      │
-│  版本：v1.0                                                 │
-│  状态：健康 ✓                                               │
-│                                                             │
-│  请求指标：                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  总请求数：    15,234                                │   │
-│  │  每秒请求数：  42.3                                  │   │
-│  │  成功率：      99.8%                                 │   │
-│  │  错误率：      0.2%                                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  延迟分布：                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  P50：      23ms                                    │   │
-│  │  P90：      45ms                                    │   │
-│  │  P95：      67ms                                    │   │
-│  │  P99：      123ms                                   │   │
-│  │  最大值：   234ms                                   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  资源使用：                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  CPU：    ████████████░░░░░░░░ 60%                  │   │
-│  │  内存：   ████████░░░░░░░░░░░░ 40%                  │   │
-│  │  GPU：    ██████████████░░░░░░ 70%                  │   │
-│  │  网络：   ██████░░░░░░░░░░░░░░ 30%                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  模型性能：                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  准确率：     0.945                                  │   │
-│  │  延迟：       23ms（平均）                            │   │
-│  │  吞吐量：     42.3 req/s                            │   │
-│  │  错误率：     0.2%                                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**根本原因：**
+1. **指标不完整**：金丝雀评估集中在CTR上，但没有监控库存感知指标
+2. **验证期不足**：在5%流量下1天不足以检测供应链交互
+3. **回滚机制bug**：回滚机制在部署前没有进行端到端测试
+4. **没有带生产约束的离线验证**：离线评估没有考虑库存可用性
+
+**修复方案：**
+- 向金丝雀监控添加库存感知指标
+- 将金丝雀评估期延长到至少7天
+- 对回滚机制实施蓝绿部署而非流量分割
+- 添加预部署验证步骤，检查模型推荐是否与当前库存匹配
 
 ---
 
-## 总结
+## 8.8 边缘部署模式
 
-**关键要点：**
+### 何时需要边缘部署
 
-1. **部署策略**取决于风险承受能力、停机要求和流量分配需求
-2. **模型服务架构**应支持版本控制、A/B 测试和自动扩缩
-3. **A/B 测试**需要统计严谨性才能得出有效结论
-4. **模型版本管理**对于回滚和可复现性至关重要
-5. **推理优化**可以显著降低延迟和成本
-6. **边缘部署**需要仔细的模型优化和管理
+| 场景 | 延迟要求 | 网络 | 示例 |
+|------|---------|------|------|
+| 自动驾驶汽车 | < 10ms | 间歇性 | 自动驾驶 |
+| 工业物联网 | < 50ms | 有限 | 制造质量控制 |
+| 移动应用 | < 100ms | 可变 | 设备端图像识别 |
+| 偏远地区 | < 200ms | 卫星 | 农业监测 |
 
-**下一章预览：**
-在第 9 章中，我们将探讨**模型监控与可观测性**，涵盖漂移检测、性能监控以及构建全面的可观测性平台。
+### 边缘服务框架
+
+| 框架 | 模型格式 | 硬件支持 | 大小 |
+|------|---------|---------|------|
+| **TensorFlow Lite** | TFLite | 移动设备、Edge TPU | < 5MB运行时 |
+| **ONNX Runtime** | ONNX | CPU、GPU、NPU | < 10MB运行时 |
+| **TensorRT** | TRT | NVIDIA GPU | < 50MB运行时 |
+| **OpenVINO** | IR | Intel CPU、VPU | < 100MB运行时 |
+| **Core ML** | MLModel | Apple Neural Engine | 仅iOS/macOS |
+
+### 边缘模型优化
+
+| 技术 | 大小缩减 | 准确性影响 | 实现方式 |
+|------|---------|-----------|---------|
+| 量化（INT8） | 4倍 | 1-3%下降 | 训练后或量化感知训练 |
+| 剪枝 | 2-10倍 | 1-5%下降 | 结构化或非结构化 |
+| 知识蒸馏 | 可变 | 2-8%下降 | 教师-学生训练 |
+| 模型架构搜索 | 可变 | 可改善 | 硬件感知NAS |
 
 ---
 
-*第8章结束*
+## 8.9 何时使用/何时不使用
+
+### 何时使用每种模式
+
+| 模式 | 最适合 | 何时使用 |
+|------|--------|---------|
+| **在线服务** | 实时决策 | 需要<100毫秒延迟的用户面向应用 |
+| **批量服务** | 定时预测 | 每小时/每天更新的推荐、风险评分 |
+| **混合服务** | 复杂管道 | 推荐系统、带预计算特征的实时 |
+| **边缘服务** | 离线/低延迟 | 移动应用、物联网、自主系统 |
+| **A/B测试** | 模型比较 | 需要改善的统计证据时 |
+| **金丝雀部署** | 风险缓解 | 任何有业务影响的生产模型更新 |
+
+### 何时不使用
+
+| 模式 | 何时避免 | 原因 |
+|------|---------|------|
+| **在线服务** | 预测每天只需要一次 | 批量更具成本效益 |
+| **批量服务** | 实时用户交互 | 延迟太高 |
+| **A/B测试** | 模型是安全关键的（医疗） | 随机化实验的伦理问题 |
+| **金丝雀部署** | 模型必须即时部署 | 金丝雀需要数天/数周 |
+| **边缘服务** | 模型需要完整GPU | 边缘设备计算能力有限 |
+| **复杂服务** | 简单回归模型 | 过度工程化增加维护负担 |
+
+---
+
+## 8.10 总结
+
+模型部署架构是模型开发和业务影响之间的桥梁。关键模式是：
+
+1. **在线服务**用于有严格延迟要求的实时决策
+2. **批量服务**用于延迟不关键的定时预测
+3. **混合服务**用于需要实时和批量的复杂管道
+4. **金丝雀和A/B测试**用于安全、统计严谨的模型评估
+
+Seldon Core提供了一个生产级的服务平台，内置支持这些模式。来自Stripe的案例研究和战争故事表明，部署成功取决于全面的监控、自动化回滚和彻底的离线验证。
+
+---
+
+## 8.11 讨论题
+
+1. **服务架构**：你正在为支付处理器设计欺诈检测系统。模型必须在<50毫秒内评估每笔交易。设计服务架构，包括你会批量处理什么和在线服务什么。
+
+2. **A/B测试设计**：一个推荐模型在离线AUC-ROC上显示5%的改善。你将如何设计在线A/B测试来验证这种改善？你需要多少样本量？
+
+3. **金丝雀部署策略**：一个每天服务1000万次请求的模型需要更新。设计一个平衡风险缓解和部署速度的金丝雀部署计划。
+
+4. **边缘 vs. 云**：你正在为工厂车间的100个摄像头构建图像分类系统。每个摄像头需要<20毫秒的推理延迟。你应该在边缘设备上部署模型还是在云端？
+
+5. **回滚设计**：为一个服务10万QPS的模型设计一个回滚机制，可以在30秒内从新模型切换到旧模型。
+
+---
+
+## 8.12 练习
+
+### 练习1：服务架构设计
+
+为产品推荐系统设计完整的服务架构，要求：
+- 为5000万用户提供<100毫秒延迟的服务
+- 需要候选生成（批量）和排名（实时）
+- 必须处理模型更新而不中断服务
+- 预算：每月5万美元用于服务基础设施
+
+**任务：**
+1. 绘制架构图
+2. 选择服务技术（Seldon Core、KServe或云托管）
+3. 估计基础设施成本
+4. 设计模型更新流程
+
+### 练习2：A/B测试分析
+
+你运行了两周的A/B测试，结果如下：
+- 对照组（旧模型）：200,000次展示中10,000次转化（5.0%）
+- 处理组（新模型）：20,000次展示中1,080次转化（5.4%）
+
+**任务：**
+1. 计算统计显著性（p值）
+2. 计算差异的95%置信区间
+3. 确定测试是否有足够的统计功效
+4. 提出建议：部署还是继续测试？
+
+### 练习3：边缘部署优化
+
+你需要在边缘设备上部署ResNet-50模型用于图像分类。模型100MB，在CPU上每次推理需要50毫秒。
+
+**任务：**
+1. 应用量化以减少模型大小
+2. 为准确性和延迟基准测试量化模型
+3. 设计向边缘设备推送新模型版本的更新机制
+4. 估计1,000个边缘设备的存储和带宽需求
+
+---
+
+## 8.13 参考资料
+
+- **Seldon Core文档**：https://docs.seldon.io/projects/seldon-core/en/latest/
+- **KServe（原KFServing）**：https://kserve.github.io/website/
+- **Kubeflow Serving**：https://www.kubeflow.org/docs/components/kfserving/
+- **Stripe工程博客**：https://stripe.com/blog/engineering
+- **Google ML Serving**：https://cloud.google.com/ai-platform/prediction/docs
+- **NVIDIA Triton推理服务器**：https://developer.nvidia.com/nvidia-triton-inference-server
+- **TensorFlow Serving**：https://www.tensorflow.org/tfx/guide/serving
+- **ONNX Runtime**：https://onnxruntime.ai/
+- **Seldon案例研究**：https://www.seldon.io/case-studies
+- **Google金丝雀分析**：https://research.google/pubs/pub46388/
+- **ML A/B测试最佳实践**：https://research.google/pubs/pub45998/

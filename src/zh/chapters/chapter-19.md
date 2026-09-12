@@ -1,1554 +1,451 @@
 # 第19章：边缘部署架构
 
-🟢 入门 | 🟡 中级 | 🔴 高级 | ⚫ 管理者
+## 学习目标
+
+完成本章学习后，你将能够：
+
+1. 比较边缘推理框架并为目标硬件选择合适的框架
+2. 设计具有回滚和金丝雀部署能力的空中（OTA）模型更新系统
+3. 架构平衡新鲜度与带宽约束的边缘-云同步系统
+4. 为分布式边缘部署实施健康监控和漂移检测
+5. 设计处理边缘基础设施独特挑战的部署管道
 
 ---
 
-## 19.1 边缘推理框架
+## 19.1 引言：边缘部署不是云部署
 
-### 框架对比
+将AI模型部署到边缘设备与部署到云服务器有根本不同。边缘设备是异构的、通常离线的、资源受限的且物理分散的。为云设计的部署架构在边缘上会失败。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              边缘推理框架                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  框架               │ 硬件支持            │ 模型格式            │
-│  ─────────────────────────────────────────────────────────────  │
-│  ONNX Runtime       │ CPU, GPU, NPU      │ ONNX               │
-│  TensorRT           │ NVIDIA GPU         │ ONNX, Caffe, PT    │
-│  TFLite             │ CPU, GPU, Edge TPU │ TFLite, TF SavedM  │
-│  OpenVINO           │ Intel CPU, VPU     │ ONNX, IR           │
-│  CoreML             │ Apple Neural Eng.  │ CoreML, ONNX       │
-│  NCNN               │ ARM CPU            │ Caffe, ONNX        │
-│  MNN                │ ARM CPU, GPU       │ ONNX, TFLite       │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+**云 vs 边缘部署特征：**
 
-### 用于边缘的 ONNX Runtime
+| 特征 | 云 | 边缘 |
+|------|---|------|
+| 硬件 | 同构（相同GPU类型） | 异构（ARM、x86、NPU、GPU） |
+| 连接性 | 始终在线，高带宽 | 间歇性，低带宽 |
+| 更新机制 | 滚动部署、蓝绿部署 | OTA带回滚、金丝雀 |
+| 监控 | 完整遥测，实时 | 间歇遥测，批处理 |
+| 故障模式 | 冗余，自动修复 | 设备特定，手动恢复 |
+| 规模 | 10-1000台服务器 | 10,000-1,000,000台设备 |
+| 物理访问 | 数据中心 | 远程，通常无法访问 |
 
-```python
-# ONNX Runtime 边缘推理
-import onnxruntime as ort
-import numpy as np
-import cv2
-
-class EdgeInferenceEngine:
-    def __init__(self, model_path, providers=['CPUExecutionProvider']):
-        """初始化 ONNX Runtime 推理引擎。"""
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
-        sess_options.intra_op_num_threads = 4
-        sess_options.inter_op_num_threads = 2
-        
-        self.session = ort.InferenceSession(
-            model_path,
-            sess_options,
-            providers=providers
-        )
-        
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-    
-    def preprocess(self, image, input_size=(224, 224)):
-        """预处理图像用于推理。"""
-        # 调整大小
-        img = cv2.resize(image, input_size)
-        
-        # BGR 转 RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # 归一化
-        img = img.astype(np.float32) / 255.0
-        img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-        
-        # 转置为 CHW
-        img = img.transpose(2, 0, 1)
-        
-        # 添加批次维度
-        img = np.expand_dims(img, axis=0)
-        
-        return img
-    
-    def inference(self, input_data):
-        """运行推理。"""
-        outputs = self.session.run(
-            [self.output_name],
-            {self.input_name: input_data}
-        )
-        return outputs[0]
-    
-    def postprocess(self, output, top_k=5):
-        """后处理输出。"""
-        # 应用 softmax
-        exp_output = np.exp(output - np.max(output))
-        probabilities = exp_output / exp_output.sum()
-        
-        # 获取 top-k 预测
-        top_k_indices = np.argsort(probabilities[0])[-top_k:][::-1]
-        top_k_probs = probabilities[0][top_k_indices]
-        
-        return list(zip(top_k_indices.tolist(), top_k_probs.tolist()))
-    
-    def predict(self, image):
-        """完整预测管道。"""
-        input_data = self.preprocess(image)
-        output = self.inference(input_data)
-        predictions = self.postprocess(output)
-        return predictions
-
-# 使用示例
-engine = EdgeInferenceEngine(
-    model_path='resnet50_quantized.onnx',
-    providers=['CPUExecutionProvider']
-)
-
-# 加载并预测
-image = cv2.imread('test_image.jpg')
-predictions = engine.predict(image)
-
-for class_id, prob in predictions:
-    print(f"类别 {class_id}: {prob:.4f}")
-```
-
-### TensorRT 优化
-
-```python
-# 用于边缘的 TensorRT 优化
-import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
-import numpy as np
-
-class TensorRTInference:
-    def __init__(self, engine_path):
-        """初始化 TensorRT 推理引擎。"""
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        
-        # 加载引擎
-        with open(engine_path, 'rb') as f:
-            runtime = trt.Runtime(self.logger)
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        
-        self.context = self.engine.create_execution_context()
-        
-        # 分配内存
-        self._allocate_buffers()
-    
-    def _allocate_buffers(self):
-        """为输入/输出分配 GPU 内存。"""
-        self.inputs = []
-        self.outputs = []
-        self.bindings = []
-        
-        for i in range(self.engine.num_bindings):
-            binding_shape = self.engine.get_binding_shape(i)
-            binding_dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            
-            size = trt.volume(binding_shape)
-            host_mem = cuda.pagelocked_empty(size, binding_dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
-            self.bindings.append(int(device_mem))
-            
-            if self.engine.binding_is_input(i):
-                self.inputs.append({'host': host_mem, 'device': device_mem})
-            else:
-                self.outputs.append({'host': host_mem, 'device': device_mem})
-    
-    def infer(self, input_data):
-        """运行 TensorRT 推理。"""
-        # 将输入复制到主机内存
-        np.copyto(self.inputs[0]['host'], input_data.ravel())
-        
-        # 传输输入到 GPU
-        cuda.memcpy_htod(
-            self.inputs[0]['device'],
-            self.inputs[0]['host']
-        )
-        
-        # 运行推理
-        self.context.execute_v2(bindings=self.bindings)
-        
-        # 传回输出到主机
-        cuda.memcpy_dtoh(
-            self.outputs[0]['host'],
-            self.outputs[0]['device']
-        )
-        
-        return self.outputs[0]['host'].reshape(self.engine.get_binding_shape(1))
-
-def build_tensorrt_engine(onnx_path, engine_path, fp16=True, max_batch_size=8):
-    """从 ONNX 构建 TensorRT 引擎。"""
-    logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    )
-    parser = trt.OnnxParser(network, logger)
-    
-    # 解析 ONNX 模型
-    with open(onnx_path, 'rb') as f:
-        if not parser.parse(f.read()):
-            for error in range(parser.num_errors):
-                print(parser.get_error(error))
-            return None
-    
-    # 配置构建器
-    config = builder.create_builder_config()
-    config.max_workspace_size = 1 << 30  # 1GB
-    
-    if fp16 and builder.platform_has_fast_fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
-    
-    # 设置优化配置文件
-    profile = builder.create_optimization_profile()
-    profile.set_shape(
-        'input',
-        min=(1, 3, 224, 224),
-        opt=(max_batch_size // 2, 3, 224, 224),
-        max=(max_batch_size, 3, 224, 224)
-    )
-    config.add_optimization_profile(profile)
-    
-    # 构建引擎
-    engine = builder.build_engine(network, config)
-    
-    # 保存引擎
-    with open(engine_path, 'wb') as f:
-        f.write(engine.serialize())
-    
-    return engine
-```
+> **📌 真实数据框**
+> BMW在**全球30多家工厂**的边缘设备上部署AI模型用于质量检测，使用混合边缘-云架构，每个工厂每天处理**超过50万张图像**（bmw.com）。西门子的MindSphere平台连接了**超过30万台边缘设备**跨工业设施用于实时AI推理（siemens.com）。NVIDIA Jetson平台在全球部署了**超过100万台边缘AI设备**，覆盖机器人、医疗保健和智慧城市（nvidia.com）。
 
 ---
 
-## 19.2 模型更新策略
+## 19.2 边缘推理框架
 
-### 更新架构
+### 19.2.1 框架比较
+
+| 框架 | 硬件支持 | 模型格式 | 延迟（ResNet-50，INT8） | 最适合 |
+|------|---------|---------|----------------------|--------|
+| **TensorRT** | NVIDIA GPU | TRT引擎 | 0.6ms（Jetson Orin） | NVIDIA硬件 |
+| **ONNX Runtime** | CPU、CUDA、DirectML、OpenVINO | ONNX | 1.2ms（CPU），0.8ms（CUDA） | 跨平台 |
+| **OpenVINO** | Intel CPU、VPU、GPU | IR格式 | 2.1ms（CPU），1.8ms（VPU） | Intel硬件 |
+| **TensorFlow Lite** | CPU、GPU、Edge TPU | TFLite | 3.2ms（CPU），1.1ms（Edge TPU） | 移动/Edge TPU |
+| **PyTorch Mobile** | CPU、GPU | TorchScript | 4.1ms（CPU） | PyTorch生态系统 |
+| **NCNN** | ARM CPU | NCNN格式 | 2.8ms（ARM） | 移动ARM设备 |
+| **MNN** | ARM CPU、GPU | MNN格式 | 2.5ms（ARM） | 阿里巴巴生态系统 |
+
+### 19.2.2 框架选择决策树
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              模型更新架构                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  云端（中心）                            │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  模型    │  │  更新    │  │  版本    │  │推送  │  │   │
-│  │  │ 注册表   │  │  管理器  │  │  控制    │  │服务  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │   更新通道        │                      │
-│                    │   (OTA/CDN)       │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  边缘设备群                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  边缘    │  │  边缘    │  │  边缘    │  │边缘  │  │   │
-│  │  │ 设备 1   │  │ 设备 2   │  │ 设备 3   │  │设备N │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+目标硬件是NVIDIA GPU吗？
+├── 是 → TensorRT（最佳性能）
+│         └── 需要跨平台？→ 带TensorRT EP的ONNX Runtime
+└── 否 → 目标是Intel硬件吗？
+         ├── 是 → OpenVINO
+         └── 否 → 目标是移动/Edge TPU吗？
+                  ├── 是 → TensorFlow Lite
+                  └── 否 → ONNX Runtime（最可移植）
 ```
 
-### OTA 更新实现
+### 19.2.3 TensorRT优化管道
 
-```python
-# OTA 模型更新系统
-import requests
-import hashlib
-import json
-import time
-from pathlib import Path
+TensorRT应用多个优化通道：
 
-class EdgeOTAUpdater:
-    def __init__(self, device_id, registry_url, local_model_dir):
-        self.device_id = device_id
-        self.registry_url = registry_url
-        self.local_model_dir = Path(local_model_dir)
-        self.local_model_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 设备状态
-        self.current_model_version = self._get_current_version()
-        self.last_update_check = 0
-        self.update_interval = 3600  # 每小时检查一次
-    
-    def _get_current_version(self):
-        """获取当前模型版本。"""
-        version_file = self.local_model_dir / 'version.json'
-        if version_file.exists():
-            with open(version_file, 'r') as f:
-                return json.load(f)
-        return {'version': '0.0.0', 'hash': None}
-    
-    def _save_version(self, version_info):
-        """保存版本信息。"""
-        version_file = self.local_model_dir / 'version.json'
-        with open(version_file, 'w') as f:
-            json.dump(version_info, f)
-    
-    def check_for_updates(self):
-        """检查是否有更新可用。"""
-        if time.time() - self.last_update_check < self.update_interval:
-            return None
-        
-        self.last_update_check = time.time()
-        
-        try:
-            response = requests.get(
-                f"{self.registry_url}/api/models/device/{self.device_id}",
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            latest = response.json()
-            
-            if latest['version'] != self.current_model_version['version']:
-                return latest
-            
-            return None
-            
-        except Exception as e:
-            print(f"检查更新时出错：{e}")
-            return None
-    
-    def download_model(self, model_url, expected_hash):
-        """带完整性检查的模型下载。"""
-        temp_path = self.local_model_dir / 'model_new.onnx'
-        
-        try:
-            # 下载
-            response = requests.get(model_url, stream=True, timeout=300)
-            response.raise_for_status()
-            
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            # 验证哈希
-            actual_hash = self._compute_hash(temp_path)
-            if actual_hash != expected_hash:
-                raise ValueError(f"哈希不匹配：{actual_hash} != {expected_hash}")
-            
-            return temp_path
-            
-        except Exception as e:
-            # 失败时清理
-            if temp_path.exists():
-                temp_path.unlink()
-            raise e
-    
-    def _compute_hash(self, file_path):
-        """计算文件的 SHA-256 哈希。"""
-        sha256 = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b''):
-                sha256.update(chunk)
-        return sha256.hexdigest()
-    
-    def apply_update(self, new_model_path, version_info):
-        """应用模型更新（支持回滚）。"""
-        backup_dir = self.local_model_dir / 'backup'
-        backup_dir.mkdir(exist_ok=True)
-        
-        # 备份当前模型
-        current_model = self.local_model_dir / 'model.onnx'
-        if current_model.exists():
-            backup_model = backup_dir / f'model_{self.current_model_version["version"]}.onnx'
-            if backup_model.exists():
-                backup_model.unlink()
-            current_model.rename(backup_model)
-        
-        # 应用新模型
-        new_model = self.local_model_dir / 'model.onnx'
-        new_model_path.rename(new_model)
-        
-        # 更新版本
-        self._save_version(version_info)
-        self.current_model_version = version_info
-        
-        print(f"模型已更新至版本 {version_info['version']}")
-    
-    def rollback(self):
-        """回滚到之前的模型版本。"""
-        backup_dir = self.local_model_dir / 'backup'
-        
-        # 找到最新备份
-        backups = sorted(backup_dir.glob('model_*.onnx'))
-        if not backups:
-            raise ValueError("没有可用于回滚的备份")
-        
-        latest_backup = backups[-1]
-        
-        # 恢复
-        current_model = self.local_model_dir / 'model.onnx'
-        if current_model.exists():
-            current_model.unlink()
-        
-        latest_backup.rename(current_model)
-        
-        # 更新版本
-        version = latest_backup.stem.replace('model_', '')
-        self._save_version({'version': version, 'hash': None})
-        
-        print(f"已回滚至版本 {version}")
-    
-    def update_loop(self):
-        """主更新循环。"""
-        while True:
-            update = self.check_for_updates()
-            
-            if update:
-                print(f"有可用更新：{update['version']}")
-                
-                try:
-                    # 下载新模型
-                    temp_path = self.download_model(
-                        update['download_url'],
-                        update['hash']
-                    )
-                    
-                    # 应用更新
-                    self.apply_update(temp_path, update)
-                    
-                except Exception as e:
-                    print(f"更新失败：{e}")
-                    # 继续使用当前模型
-            
-            time.sleep(60)  # 每分钟检查一次
-```
+1. **层融合：** 将卷积 + 偏置 + 激活合并为单个内核
+2. **内核自动调优：** 分析每个层的多个CUDA内核，为特定GPU选择最快的
+3. **精度校准：** 确定每层的最优精度（FP16、INT8或混合）
+4. **动态张量内存：** 通过重用缓冲区最小化内存占用
+5. **多流执行：** 重叠计算和内存操作
+
+**TensorRT优化结果（Jetson Orin Nano，批次大小1）：**
+
+| 模型 | PyTorch FP32 | TensorRT FP16 | TensorRT INT8 | 加速 |
+|------|-------------|---------------|---------------|------|
+| ResNet-50 | 12.3ms | 3.1ms | 1.2ms | 10.3倍 |
+| YOLOv5-S | 28.5ms | 8.2ms | 4.1ms | 7.0倍 |
+| BERT-base | 18.7ms | 6.3ms | 3.8ms | 4.9倍 |
 
 ---
 
-## 19.3 边缘集群管理
+## 19.3 空中（OTA）模型更新模式
 
-### 边缘的 Kubernetes（K3s/kubeedge）
+### 19.3.1 OTA更新架构
 
-```yaml
-# K3s 边缘集群配置
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: edge-ai
-  labels:
-    edge-cluster: "true"
----
-# 边缘设备群
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: edge-agent
-  namespace: edge-ai
-spec:
-  selector:
-    matchLabels:
-      app: edge-agent
-  template:
-    metadata:
-      labels:
-        app: edge-agent
-    spec:
-      containers:
-      - name: agent
-        image: edge-agent:latest
-        env:
-        - name: CLOUD_ENDPOINT
-          value: "https://cloud-gateway.company.com"
-        - name: DEVICE_GROUP
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.labels['device-group']
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        volumeMounts:
-        - name: model-storage
-          mountPath: /models
-        - name: config
-          mountPath: /config
-      volumes:
-      - name: model-storage
-        hostPath:
-          path: /var/lib/edge-models
-          type: DirectoryOrCreate
-      - name: config
-        configMap:
-          name: edge-config
-      nodeSelector:
-        node-type: edge
-      tolerations:
-      - key: "edge-node"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
----
-# 边缘推理部署
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: inference-service
-  namespace: edge-ai
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: inference-service
-  template:
-    metadata:
-      labels:
-        app: inference-service
-    spec:
-      containers:
-      - name: inference
-        image: edge-inference:latest
-        ports:
-        - containerPort: 8080
-        resources:
-          requests:
-            nvidia.com/gpu: "1"
-            memory: "4Gi"
-            cpu: "2"
-          limits:
-            nvidia.com/gpu: "1"
-            memory: "8Gi"
-            cpu: "4"
-        env:
-        - name: MODEL_PATH
-          value: "/models/current"
-        - name: MAX_BATCH_SIZE
-          value: "8"
-        - name: INFERENCE_TIMEOUT
-          value: "100"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /ready
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
+```
+┌─────────────────────────────────────────────┐
+│                云控制平面                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ 模型     │  │ 更新     │  │ 回滚     │  │
+│  │ 注册表   │  │ 调度器   │  │ 管理器   │  │
+│  └──────────┘  └──────────┘  └──────────┘  │
+└────────────────────┬────────────────────────┘
+                     │ HTTPS/mTLS
+┌────────────────────┴────────────────────────┐
+│              边缘设备车队                     │
+│  ┌────────┐  ┌────────┐  ┌────────┐       │
+│  │设备A   │  │设备B   │  │设备C   │  ...   │
+│  │ 代理   │  │ 代理   │  │ 代理   │       │
+│  └────────┘  └────────┘  └────────┘       │
+└─────────────────────────────────────────────┘
 ```
 
-### 边缘设备群管理
+### 19.3.2 更新策略
 
-```python
-# 边缘设备群管理系统
-import asyncio
-import aiohttp
-from datetime import datetime, timedelta
-from typing import Dict, List
-from dataclasses import dataclass
-from enum import Enum
+**策略1：完整模型替换**
 
-class DeviceStatus(Enum):
-    ONLINE = "online"
-    OFFLINE = "offline"
-    UPDATING = "updating"
-    ERROR = "error"
+- 将完整新模型下载到设备
+- 原子交换模型指针
+- 简单但带宽密集
 
-@dataclass
-class EdgeDevice:
-    device_id: str
-    location: str
-    status: DeviceStatus
-    current_model_version: str
-    last_heartbeat: datetime
-    resource_usage: Dict[str, float]
+**最适合：** 小模型（< 50MB）、不频繁更新、高带宽连接。
 
-class EdgeFleetManager:
-    def __init__(self, cloud_endpoint: str):
-        self.cloud_endpoint = cloud_endpoint
-        self.devices: Dict[str, EdgeDevice] = {}
-        self.update_schedule: Dict[str, datetime] = {}
-    
-    async def register_device(self, device_info: Dict):
-        """注册新的边缘设备。"""
-        device = EdgeDevice(
-            device_id=device_info['device_id'],
-            location=device_info['location'],
-            status=DeviceStatus.ONLINE,
-            current_model_version=device_info['model_version'],
-            last_heartbeat=datetime.now(),
-            resource_usage=device_info.get('resource_usage', {})
-        )
-        
-        self.devices[device.device_id] = device
-        
-        # 通知云端
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.cloud_endpoint}/api/devices/register",
-                json=device_info
-            ) as response:
-                return await response.json()
-    
-    async def heartbeat(self, device_id: str, status: Dict):
-        """接收边缘设备的心跳。"""
-        if device_id in self.devices:
-            self.devices[device_id].last_heartbeat = datetime.now()
-            self.devices[device_id].status = DeviceStatus.ONLINE
-            self.devices[device_id].resource_usage = status.get('resource_usage', {})
-    
-    async def check_device_health(self):
-        """检查所有设备的健康状况。"""
-        now = datetime.now()
-        unhealthy_devices = []
-        
-        for device_id, device in self.devices.items():
-            # 检查心跳是否过期
-            if (now - device.last_heartbeat) > timedelta(minutes=5):
-                device.status = DeviceStatus.OFFLINE
-                unhealthy_devices.append(device_id)
-            
-            # 检查资源使用
-            if device.resource_usage.get('gpu_memory', 0) > 90:
-                unhealthy_devices.append(device_id)
-        
-        return unhealthy_devices
-    
-    async def orchestrate_update(self, model_version: str, 
-                                  strategy: str = 'rolling'):
-        """在整个设备群中协调模型更新。"""
-        devices = list(self.devices.keys())
-        
-        if strategy == 'rolling':
-            # 每次更新 10%
-            batch_size = max(1, len(devices) // 10)
-            
-            for i in range(0, len(devices), batch_size):
-                batch = devices[i:i + batch_size]
-                
-                # 更新批次
-                await self._update_batch(batch, model_version)
-                
-                # 等待批次完成
-                await asyncio.sleep(60)
-                
-                # 检查健康状况
-                unhealthy = await self.check_device_health()
-                if unhealthy:
-                    print(f"更新期间的不健康设备：{unhealthy}")
-                    # 如果失败过多则回滚
-                    if len(unhealthy) > batch_size * 0.5:
-                        await self._rollback_batch(batch)
-                        break
-        
-        elif strategy == 'canary':
-            # 首先更新 1 台设备
-            canary_device = devices[0]
-            await self._update_batch([canary_device], model_version)
-            
-            # 等待并检查
-            await asyncio.sleep(300)
-            
-            if canary_device not in await self.check_device_health():
-                # 继续更新其余设备
-                await self._update_batch(devices[1:], model_version)
-            else:
-                print("金丝雀更新失败，中止")
-                await self._rollback_batch([canary_device])
-    
-    async def _update_batch(self, device_ids: List[str], model_version: str):
-        """更新一批设备。"""
-        for device_id in device_ids:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.cloud_endpoint}/api/devices/{device_id}/update",
-                        json={'model_version': model_version}
-                    ) as response:
-                        if response.status == 200:
-                            self.devices[device_id].status = DeviceStatus.UPDATING
-                        else:
-                            print(f"更新 {device_id} 失败")
-            except Exception as e:
-                print(f"更新 {device_id} 时出错：{e}")
-    
-    async def _rollback_batch(self, device_ids: List[str]):
-        """回滚一批设备。"""
-        for device_id in device_ids:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.cloud_endpoint}/api/devices/{device_id}/rollback"
-                    ) as response:
-                        if response.status == 200:
-                            print(f"已回滚 {device_id}")
-            except Exception as e:
-                print(f"回滚 {device_id} 时出错：{e}")
-    
-    def get_fleet_status(self) -> Dict:
-        """获取设备群整体状态。"""
-        status_counts = {
-            'total': len(self.devices),
-            'online': sum(1 for d in self.devices.values() 
-                         if d.status == DeviceStatus.ONLINE),
-            'offline': sum(1 for d in self.devices.values() 
-                          if d.status == DeviceStatus.OFFLINE),
-            'updating': sum(1 for d in self.devices.values() 
-                           if d.status == DeviceStatus.UPDATING),
-            'error': sum(1 for d in self.devices.values() 
-                        if d.status == DeviceStatus.ERROR)
-        }
-        
-        return status_counts
+**策略2：增量/差异更新**
+
+- 计算新旧模型之间的二进制差异
+- 仅传输差异
+- 带宽减少80-95%
+
+**最适合：** 大模型、频繁更新、低带宽连接。
+
+**策略3：仅权重更新**
+
+- 模型架构保持不变，仅权重更改
+- 仅传输权重文件（跳过架构）
+- 与完整模型相比减少更新大小10-30%
+
+**最适合：** 相同架构的重新训练、在线学习场景。
+
+**策略4：分层更新**
+
+- 将模型分割为层/块
+- 优先处理关键层立即更新
+- 后台下载剩余层
+
+**最适合：** 超大模型、存储有限的设备、渐进增强。
+
+### 19.3.3 边缘金丝雀部署
+
 ```
+阶段1：部署到1%的设备
+         ┌─────────┐
+         │ 1%车队  │ → 监控24-48小时
+         └─────────┘
+         
+阶段2：如果指标正常，部署到10%
+         ┌──────────┐
+         │ 10%车队  │ → 监控24-48小时
+         └──────────┘
+         
+阶段3：如果指标正常，部署到50%
+         ┌──────────┐
+         │ 50%车队  │ → 监控24-48小时
+         └──────────┘
+         
+阶段4：全面推出
+         ┌───────────┐
+         │ 100%车队  │
+         └───────────┘
+         
+如果任何阶段显示退化 → 自动回滚
+```
+
+### 19.3.4 回滚机制
+
+| 机制 | 描述 | 恢复时间 |
+|------|------|---------|
+| **模型版本控制** | 在设备上保留前一模型，切换指针 | < 1秒 |
+| **A/B分区** | 两个模型槽，交换活动分区 | < 1秒 |
+| **云回滚** | 向所有设备推送前一版本 | 5-30分钟 |
+| **出厂重置** | 擦除设备，从头重新初始化 | 10-60分钟 |
+| **物理干预** | 手动设备恢复 | 数小时到数天 |
+
+**推荐方法：** 始终在每个设备上维护至少2个模型版本。活动模型可以即时切换，前一版本可用于即时回滚，无需网络访问。
 
 ---
 
-## 19.4 离线推理架构
+## 19.4 边缘-云同步架构
 
-### 离线模式设计
+### 19.4.1 同步模式
 
+**模式1：基于推送的更新**
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              离线推理架构                                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  在线模式                                 │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  输入    │  │  推理    │  │  输出    │  │云端  │  │   │
-│  │  │  流      │→ │  引擎    │→ │  流      │→ │同步  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │   网络状态        │                      │
-│                    │   检测            │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  离线模式                                 │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  输入    │  │  推理    │  │  本地    │  │队列  │  │   │
-│  │  │  流      │→ │  引擎    │→ │  存储    │  │管理器│  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  关键特性：                                                     │
-│  • 本地模型缓存                                                │
-│  • 结果排队等待同步                                             │
-│  • 优雅降级                                                    │
-│  • 连接恢复时自动同步                                           │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+云推送新模型 → 设备代理接收 → 应用更新 → 报告状态
 ```
+用于：模型更新、配置更改、固件补丁。
 
-### 实现
-
-```python
-# 离线推理管理器
-import asyncio
-import json
-import sqlite3
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, Dict, Any
-import aiohttp
-
-class OfflineInferenceManager:
-    def __init__(self, model_path: str, sync_endpoint: str, 
-                 local_db_path: str = '/data/offline_queue.db'):
-        self.model_path = model_path
-        self.sync_endpoint = sync_endpoint
-        self.local_db_path = local_db_path
-        
-        # 初始化本地数据库
-        self._init_db()
-        
-        # 网络状态
-        self.is_online = True
-        self.sync_interval = 300  # 5 分钟
-        self.max_queue_size = 10000
-        
-        # 加载模型
-        self.model = self._load_model()
-    
-    def _init_db(self):
-        """初始化本地 SQLite 数据库。"""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS inference_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input_data TEXT NOT NULL,
-                output_data TEXT,
-                timestamp TEXT NOT NULL,
-                synced BOOLEAN DEFAULT FALSE,
-                model_version TEXT
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def _load_model(self):
-        """从本地存储加载模型。"""
-        import onnxruntime as ort
-        
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
-        
-        return ort.InferenceSession(
-            self.model_path,
-            sess_options,
-            providers=['CPUExecutionProvider']
-        )
-    
-    async def check_connectivity(self) -> bool:
-        """检查云端是否可达。"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.sync_endpoint}/health",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    return response.status == 200
-        except:
-            return False
-    
-    async def inference(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """运行带离线支持的推理。"""
-        # 本地运行推理
-        output = self._run_inference(input_data)
-        
-        # 如果离线则存储在队列中
-        if not self.is_online:
-            self._queue_result(input_data, output)
-        
-        # 如果在线则尝试同步
-        if self.is_online:
-            await self._try_sync()
-        
-        return output
-    
-    def _run_inference(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """运行本地推理。"""
-        import numpy as np
-        
-        # 预处理输入
-        input_tensor = self._preprocess(input_data)
-        
-        # 运行推理
-        input_name = self.model.get_inputs()[0].name
-        output = self.model.run(None, {input_name: input_tensor})[0]
-        
-        # 后处理输出
-        result = self._postprocess(output)
-        
-        return result
-    
-    def _preprocess(self, input_data: Dict[str, Any]) -> np.ndarray:
-        """预处理输入数据。"""
-        # 示例：图像预处理
-        if 'image' in input_data:
-            import cv2
-            img = cv2.imdecode(
-                np.frombuffer(input_data['image'], np.uint8),
-                cv2.IMREAD_COLOR
-            )
-            img = cv2.resize(img, (224, 224))
-            img = img.astype(np.float32) / 255.0
-            img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-            img = img.transpose(2, 0, 1)
-            return np.expand_dims(img, axis=0)
-        
-        return input_data.get('tensor', np.array([]))
-    
-    def _postprocess(self, output: np.ndarray) -> Dict[str, Any]:
-        """后处理推理输出。"""
-        # 应用 softmax
-        exp_output = np.exp(output - np.max(output))
-        probabilities = exp_output / exp_output.sum()
-        
-        return {
-            'predictions': probabilities.tolist(),
-            'timestamp': datetime.now().isoformat(),
-            'model_version': self._get_model_version()
-        }
-    
-    def _get_model_version(self) -> str:
-        """获取当前模型版本。"""
-        version_file = Path(self.model_path).parent / 'version.json'
-        if version_file.exists():
-            with open(version_file, 'r') as f:
-                return json.load(f).get('version', 'unknown')
-        return 'unknown'
-    
-    def _queue_result(self, input_data: Dict, output: Dict):
-        """将结果排队等待后续同步。"""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        # 检查队列大小
-        cursor.execute('SELECT COUNT(*) FROM inference_queue WHERE synced = FALSE')
-        queue_size = cursor.fetchone()[0]
-        
-        if queue_size >= self.max_queue_size:
-            # 删除最旧的未同步结果
-            cursor.execute('''
-                DELETE FROM inference_queue 
-                WHERE synced = FALSE 
-                AND id IN (
-                    SELECT id FROM inference_queue 
-                    WHERE synced = FALSE 
-                    ORDER BY timestamp ASC 
-                    LIMIT 1000
-                )
-            ''')
-        
-        # 插入新结果
-        cursor.execute('''
-            INSERT INTO inference_queue (input_data, output_data, timestamp, model_version)
-            VALUES (?, ?, ?, ?)
-        ''', (
-            json.dumps(input_data),
-            json.dumps(output),
-            datetime.now().isoformat(),
-            self._get_model_version()
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    async def _try_sync(self):
-        """尝试将排队结果同步到云端。"""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        # 获取未同步的结果
-        cursor.execute('''
-            SELECT id, input_data, output_data, timestamp, model_version
-            FROM inference_queue
-            WHERE synced = FALSE
-            ORDER BY timestamp ASC
-            LIMIT 100
-        ''')
-        
-        results = cursor.fetchall()
-        
-        if not results:
-            conn.close()
-            return
-        
-        # 同步到云端
-        try:
-            async with aiohttp.ClientSession() as session:
-                for row in results:
-                    record_id, input_data, output_data, timestamp, model_version = row
-                    
-                    await session.post(
-                        f"{self.sync_endpoint}/api/inference/results",
-                        json={
-                            'input': json.loads(input_data),
-                            'output': json.loads(output_data),
-                            'timestamp': timestamp,
-                            'model_version': model_version
-                        }
-                    )
-                    
-                    # 标记为已同步
-                    cursor.execute(
-                        'UPDATE inference_queue SET synced = TRUE WHERE id = ?',
-                        (record_id,)
-                    )
-            
-            conn.commit()
-            
-        except Exception as e:
-            print(f"同步失败：{e}")
-        
-        finally:
-            conn.close()
-    
-    async def sync_loop(self):
-        """后台同步循环。"""
-        while True:
-            # 检查连接
-            self.is_online = await self.check_connectivity()
-            
-            if self.is_online:
-                await self._try_sync()
-            
-            await asyncio.sleep(self.sync_interval)
-    
-    def get_queue_status(self) -> Dict:
-        """获取队列状态。"""
-        conn = sqlite3.connect(self.local_db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT COUNT(*) FROM inference_queue WHERE synced = FALSE')
-        unsynced = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM inference_queue WHERE synced = TRUE')
-        synced = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        return {
-            'unsynced': unsynced,
-            'synced': synced,
-            'total': unsynced + synced,
-            'is_online': self.is_online
-        }
+**模式2：基于拉取的轮询**
 ```
+设备轮询云 → 检查更新 → 如果可用则下载 → 报告状态
+```
+用于：定期同步、防火墙后的设备、带宽受限环境。
+
+**模式3：混合（事件触发推送 + 定期拉取）**
+```
+云发送推送通知 → 设备在下一个连接窗口拉取更新
+```
+最适合：间歇性连接，平衡新鲜度与带宽。
+
+### 19.4.2 数据同步
+
+**上行（设备 → 云）：**
+
+| 数据类型 | 频率 | 带宽 | 优先级 |
+|---------|------|------|--------|
+| 模型健康指标 | 每5-15分钟 | 低（~1KB） | 高 |
+| 推理统计 | 每15-60分钟 | 低（~10KB） | 中 |
+| 漂移检测警报 | 事件驱动 | 低（~1KB） | 高 |
+| 示例预测（用于重训练） | 每日批处理 | 中（~100MB） | 中 |
+| 原始传感器数据 | 极少/永不 | 极高 | 低 |
+
+**下行（云 → 设备）：**
+
+| 数据类型 | 频率 | 大小 | 优先级 |
+|---------|------|------|--------|
+| 模型更新 | 每周/每月 | 5-500MB | 高 |
+| 配置更新 | 按需 | < 1MB | 中 |
+| 安全补丁 | 按需 | 1-50MB | 关键 |
+
+### 19.4.3 冲突解决
+
+当边缘设备离线运行后同步时，可能出现冲突：
+
+| 冲突类型 | 解决策略 |
+|---------|---------|
+| 配置在设备和云上都更改 | 云赢（集中治理） |
+| 模型版本不匹配 | 设备保持当前版本直到下一次更新 |
+| 数据不一致 | 使用时间戳合并（最新者胜） |
+| 资源分配冲突 | 云权限覆盖设备 |
 
 ---
 
-## 19.5 边缘-云协同架构
+## 19.5 案例研究：BMW如何使用边缘AI进行质量检测
 
-### 架构概览
+BMW在其全球制造网络中部署边缘AI，用于生产线上的实时质量检测。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              边缘-云协同架构                                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   云层                                   │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  模型    │  │  训练    │  │  设备群  │  │数据  │  │   │
-│  │  │ 注册表   │  │  服务    │  │  管理器  │  │湖    │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                    ┌─────────┴─────────┐                      │
-│                    │  通信层            │                      │
-│                    │  (MQTT/gRPC/HTTP) │                      │
-│                    └─────────┬─────────┘                      │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   边缘层                                 │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  边缘    │  │  本地    │  │  推理    │  │数据  │  │   │
-│  │  │ 代理     │  │  缓存    │  │  引擎    │  │过滤  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   设备层                                 │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  │   │
-│  │  │  传感器  │  │  摄像头  │  │  执行器  │  │用户  │  │   │
-│  │  │  阵列    │  │  视频流  │  │  控制    │  │输入  │  │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └──────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+**架构：**
 
-### 通信协议
+| 层 | 技术 | 用途 |
+|----|------|------|
+| **边缘设备** | NVIDIA Jetson AGX Xavier（32 TOPS） | 生产线上实时图像推理 |
+| **边缘服务器** | NVIDIA DGX工作站 | 聚合多个摄像头结果，运行更大模型 |
+| **工厂云** | 本地Kubernetes集群 | 模型管理、数据聚合、仪表板 |
+| **全球云** | BMW云基础设施 | 跨工厂分析、模型重训练、车队管理 |
 
-```python
-# 边缘-云通信协议
-import asyncio
-import json
-from datetime import datetime
-from typing import Dict, Any
-from enum import Enum
+**检测工作流：**
 
-class MessageType(Enum):
-    HEARTBEAT = "heartbeat"
-    MODEL_UPDATE = "model_update"
-    INFERENCE_RESULT = "inference_result"
-    TRAINING_DATA = "training_data"
-    CONFIG_UPDATE = "config_update"
-    ALERT = "alert"
+1. **图像捕获：** 高分辨率摄像头（2000万像素）以每秒30帧捕获每个车辆组件的图像
+2. **边缘推理（设备）：** Jetson设备运行YOLOv8进行缺陷检测，延迟<20ms
+3. **边缘聚合（服务器）：** DGX工作站关联每个工位8-16个摄像头的结果，对模糊情况运行更大模型
+4. **工厂仪表板：** 实时质量指标显示在工厂floor监视器上
+5. **云重训练：** 缺陷样本每周发送到云进行模型重训练
+6. **OTA更新：** 重训练模型全球推送到所有工厂
 
-class EdgeCloudProtocol:
-    def __init__(self, device_id: str, cloud_endpoint: str):
-        self.device_id = device_id
-        self.cloud_endpoint = cloud_endpoint
-        self.message_queue = asyncio.Queue()
-        self.is_connected = False
-        
-    async def connect(self):
-        """建立与云端的连接。"""
-        # 实现取决于协议（MQTT、gRPC 等）
-        self.is_connected = True
-        
-    async def send_message(self, msg_type: MessageType, payload: Dict[str, Any]):
-        """向云端发送消息。"""
-        message = {
-            'device_id': self.device_id,
-            'message_type': msg_type.value,
-            'timestamp': datetime.now().isoformat(),
-            'payload': payload
-        }
-        
-        if self.is_connected:
-            # 直接发送
-            await self._send_to_cloud(message)
-        else:
-            # 排队等待后续发送
-            await self.message_queue.put(message)
-    
-    async def receive_messages(self):
-        """从云端接收消息。"""
-        # 实现取决于协议
-        pass
-    
-    async def _send_to_cloud(self, message: Dict):
-        """内部发送实现。"""
-        import aiohttp
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.cloud_endpoint}/api/messages",
-                json=message
-            ) as response:
-                return await response.json()
-    
-    async def sync_queued_messages(self):
-        """连接时同步排队的消息。"""
-        while not self.message_queue.empty():
-            message = await self.message_queue.get()
-            try:
-                await self._send_to_cloud(message)
-            except Exception:
-                # 失败时放回队列
-                await self.message_queue.put(message)
-                break
-```
+**规模和指标：**
 
-### 协同训练
+- 全球30+家工厂
+- 每个工厂每天处理50万+张图像
+- 检测15+种缺陷类型（划痕、凹痕、错位、颜色变化）
+- 检测率99.7%（vs人类检查员基线94%）
+- 误报率0.8%（人类基线5-8%）
+- 平均缺陷检测延迟：18ms（边缘）+ 120ms（服务器聚合）
+- 模型更新频率：每两周全球所有工厂
 
-```python
-# 用于边缘-云协同的联邦学习
-import torch
-import torch.nn as nn
-from typing import List, Dict
-import asyncio
+**关键架构决策：**
 
-class FederatedLearningCoordinator:
-    def __init__(self, global_model: nn.Module, num_clients: int):
-        self.global_model = global_model
-        self.num_clients = num_clients
-        self.round_number = 0
-        self.client_updates = []
-    
-    async def coordinate_round(self, edge_clients: List):
-        """协调一轮联邦学习。"""
-        self.round_number += 1
-        
-        # 发送全局模型到客户端
-        global_weights = self.global_model.state_dict()
-        
-        # 从客户端收集更新
-        updates = []
-        for client in edge_clients:
-            update = await client.train_locally(global_weights)
-            updates.append(update)
-        
-        # 聚合更新
-        aggregated_weights = self._aggregate_updates(updates)
-        
-        # 更新全局模型
-        self.global_model.load_state_dict(aggregated_weights)
-        
-        return aggregated_weights
-    
-    def _aggregate_updates(self, updates: List[Dict]) -> Dict:
-        """使用 FedAvg 聚合客户端更新。"""
-        averaged_weights = {}
-        
-        for key in updates[0].keys():
-            averaged_weights[key] = torch.zeros_like(updates[0][key])
-            
-            for update in updates:
-                averaged_weights[key] += update[key]
-            
-            averaged_weights[key] /= len(updates)
-        
-        return averaged_weights
+1. **两层边缘架构。** 快速检测在Jetson设备上进行（<20ms）。复杂情况转介到边缘服务器进行集成分析（总计<150ms）。这平衡了延迟与准确性。
 
-class EdgeFederatedClient:
-    def __init__(self, local_data, local_model: nn.Module, 
-                 local_epochs: int = 5):
-        self.local_data = local_data
-        self.local_model = local_model
-        self.local_epochs = local_epochs
-    
-    async def train_locally(self, global_weights: Dict) -> Dict:
-        """本地训练并返回更新。"""
-        # 加载全局权重
-        self.local_model.load_state_dict(global_weights)
-        
-        # 本地训练
-        optimizer = torch.optim.SGD(self.local_model.parameters(), lr=0.01)
-        criterion = nn.CrossEntropyLoss()
-        
-        self.local_model.train()
-        for epoch in range(self.local_epochs):
-            for data, labels in self.local_data:
-                optimizer.zero_grad()
-                output = self.local_model(data)
-                loss = criterion(output, labels)
-                loss.backward()
-                optimizer.step()
-        
-        # 计算更新（与全局的差异）
-        update = {}
-        for key, value in self.local_model.state_dict().items():
-            update[key] = value - global_weights[key]
-        
-        return update
-```
+2. **云管理，边缘执行。** 模型在云中训练，但推理完全在边缘运行。工厂可以在没有云连接的情况下运行数天。
+
+3. **全局模型，本地校准。** 基础模型在所有工厂的数据上训练。每个工厂使用本地数据微调（不同光照、摄像头角度、产品变体）并部署工厂特定版本。
+
+4. **人类在环处理模糊情况。** 当模型置信度低于70%时，图像被标记供人类审查。这些审查案例被添加到重训练数据集中。
 
 ---
 
-## 💡 案例研究：基于 NVIDIA Jetson 的边缘部署
+## 19.6 战争故事：边缘设备在生产中内存耗尽
 
-### 完整部署管道
+**公司：** 智能零售连锁店，部署5,000个带设备上AI的货架扫描摄像头
 
-🔴 高级
+**问题：** 部署3个月后，12%的设备（600个摄像头）开始经历内存不足（OOM）崩溃，每周增长2%。设备会崩溃、重启，并在几分钟内再次崩溃。
 
-```yaml
-# NVIDIA Jetson 部署配置
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: jetson-config
-  namespace: edge-ai
-data:
-  DEPLOY_MODE: "production"
-  MODEL_FORMAT: "tensorrt"
-  ENABLE_DLA: "true"
-  GPU_MEMORY_FRACTION: "0.8"
-  MAX_BATCH_SIZE: "4"
-  INFERENCE_PRECISION: "fp16"
+**退化时间线：**
+
+| 月份 | OOM崩溃 | 崩溃率 | 根本原因 |
+|------|--------|--------|---------|
+| 第1个月 | 3 | 0.06% | 随机，可接受 |
+| 第2个月 | 15 | 0.3% | 怀疑内存泄漏 |
+| 第3个月 | 600 | 12% | 系统性故障 |
+| 第4个月（预测） | 3,000+ | 60%+ | 车队范围危机 |
+
+**根本原因分析：**
+
+1. **图像预处理管道中的内存泄漏。** 摄像头软件将解码图像缓存在环形缓冲区中。由于竞态条件，图像有时在预期生命周期之外被保留。每张2000万像素图像消耗约60MB RAM。
+
+2. **缓存无限增长。** 数周内，泄漏的图像在内存中累积。2GB RAM设备最终耗尽可用内存。
+
+3. **模型推理内存未回收。** ONNX Runtime会话分配GPU内存（通过OpenCL）但推理后不释放。此内存与Python垃圾收集器分离。
+
+4. **OTA更新增加了模型大小。** 第2个月部署的模型更新将模型从45MB增加到62MB，减少了可用空间。
+
+**修复措施：**
+
+| 修复 | 影响 |
+|------|------|
+| 修复环形缓冲区竞态条件（添加适当的引用计数） | 消除了70%的内存泄漏 |
+| 添加显式ONNX Runtime会话内存管理 | 消除了25%的内存泄漏 |
+| 将模型减少到48MB（剪枝不必要的层） | 恢复了14MB空间 |
+| 添加内存看门狗（RAM使用>85%时重启） | 防止了级联崩溃 |
+| 添加30秒后自动缓存驱逐 | 将峰值内存减少了40% |
+
+**结果：**
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| 每周OOM崩溃 | 200+ | 0 |
+| 24小时运行时内存 | 1.85GB（崩溃） | 1.1GB（稳定） |
+| 每设备运行时间 | 4-6小时 | 30+天 |
+| OTA部署可靠性 | 88% | 99.5% |
+
+**实施的预防措施：**
+
+1. **强制内存分析**在任何OTA部署之前
+2. **每个组件的内存预算**（模型：80MB，预处理：100MB，运行时：50MB，OS：700MB）
+3. **48小时浸泡测试**在车队范围推出之前
+4. **所有设备的实时内存遥测**到中央监控
+5. **自动回滚**如果内存使用超过80%阈值持续5分钟
+
 ---
-# Jetson 特定的 DaemonSet
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: jetson-agent
-  namespace: edge-ai
-spec:
-  selector:
-    matchLabels:
-      app: jetson-agent
-  template:
-    metadata:
-      labels:
-        app: jetson-agent
-    spec:
-      containers:
-      - name: jetson-agent
-        image: nvcr.io/nvidia/l4t-pytorch:r32.7.1-pth1.10-py3
-        command:
-        - python
-        - /scripts/jetson_agent.py
-        env:
-        - name: JETSON_MODEL
-          value: "resnet50"
-        - name: TENSORRT_CACHE_PATH
-          value: "/var/cache/tensorrt"
-        resources:
-          limits:
-            nvidia.com/gpu: "1"
-        volumeMounts:
-        - name: model-cache
-          mountPath: /var/cache/models
-        - name: tensorrt-cache
-          mountPath: /var/cache/tensorrt
-      volumes:
-      - name: model-cache
-        hostPath:
-          path: /var/lib/jetson-models
-          type: DirectoryOrCreate
-      - name: tensorrt-cache
-        hostPath:
-          path: /var/cache/tensorrt
-          type: DirectoryOrCreate
-      nodeSelector:
-        hardware: nvidia-jetson
-      tolerations:
-      - key: "jetson"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
+
+## 19.7 边缘部署管道架构
+
+完整的边缘部署管道包括：
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   模型       │    │   模型       │    │   模型       │
+│   训练       │ →  │   验证       │ →  │   打包       │
+│   （云）     │    │   （云）     │    │   （云）     │
+└──────────────┘    └──────────────┘    └──────────────┘
+                                              │
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   车队       │    │   金丝雀     │    │   OTA        │
+│   推出       │ ←  │   测试       │ ←  │   上传       │
+│   （云）     │    │   （边缘）   │    │   （云）     │
+└──────────────┘    └──────────────┘    └──────────────┘
+       │
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   设备       │    │   监控       │    │   回滚       │
+│   执行       │ →  │   与漂移     │ →  │   （如需要） │
+│   （边缘）   │    │   （云）     │    │   （云）     │
+└──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-### Jetson 优化代码
+### 19.7.1 边缘模型打包
 
-```python
-# NVIDIA Jetson 优化
-import tensorrt as trt
-import pycuda.driver as cuda
-import numpy as np
-from pathlib import Path
+| 组件 | 内容 | 格式 |
+|------|------|------|
+| 模型权重 | 量化、压缩的模型 | .onnx、.trt、.tflite |
+| 运行时 | 推理引擎 | 静态二进制或容器 |
+| 配置 | 输入/输出规范、预处理 | JSON/YAML |
+| 元数据 | 版本、校验和、目标硬件 | 清单文件 |
+| 回滚模型 | 以前工作模型 | 与主要模型相同格式 |
 
-class JetsonInference:
-    def __init__(self, model_path: str, use_dla: bool = False, 
-                 dla_core: int = 0):
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        self.use_dla = use_dla
-        self.dla_core = dla_core
-        
-        # 构建或加载引擎
-        self.engine = self._load_engine(model_path)
-        self.context = self.engine.create_execution_context()
-        
-        # 分配内存
-        self._allocate_buffers()
-        
-        # CUDA 流
-        self.stream = cuda.Stream()
-    
-    def _load_engine(self, model_path: str) -> trt.ICudaEngine:
-        """加载 TensorRT 引擎。"""
-        cache_path = Path(model_path).with_suffix('.trt')
-        
-        if cache_path.exists():
-            # 加载缓存的引擎
-            with open(cache_path, 'rb') as f:
-                runtime = trt.Runtime(self.logger)
-                return runtime.deserialize_cuda_engine(f.read())
-        else:
-            # 构建新引擎
-            engine = self._build_engine(model_path)
-            
-            # 缓存引擎
-            with open(cache_path, 'wb') as f:
-                f.write(engine.serialize())
-            
-            return engine
-    
-    def _build_engine(self, onnx_path: str) -> trt.ICudaEngine:
-        """从 ONNX 构建 TensorRT 引擎。"""
-        builder = trt.Builder(self.logger)
-        network = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
-        parser = trt.OnnxParser(network, self.logger)
-        
-        # 解析 ONNX
-        with open(onnx_path, 'rb') as f:
-            if not parser.parse(f.read()):
-                for error in range(parser.num_errors):
-                    print(parser.get_error(error))
-                raise RuntimeError("解析 ONNX 模型失败")
-        
-        # 配置构建器
-        config = builder.create_builder_config()
-        config.max_workspace_size = 1 << 28  # 256MB
-        
-        # 启用 FP16
-        if builder.platform_has_fast_fp16:
-            config.set_flag(trt.BuilderFlag.FP16)
-        
-        # 如果可用则启用 DLA
-        if self.use_dla and builder.platform_has_fast_dla:
-            config.default_device_type = trt.DeviceType.DLA
-            config.DLA_core = self.dla_core
-            config.set_flag(trt.BuilderFlag.STRICT_TYPES)
-        
-        # 构建引擎
-        engine = builder.build_engine(network, config)
-        
-        return engine
-    
-    def _allocate_buffers(self):
-        """分配 GPU 内存。"""
-        self.inputs = []
-        self.outputs = []
-        self.bindings = []
-        
-        for i in range(self.engine.num_bindings):
-            shape = self.engine.get_binding_shape(i)
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            
-            size = trt.volume(shape)
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
-            self.bindings.append(int(device_mem))
-            
-            if self.engine.binding_is_input(i):
-                self.inputs.append({
-                    'host': host_mem,
-                    'device': device_mem,
-                    'shape': shape
-                })
-            else:
-                self.outputs.append({
-                    'host': host_mem,
-                    'device': device_mem,
-                    'shape': shape
-                })
-    
-    def infer(self, input_data: np.ndarray) -> np.ndarray:
-        """在 Jetson 上运行推理。"""
-        # 如需要则调整输入形状
-        input_data = input_data.astype(np.float32)
-        
-        # 将输入复制到固定内存
-        np.copyto(self.inputs[0]['host'], input_data.ravel())
-        
-        # 传输到 GPU
-        cuda.memcpy_htod_async(
-            self.inputs[0]['device'],
-            self.inputs[0]['host'],
-            self.stream
-        )
-        
-        # 运行推理
-        self.context.execute_async_v2(
-            bindings=self.bindings,
-            stream_handle=self.stream.handle
-        )
-        
-        # 传回输出
-        cuda.memcpy_dtoh_async(
-            self.outputs[0]['host'],
-            self.outputs[0]['device'],
-            self.stream
-        )
-        
-        # 同步
-        self.stream.synchronize()
-        
-        return self.outputs[0]['host'].reshape(self.outputs[0]['shape'])
+### 19.7.2 边缘漂移检测
 
-# 在 Jetson 上使用
-def deploy_on_jetson():
-    """完整的 Jetson 部署示例。"""
-    # 初始化推理
-    engine = JetsonInference(
-        model_path='/var/lib/jetson-models/resnet50.onnx',
-        use_dla=True,
-        dla_core=0
-    )
-    
-    # 处理摄像头馈送
-    import cv2
-    
-    cap = cv2.VideoCapture(0)
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # 预处理
-        input_tensor = preprocess_frame(frame)
-        
-        # 推理
-        output = engine.infer(input_tensor)
-        
-        # 后处理
-        predictions = postprocess_output(output)
-        
-        # 显示
-        display_predictions(frame, predictions)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    
-    cap.release()
+边缘设备应检测模型在当前数据上性能不再良好：
 
-def preprocess_frame(frame):
-    """预处理摄像头帧。"""
-    import cv2
-    
-    # 调整大小
-    img = cv2.resize(frame, (224, 224))
-    
-    # BGR 转 RGB
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    # 归一化
-    img = img.astype(np.float32) / 255.0
-    img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-    
-    # 转置
-    img = img.transpose(2, 0, 1)
-    
-    # 添加批次
-    return np.expand_dims(img, axis=0)
+| 漂移类型 | 检测方法 | 响应 |
+|---------|---------|------|
+| **数据漂移** | 统计比较（KS检验、PSI）输入特征 | 标记供审查，考虑重训练 |
+| **概念漂移** | 监控预测置信度分布 | 触发云重训练 |
+| **性能漂移** | 比较预测与真实值（当可用时） | 告警运营团队 |
+| **模型过时** | 跟踪上次更新以来的天数 | 安排更新 |
 
-def postprocess_output(output):
-    """后处理模型输出。"""
-    # Softmax
-    exp_output = np.exp(output - np.max(output))
-    probs = exp_output / exp_output.sum()
-    
-    # 获取 top 预测
-    top_k = 5
-    top_indices = np.argsort(probs[0])[-top_k:][::-1]
-    top_probs = probs[0][top_indices]
-    
-    return list(zip(top_indices.tolist(), top_probs.tolist()))
-```
+**实际阈值：** 如果人口稳定性指数（PSI）连续3天超过0.2，在云中触发重训练管道。
 
 ---
 
-## 📝 练习
+## 19.8 何时使用/何时不使用边缘部署
 
-### 练习 19.1：边缘部署管道
-构建完整的边缘部署管道，要求：
-1. 将 PyTorch 模型导出为 ONNX
-2. 使用 TensorRT 优化
-3. 部署到 Jetson 设备
-4. 监控推理性能
-5. 处理模型更新
+### 何时使用边缘部署
 
-### 练习 19.2：离线推理
-为偏远位置实现离线推理：
-1. 优雅处理网络断开
-2. 本地排队结果
-3. 连接恢复时同步
-4. 维护数据一致性
-5. 在离线期间处理模型更新
+| 场景 | 边缘必需的原因 |
+|------|-------------|
+| 延迟 < 20ms | 云往返太慢 |
+| 无互联网连接 | 云不可达 |
+| 隐私法规（GDPR、HIPAA） | 数据不能离开场所 |
+| 高数据量（视频、传感器） | 带宽太贵 |
+| 安全关键系统 | 网络故障不能禁用AI |
+| 数千个部署站点 | 每设备云成本过高 |
 
-### 练习 19.3：边缘-云协同
-设计边缘-云协同系统，要求：
-1. 100 台边缘设备的联邦学习
-2. 隐私保护的数据聚合
-3. 高效的模型分发
-4. 实时监控和告警
-5. 基于需求的自动扩展
+### 何时不使用边缘部署
+
+| 场景 | 边缘不适合的原因 | 替代方案 |
+|------|----------------|---------|
+| 模型需要 > 100 TOPS | 边缘硬件不足 | 云推理 |
+| 频繁模型更新（每日） | OTA复杂性太高 | 云推理 |
+| 需要集中数据处理 | 边缘碎片化有害 | 云批处理 |
+| 无边缘工程团队 | 部署维护负担 | 托管云服务 |
+| 原型/开发阶段 | 边缘调试慢 | 云用于开发，边缘用于生产 |
 
 ---
 
-## ⚠️ 警告
+## 19.9 本章小结
 
-1. **资源限制**：边缘设备计算和内存有限。积极优化模型。
-2. **热节流**：监控设备温度。热压力下性能下降。
-3. **电源管理**：实现电源感知调度。电池供电设备需要仔细的能源管理。
-4. **安全性**：边缘设备物理暴露。实现安全启动、加密存储和远程擦除。
-5. **连接性**：为间歇性连接设计。切勿假设持续的网络访问。
+- **边缘推理框架**在硬件支持和性能上差异显著：NVIDIA用TensorRT、Intel用OpenVINO、跨平台用ONNX Runtime、移动/Edge TPU用TFLite
+- **OTA模型更新**需要仔细架构：增量更新减少80-95%带宽，金丝雀部署在车队范围推出前发现问题，双模型槽实现即时回滚
+- **边缘-云同步**应该是混合的：推送通知在设备的连接窗口触发基于拉取的更新
+- **BMW的架构**展示了生产级边缘AI：两层边缘（设备+服务器），云管理但边缘执行，全局模型带本地校准
+- **内存管理**是边缘部署中最常见的生产故障——强制分析、浸泡测试和实时遥测是必要的
+- 边缘部署是一个**已解决的架构问题**，但需要在测试、监控和回滚能力方面有纪律
 
 ---
 
-## 本章小结
+## 讨论题
 
-本章介绍了边缘部署架构和策略：
-1. 边缘推理框架（ONNX Runtime、TensorRT、TFLite）
-2. 模型更新策略（OTA、版本控制、回滚）
-3. 边缘集群管理（K3s、边缘的 Kubernetes）
-4. 离线推理架构
-5. 边缘-云协同模式
-6. NVIDIA Jetson 部署最佳实践
+1. 为100,000个运行AI模型的IoT设备设计OTA更新系统。设备有512MB RAM、2GB存储，每小时连接互联网一次，持续5分钟。你会使用什么更新策略、打包格式和回滚机制？
 
-这完成了第 6 部分：边缘 AI 架构。您现在掌握了云原生和边缘 AI 架构的全面知识，能够在整个计算连续体上设计和部署 AI 系统。
+2. 比较1,000个摄像头的视频分析系统的边缘部署与云部署的3年总拥有成本。包括硬件、软件、维护、网络和模型更新成本。
+
+3. 一家工厂有50个边缘设备运行质量检测AI。模型更新后，5个设备显示准确性下降。设计响应计划，最小化生产停机时间同时调查问题。
+
+4. 你将如何跨100个边缘设备实施联邦学习以改进模型而不集中训练数据？你会使用什么通信和聚合模式？
+
+5. 自动驾驶车队需要在车辆行驶时更新模型。必须满足哪些安全约束，与固定边缘设备相比，这如何改变OTA架构？
+
+---
+
+## 练习
+
+**练习1：** 设置完整的边缘部署管道：训练模型，使用TensorRT优化，为Jetson设备打包，通过OTA部署，验证回滚正常工作。
+
+**练习2：** 实现边缘设备的内存分析框架，跟踪24小时内的内存使用，检测泄漏，并在使用超过定义阈值时生成告警。
+
+**练习3：** 设计并实现金丝雀部署系统，如果任何设备上的错误率在首次100次推理后超过2%，自动回滚模型更新。
+
+---
+
+## 参考文献
+
+- NVIDIA Jetson边缘AI部署：https://developer.nvidia.com/embedded-computing
+- TensorRT开发者指南：https://developer.nvidia.com/tensorrt
+- ONNX Runtime部署指南：https://onnxruntime.ai/docs/tutorials/
+- Google Coral部署：https://coral.ai/docs/
+- OpenVINO边缘部署：https://docs.openvino.ai/
+- BMW制造业AI：https://www.bmwgroup.com/en/innovation/
+- 西门子MindSphere IoT平台：https://www.siemens.com/global/en/products/software/mindsphere.html
+- NVIDIA Fleet Command（OTA管理）：https://developer.nvidia.com/fleet-command
+- Eclipse hawkBit（OTA更新框架）：https://www.eclipse.org/hawkbit/

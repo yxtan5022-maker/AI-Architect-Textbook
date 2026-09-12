@@ -1,1456 +1,544 @@
 # 第9章：模型监控与可观测性
 
-> **第三部分：MLOps 架构**
+## 学习目标
 
-**学习目标：**
-- 实现全面的模型漂移检测
-- 设计数据漂移监控系统
-- 构建性能指标监控仪表板
-- 配置告警和自动响应系统
-- 构建 ML 系统的可观测性平台
+学完本章后，你将能够：
 
----
-
-## 9.1 模型漂移检测
-
-### 9.1.1 什么是模型漂移？
-
-🟢 **初级**
-
-模型漂移是指由于底层数据分布或特征与目标之间关系的变化，导致部署模型的性能随时间退化。
-
-```
-模型漂移示意图：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  准确率随时间变化：                                          │
-│                                                             │
-│  0.95 ┤ ●──●──●──●──●                                     │
-│  0.90 ┤              ●──●──●                               │
-│  0.85 ┤                     ●──●                           │
-│  0.80 ┤                          ●──●──●                   │
-│  0.75 ┤                                 ●──●              │
-│  0.70 ┤                                    ●──●           │
-│       └─────┬─────┬─────┬─────┬─────┬─────┬─────        │
-│            T0    T1    T2    T3    T4    T5    T6         │
-│            ▲                                     ▲         │
-│            │                                     │         │
-│        模型部署                             性能退化         │
-│                                                             │
-│  漂移类型：                                                  │
-│  ├── 数据漂移：输入数据分布变化                               │
-│  ├── 概念漂移：特征与目标之间的关系变化                       │
-│  ├── 模型漂移：模型性能退化                                  │
-│  └── 上游漂移：数据管道变化影响输入                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.1.2 漂移类型
-
-🟡 **中级**
-
-| 漂移类型 | 描述 | 检测方法 | 示例 |
-|---------|------|---------|------|
-| **数据漂移** | 输入分布变化 | 统计检验（KS、PSI） | 季节性模式改变 |
-| **概念漂移** | P(Y\|X) 变化 | 性能监控 | 用户行为转移 |
-| **模型漂移** | 整体性能退化 | 准确率/F1 监控 | 模型过时 |
-| **预测漂移** | 输出分布变化 | 分布比较 | 预测模式偏移 |
-| **协变量漂移** | 特征分布变化 | 特征级监控 | 数据收集变化 |
-
-### 9.1.3 漂移检测算法
-
-🔴 **高级**
-
-```python
-import numpy as np
-from scipy import stats
-from sklearn.metrics import accuracy_score
-
-class ModelDriftDetector:
-    def __init__(self, reference_data, reference_predictions):
-        self.reference_data = reference_data
-        self.reference_predictions = reference_predictions
-    
-    def detect_data_drift_ks(self, current_data, feature_idx, threshold=0.05):
-        """Kolmogorov-Smirnov 检验用于数据漂移"""
-        
-        reference_feature = self.reference_data[:, feature_idx]
-        current_feature = current_data[:, feature_idx]
-        
-        # 执行 KS 检验
-        ks_statistic, p_value = stats.ks_2samp(reference_feature, current_feature)
-        
-        # 确定是否发生漂移
-        is_drifted = p_value < threshold
-        
-        return {
-            "test": "Kolmogorov-Smirnov",
-            "feature_idx": feature_idx,
-            "ks_statistic": ks_statistic,
-            "p_value": p_value,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-    
-    def detect_data_drift_psi(self, reference_data, current_data, feature_idx, threshold=0.1):
-        """群体稳定性指数（PSI）用于数据漂移"""
-        
-        reference_feature = reference_data[:, feature_idx]
-        current_feature = current_data[:, feature_idx]
-        
-        # 创建分箱
-        n_bins = 10
-        combined = np.concatenate([reference_feature, current_feature])
-        bins = np.percentile(combined, np.linspace(0, 100, n_bins + 1))
-        
-        # 计算比例
-        ref_proportions = np.histogram(reference_feature, bins=bins)[0] / len(reference_feature)
-        cur_proportions = np.histogram(current_feature, bins=bins)[0] / len(current_feature)
-        
-        # 避免除以零
-        ref_proportions = np.where(ref_proportions == 0, 0.0001, ref_proportions)
-        cur_proportions = np.where(cur_proportions == 0, 0.0001, cur_proportions)
-        
-        # 计算 PSI
-        psi = np.sum((cur_proportions - ref_proportions) * np.log(cur_proportions / ref_proportions))
-        
-        # 确定漂移
-        is_drifted = psi > threshold
-        
-        return {
-            "test": "Population Stability Index",
-            "feature_idx": feature_idx,
-            "psi": psi,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-    
-    def detect_concept_drift(self, current_data, current_labels, window_size=100):
-        """使用性能退化检测概念漂移"""
-        
-        # 计算最近数据的性能
-        recent_predictions = self.model.predict(current_data[-window_size:])
-        recent_labels = current_labels[-window_size:]
-        recent_accuracy = accuracy_score(recent_labels, recent_predictions)
-        
-        # 与参考性能比较
-        reference_accuracy = self.reference_accuracy
-        performance_drop = reference_accuracy - recent_accuracy
-        
-        # 显著下降的阈值
-        threshold = 0.05  # 5% 性能下降
-        
-        is_drifted = performance_drop > threshold
-        
-        return {
-            "test": "Performance Degradation",
-            "reference_accuracy": reference_accuracy,
-            "recent_accuracy": recent_accuracy,
-            "performance_drop": performance_drop,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-    
-    def detect_prediction_drift(self, current_predictions, threshold=0.1):
-        """检测预测分布的漂移"""
-        
-        # 比较预测分布
-        reference_mean = np.mean(self.reference_predictions)
-        reference_std = np.std(self.reference_predictions)
-        
-        current_mean = np.mean(current_predictions)
-        current_std = np.std(current_predictions)
-        
-        # 计算分布偏移
-        mean_shift = abs(current_mean - reference_mean) / reference_std
-        std_shift = abs(current_std - reference_std) / reference_std
-        
-        is_drifted = mean_shift > threshold or std_shift > threshold
-        
-        return {
-            "test": "Prediction Distribution",
-            "mean_shift": mean_shift,
-            "std_shift": std_shift,
-            "is_drifted": is_drifted,
-            "threshold": threshold
-        }
-
-# 用法
-detector = ModelDriftDetector(reference_data, reference_predictions)
-
-# 检查每个特征的数据漂移
-for i in range(n_features):
-    result = detector.detect_data_drift_ks(current_data, feature_idx=i)
-    if result["is_drifted"]:
-        print(f"特征 {i}：检测到漂移 (p={result['p_value']:.4f})")
-
-# 检查概念漂移
-concept_result = detector.detect_concept_drift(current_data, current_labels)
-if concept_result["is_drifted"]:
-    print(f"概念漂移：{concept_result['performance_drop']:.2%} 下降")
-```
+1. 设计涵盖数据、模型和系统健康的全面ML监控策略
+2. 使用统计方法和生产级工具实现漂移检测
+3. 配置Prometheus和Grafana进行ML特定指标收集和可视化
+4. 在模型退化影响业务指标之前识别静默退化
+5. 构建平衡敏感性和警报疲劳的告警策略
 
 ---
 
-## 9.2 数据漂移监控
+## 9.1 为什么ML监控与众不同
 
-### 9.2.1 数据漂移监控架构
+传统软件监控问："系统在工作吗？"ML监控问："系统在工作并且其输出仍然正确吗？"第二个问题根本上更难，因为你通常在服务时不知道正确答案。
 
-🟡 **中级**
+### 三种漂移类型
+
+| 漂移类型 | 变化内容 | 检测方法 | 示例 |
+|---------|---------|---------|------|
+| **数据漂移**（协变量偏移） | 输入特征的分布 | 特征分布的统计检验 | 假期后用户行为变化 |
+| **概念漂移** | 特征与目标之间的关系 | 模型性能退化 | 垃圾邮件模式随时间演变 |
+| **预测漂移** | 模型输出的分布 | 预测分布的统计检验 | 模型开始预测更多"正向"结果 |
+
+### 为什么静默故障会发生
+
+ML模型静默失败是因为：
+1. **服务时没有真实标签**：与返回500错误的Web服务器不同，返回错误预测的模型不会触发异常
+2. **渐进退化**：大多数ML模型故障是渐进的，不是灾难性的。性能缓慢退化，在数周内保持在警报阈值之上
+3. **相关性掩盖**：业务指标可能不会立即反映模型退化，因为滞后效应或其他因素的相关性
+4. **分布偏移是正常的**：数据分布不断变化。模型没有坏——它只是随时间变得不那么准确
+
+> 📌 **已验证数据**：Prometheus是CNCF毕业项目，是指标收集和告警的行业标准（prometheus.io）。Grafana是指标可视化的行业标准（grafana.com）。它们一起构成了大多数生产ML监控栈的基础。Seldon Core（4.8K星标，seldon.io）提供与Prometheus的内置集成用于ML特定指标。
+
+---
+
+## 9.2 ML监控架构
+
+### 监控栈
 
 ```
-数据漂移监控管道：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              数据源                                  │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 训练     │  │ 生产     │  │ 外部     │         │   │
-│  │  │ 数据     │  │ 数据     │  │ 数据     │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  └───────┼──────────────┼──────────────┼───────────────┘   │
-│          │              │              │                    │
-│          ▼              ▼              ▼                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              特征仓库                                 │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  参考统计信息（训练数据）                       │   │   │
-│  │  │  ├── 每个特征的均值、标准差、最小值、最大值    │   │   │
-│  │  │  ├── 分布直方图                               │   │   │
-│  │  │  └── 相关性矩阵                               │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              漂移检测引擎                             │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 统计     │  │ 机器学习 │  │ 业务     │         │   │
-│  │  │ 检验     │  │ 检测     │  │ 规则     │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  │       └──────────────┼──────────────┘               │   │
-│  │                      │                              │   │
-│  │                      ▼                              │   │
-│  │              ┌──────────────┐                       │   │
-│  │              │ 漂移分数     │                       │   │
-│  │              │ 计算器       │                       │   │
-│  │              └──────────────┘                       │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │              告警与响应                               │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 告警     │  │ 自动     │  │ 仪表板   │         │   │
-│  │  │ 系统     │  │ 重训练   │  │ 展示     │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                     监控栈                                │
+├─────────────┬─────────────┬─────────────┬───────────────┤
+│  数据层     │ 模型层      │ 系统层      │ 业务层        │
+├─────────────┼─────────────┼─────────────┼───────────────┤
+│ 特征分布    │ 预测分布    │ 延迟        │ 转化率        │
+│ 缺失值      │ 准确性      │ 吞吐量      │ 收入          │
+│ 模式变更    │ 置信度分数  │ 错误率      │ 用户满意度    │
+│             │             │ CPU/GPU     │ 流失率        │
+│             │             │ 内存        │ 参与度        │
+└─────────────┴─────────────┴─────────────┴───────────────┘
+         │             │             │             │
+         ▼             ▼             ▼             ▼
+┌─────────────────────────────────────────────────────────┐
+│              Prometheus（指标收集）                       │
+├─────────────────────────────────────────────────────────┤
+│              Grafana（可视化与告警）                      │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 9.2.2 使用 Evidently 实现数据漂移检测
+### 每层的关键指标
 
-🔴 **高级**
+| 层 | 指标 | 描述 | 告警阈值 |
+|----|------|------|---------|
+| **数据** | 特征缺失率 | 缺失特征的请求百分比 | > 5%增加 |
+| **数据** | 特征分布 | 相对于训练分布的KL散度 | > 0.1 |
+| **数据** | 模式违规 | 具有意外特征类型的请求 | > 0 |
+| **模型** | 预测分布 | 相对于训练预测的PSI | > 0.2 |
+| **模型** | 置信度分数 | 平均预测置信度 | < 0.3（对校准模型） |
+| **模型** | A/B测试指标 | 在线性能 vs. 基线 | 统计显著性 |
+| **系统** | 延迟（p50，p99） | 推理时间 | > 2倍基线 |
+| **系统** | 吞吐量 | 每秒请求数 | < 50%容量 |
+| **系统** | 错误率 | 失败的预测 | > 1% |
+| **业务** | 转化率 | 业务KPI | < 5%退化 |
+| **业务** | 每次预测收入 | ROI指标 | < 10%退化 |
+
+---
+
+## 9.3 Prometheus用于ML监控
+
+### Prometheus架构
+
+Prometheus使用基于拉取的模型，定期从仪器化的端点抓取指标：
+
+```
+ML模型服务器（暴露/metrics端点）
+         │
+         │ HTTP GET /metrics
+         ▼
+    Prometheus服务器
+         │
+         │ PromQL查询
+         ├──► Grafana仪表板
+         └──► Alertmanager → Slack/邮件/PagerDuty
+```
+
+### ML特定的Prometheus指标
 
 ```python
-from evidently import ColumnMapping
-from evidently.report import Report
-from evidently.metric_preset import (
-    DataDriftPreset, 
-    DataQualityPreset,
-    TargetDriftPreset
-)
-import pandas as pd
+from prometheus_client import Counter, Histogram, Gauge, Summary
 
-class DataDriftMonitor:
-    def __init__(self, reference_data: pd.DataFrame):
-        self.reference_data = reference_data
-        self.column_mapping = None
-        
-    def set_column_mapping(self, target_column: str = None, 
-                          numerical_columns: list = None,
-                          categorical_columns: list = None):
-        """设置 Evidently 的列映射"""
-        
-        self.column_mapping = ColumnMapping(
-            target=target_column,
-            numerical_features=numerical_columns,
-            categorical_features=categorical_columns
-        )
-    
-    def generate_drift_report(self, current_data: pd.DataFrame, 
-                             save_path: str = None) -> dict:
-        """生成全面的漂移报告"""
-        
-        # 创建漂移报告
-        drift_report = Report(metrics=[
-            DataDriftPreset(),
-            DataQualityPreset(),
-            TargetDriftPreset()
-        ])
-        
-        # 运行报告
-        drift_report.run(
-            reference_data=self.reference_data,
-            current_data=current_data,
-            column_mapping=self.column_mapping
-        )
-        
-        # 获取结果
-        report_dict = drift_report.as_dict()
-        
-        # 如果提供路径则保存报告
-        if save_path:
-            drift_report.save_html(save_path)
-        
-        # 提取关键指标
-        result = {
-            "dataset_drift": report_dict["metrics"][0]["result"]["dataset_drift"],
-            "drift_score": report_dict["metrics"][0]["result"]["drift_score"],
-            "n_drifted_columns": report_dict["metrics"][0]["result"]["n_drifted_columns"],
-            "drifted_columns": report_dict["metrics"][0]["result"]["drifted_columns"]
-        }
-        
-        return result
-    
-    def monitor_real_time(self, current_batch: pd.DataFrame, 
-                         threshold: float = 0.5) -> dict:
-        """流数据的实时漂移监控"""
-        
-        # 计算批次的漂移分数
-        drift_result = self.generate_drift_report(current_batch)
-        
-        # 检查阈值
-        needs_alert = drift_result["drift_score"] > threshold
-        
-        # 确定操作
-        if needs_alert:
-            action = {
-                "type": "alert",
-                "severity": "high" if drift_result["drift_score"] > 0.8 else "medium",
-                "message": f"检测到数据漂移：分数={drift_result['drift_score']:.3f}",
-                "drifted_features": drift_result["drifted_columns"]
-            }
-        else:
-            action = {
-                "type": "continue",
-                "message": "未检测到显著漂移"
-            }
-        
-        return {
-            "drift_result": drift_result,
-            "action": action,
-            "timestamp": pd.Timestamp.now()
-        }
-
-# 用法
-monitor = DataDriftMonitor(reference_data=train_df)
-monitor.set_column_mapping(
-    target_column="target",
-    numerical_columns=["feature1", "feature2", "feature3"],
-    categorical_columns=["category1", "category2"]
+# 预测指标
+prediction_counter = Counter(
+    'ml_predictions_total',
+    '做出的预测总数',
+    ['model_name', 'model_version', 'prediction_class']
 )
 
-# 生成报告
-result = monitor.generate_drift_report(current_data=production_df)
-print(f"数据集漂移：{result['dataset_drift']}")
-print(f"漂移分数：{result['drift_score']:.3f}")
-print(f"漂移特征：{result['drifted_columns']}")
+prediction_latency = Histogram(
+    'ml_prediction_latency_seconds',
+    '预测延迟（秒）',
+    ['model_name', 'model_version'],
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+)
+
+prediction_confidence = Summary(
+    'ml_prediction_confidence',
+    '模型预测置信度分数',
+    ['model_name', 'model_version']
+)
+
+# 数据漂移指标
+feature_drift = Gauge(
+    'ml_feature_drift_psi',
+    '特征漂移的种群稳定性指数',
+    ['model_name', 'feature_name']
+)
+
+missing_value_rate = Gauge(
+    'ml_missing_value_rate',
+    '每特征的缺失值率',
+    ['model_name', 'feature_name']
+)
+
+# 系统指标
+model_loaded = Gauge(
+    'ml_model_loaded',
+    '模型是否加载到内存中',
+    ['model_name', 'model_version']
+)
+
+gpu_utilization = Gauge(
+    'ml_gpu_utilization_percent',
+    'GPU利用率百分比',
+    ['model_name', 'gpu_id']
+)
+```
+
+### ML监控的PromQL查询
+
+```promql
+# 预测率（每秒预测数）
+rate(ml_predictions_total[5m])
+
+# p99延迟
+histogram_quantile(0.99, rate(ml_prediction_latency_seconds_bucket[5m]))
+
+# p50延迟
+histogram_quantile(0.50, rate(ml_prediction_latency_seconds_bucket[5m]))
+
+# 平均置信度分数
+avg(ml_prediction_confidence)
+
+# 特征漂移告警
+ml_feature_drift_psi > 0.2
+
+# 缺失值率增加
+/ml_missing_value_rate > 0.05
+
+# GPU利用率低于阈值
+/ml_gpu_utilization_percent < 30
 ```
 
 ---
 
-## 9.3 性能指标监控
+## 9.4 漂移检测方法
 
-### 9.3.1 性能指标框架
+### 数据漂移的统计检验
 
-🟢 **初级**
+| 检验 | 数据类型 | 零假设 | 何时使用 |
+|------|---------|--------|---------|
+| **Kolmogorov-Smirnov** | 连续 | 分布相同 | 特征分布比较 |
+| **卡方** | 分类 | 分布相同 | 分类特征比较 |
+| **Jensen-Shannon散度** | 任意 | 分布相同 | 非负散度度量 |
+| **种群稳定性指数（PSI）** | 任意 | 分布相同 | 漂移检测的行业标准 |
+| **Cramér-von Mises** | 连续 | 分布相同 | 对某些分布比KS更有功效 |
+
+### PSI（种群稳定性指数）
+
+生产中最广泛使用的漂移指标：
 
 ```
-ML 性能指标框架：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  模型质量指标：                                              │
-│  ├── 准确率                                                │
-│  ├── 精确率 / 召回率 / F1 分数                               │
-│  ├── AUC-ROC                                               │
-│  ├── 均方误差（MSE）                                        │
-│  └── 平均绝对误差（MAE）                                    │
-│                                                             │
-│  运营指标：                                                  │
-│  ├── 延迟（P50, P90, P95, P99）                            │
-│  ├── 吞吐量（QPS）                                         │
-│  ├── 错误率                                                │
-│  └── 可用性                                                │
-│                                                             │
-│  业务指标：                                                  │
-│  ├── 转化率                                                │
-│  ├── 每次预测收入                                           │
-│  ├── 用户满意度评分                                         │
-│  └── 每次预测成本                                           │
-│                                                             │
-│  系统指标：                                                  │
-│  ├── CPU / 内存使用                                         │
-│  ├── GPU 利用率                                             │
-│  ├── 网络 I/O                                              │
-│  └── 磁盘 I/O                                              │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+PSI = Σ (P_i - Q_i) × ln(P_i / Q_i)
+
+其中：
+- P_i = 参考分布中第i个bin的观测比例
+- Q_i = 当前分布中第i个bin的观测比例
+-  bins通常是参考分布的十分位数
 ```
 
-### 9.3.2 构建监控仪表板
+**解释：**
+| PSI范围 | 解释 | 动作 |
+|---------|------|------|
+| < 0.1 | 无显著漂移 | 无需动作 |
+| 0.1 - 0.25 | 中度漂移 | 调查，考虑重训练 |
+| > 0.25 | 显著漂移 | 重训练模型 |
 
-🟡 **中级**
+### 实时漂移检测管道
 
-```python
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
-import time
-import numpy as np
-
-class MLMetricsCollector:
-    def __init__(self, port=8000):
-        self.port = port
-        
-        # 定义指标
-        self.prediction_counter = Counter(
-            'ml_predictions_total',
-            '预测总数',
-            ['model_name', 'model_version']
-        )
-        
-        self.prediction_latency = Histogram(
-            'ml_prediction_latency_seconds',
-            '预测延迟（秒）',
-            ['model_name', 'model_version'],
-            buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
-        )
-        
-        self.prediction_errors = Counter(
-            'ml_prediction_errors_total',
-            '预测错误总数',
-            ['model_name', 'model_version', 'error_type']
-        )
-        
-        self.model_accuracy = Gauge(
-            'ml_model_accuracy',
-            '当前模型准确率',
-            ['model_name', 'model_version']
-        )
-        
-        self.data_drift_score = Gauge(
-            'ml_data_drift_score',
-            '当前数据漂移分数',
-            ['model_name', 'feature_name']
-        )
-        
-        self.gpu_utilization = Gauge(
-            'ml_gpu_utilization_percent',
-            'GPU 利用率百分比',
-            ['gpu_id']
-        )
-        
-        self.memory_usage = Gauge(
-            'ml_memory_usage_bytes',
-            '内存使用量（字节）',
-            ['model_name']
-        )
-    
-    def start_metrics_server(self):
-        """启动 Prometheus 指标服务器"""
-        start_http_server(self.port)
-        print(f"指标服务器在端口 {self.port} 启动")
-    
-    def record_prediction(self, model_name: str, model_version: str, 
-                         latency: float, success: bool):
-        """记录预测事件"""
-        
-        # 递增预测计数器
-        self.prediction_counter.labels(
-            model_name=model_name, 
-            model_version=model_version
-        ).inc()
-        
-        # 记录延迟
-        self.prediction_latency.labels(
-            model_name=model_name, 
-            model_version=model_version
-        ).observe(latency)
-        
-        # 如果失败则记录错误
-        if not success:
-            self.prediction_errors.labels(
-                model_name=model_name,
-                model_version=model_version,
-                error_type="prediction_failed"
-            ).inc()
-    
-    def update_accuracy(self, model_name: str, model_version: str, accuracy: float):
-        """更新模型准确率指标"""
-        self.model_accuracy.labels(
-            model_name=model_name,
-            model_version=model_version
-        ).set(accuracy)
-    
-    def update_drift_score(self, model_name: str, feature_name: str, score: float):
-        """更新数据漂移分数"""
-        self.data_drift_score.labels(
-            model_name=model_name,
-            feature_name=feature_name
-        ).set(score)
-    
-    def update_system_metrics(self, gpu_id: int, gpu_util: float, 
-                             memory_bytes: int, model_name: str):
-        """更新系统指标"""
-        self.gpu_utilization.labels(gpu_id=str(gpu_id)).set(gpu_util)
-        self.memory_usage.labels(model_name=model_name).set(memory_bytes)
-
-# 用法
-collector = MLMetricsCollector(port=8000)
-collector.start_metrics_server()
-
-# 记录预测
-for prediction in predictions:
-    start_time = time.time()
-    
-    # 进行预测
-    try:
-        result = model.predict(prediction)
-        success = True
-    except Exception as e:
-        success = False
-    
-    latency = time.time() - start_time
-    
-    # 记录指标
-    collector.record_prediction(
-        model_name="text-classifier",
-        model_version="v1.0",
-        latency=latency,
-        success=success
-    )
+```
+传入请求
+    │
+    ▼
+特征提取 → 缓冲区（如1000个样本）
+    │
+    ▼
+统计比较（KS检验/PSI）
+    │
+    ├── 无漂移 → 继续服务
+    │
+    └── 检测到漂移 → 警报 + 触发调查
+                          │
+                          ├── 特征漂移 → 特征管道审查
+                          └── 概念漂移 → 模型重训练
 ```
 
-### 9.3.3 Grafana 仪表板配置
+---
 
-🟡 **中级**
+## 9.5 案例研究：Uber如何监控ML模型
+
+> 💡 **案例研究：Uber的Michelangelo ML平台监控**
+
+Uber的Michelangelo ML平台（在eng.uber.com的工程博客中描述）服务于公司的数千个模型。大规模监控这些模型需要复杂的可观测性策略。
+
+**规模：**
+- 生产中有数千个ML模型
+- 模型为定价、路线规划、欺诈检测、ETA估算和需求预测提供预测
+- 跨多个区域每天提供数十亿次预测
+
+**监控架构（来自公开描述）：**
+
+1. **多层监控**：Uber在四个层进行监控：
+   - **数据层**：特征分布、缺失值、模式变更
+   - **模型层**：预测分布、置信度分数、准确性（当真实标签可用时）
+   - **系统层**：延迟、吞吐量、错误率、资源利用率
+   - **业务层**：业务KPI（完成率、司机利用率、客户满意度）
+
+2. **自动化漂移检测**：Uber使用自动化统计检验来检测输入特征和模型输出的漂移。当漂移超过阈值时，系统自动触发调查工作流。
+
+3. **特征存储监控**：Uber的特征存储提供集中式的特征质量监控。如果特征管道中断或产生意外值，监控系统会在影响模型预测之前检测到。
+
+4. **影子模型评估**：在部署新模型之前，Uber以影子模式运行它们，将其预测与生产模型进行比较。这在真实生产流量上提供离线评估，没有任何风险。
+
+5. **A/B测试平台**：Uber维护一个复杂的A/B测试平台，与ML平台集成。每个模型变更都经过具有统计严谨性的受控实验。
+
+**关键洞察：**
+Uber的监控方法强调**主动检测**而不是反应性告警。通过监控数据质量和特征分布（领先指标），他们可以在影响模型预测（滞后指标）之前检测到问题。这与仅监控预测准确性根本不同，后者告诉你问题已经发生后的信息。
+
+**给从业者的启示：**
+- 监控领先指标（数据质量、特征分布），而不仅仅是滞后指标（预测准确性）
+- 集中式特征存储监控可防止一个主要的静默故障来源
+- 影子模式部署对于高风险模型很有价值
+- 自动化漂移检测减少了手动监控的需求
+
+---
+
+## 9.6 战争故事：静默模型退化损失数百万
+
+> ⚠️ **战争故事：500万美元的静默退化**
+
+**公司：** 一家大型金融机构（匿名化，基于行业报告）
+**模型：** 信用卡交易欺诈检测模型
+**时间：** 2021-2022年
+
+**背景：**
+该公司运营一个欺诈检测模型，每天处理数百万笔交易。模型每季度重训练一次，在离线评估中显示一致的性能。生产监控集中在系统指标（延迟、吞吐量、错误率）上，但不监控预测质量。
+
+**发生了什么：**
+
+**第1-2个月：** 没有可见问题。系统指标健康。模型以正常延迟和吞吐量处理交易。
+
+**第3个月：** 出现了一种新型欺诈——合成身份欺诈，犯罪者使用真实和伪造信息的组合创建虚假身份。模型从未接受过这种模式的训练，开始将这些交易分类为合法。
+
+**第4-6个月：** 欺诈率逐渐增加。然而，由于模型的整体准确性仍然很高（绝大多数交易仍然是合法的），监控系统没有触发警报。模型欺诈检测的精确度从92%下降到78%，但这在聚合指标中不可见。
+
+**第7个月：** 季度模型审查发现了这个问题。到这时，大约500万美元的欺诈交易已被批准。审查过程发现：
+- 超过15,000笔本应被标记的欺诈交易
+- 欺诈交易有一个明显的模式，漂移检测系统本可以捕获
+- 模型对这些交易的置信度分数异常低（0.3-0.5 vs. 典型的0.7-0.9），但没有人监控置信度分数分布
+
+**根本原因：**
+1. **没有预测分布监控**：公司不监控预测置信度分数的分布。低置信度预测通常是模型退化的领先指标。
+2. **没有真实标签反馈循环**：欺诈通常在交易后数天或数周才被发现。公司没有自动化管道在24小时内将确认的欺诈案例反馈到监控中。
+3. **聚合指标掩盖了退化**：总体准确性保持很高，因为欺诈只是总交易的一小部分。模型可以在100%的欺诈案例上出错，仍然显示99%+的总体准确性。
+4. **特征没有漂移检测**：模型的输入特征发生了显著偏移（新的商家类别、新的交易模式），但没有人监控特征分布。
+
+**修复方案：**
+- 实施置信度分数监控和自动告警
+- 构建反馈管道，在24小时内将确认的欺诈案例反馈到监控
+- 添加按类别监控（分别监控欺诈检测率和合法检测率）
+- 使用PSI对所有输入特征实施特征漂移检测
+- 将重训练触发从季度计划更改为基于漂移触发
+
+**故障成本：**
+- 直接损失：500万美元的欺诈交易
+- 调查成本：50万美元的取证分析
+- 监管罚款：100万美元（延迟检测违反了报告要求）
+- 总计：约650万美元
+
+**关键要点：** 仅监控系统健康（延迟、吞吐量、错误）对于ML系统是必要的但不充分的。你必须监控预测质量，最有效的方法是监控领先指标（数据漂移、置信度分数）而不是滞后指标（真实标签可用后的准确性）。
+
+---
+
+## 9.7 Grafana ML仪表板设计
+
+### 仪表板层次结构
+
+| 仪表板级别 | 受众 | 刷新率 | 关键指标 |
+|-----------|------|--------|---------|
+| **执行** | 高管、产品经理 | 1小时 | 业务KPI、模型数量、SLA合规 |
+| **运维** | ML工程师、SRE | 1分钟 | 延迟、吞吐量、错误率、漂移告警 |
+| **诊断** | 数据科学家、ML工程师 | 5分钟 | 特征分布、置信度分数、按类别指标 |
+| **调试** | 数据科学家 | 实时 | 单个预测、特征值、模型内部 |
+
+### ML必需的Grafana面板
+
+| 面板类型 | 指标 | 可视化 | 告警 |
+|---------|------|--------|------|
+| **预测率** | `rate(ml_predictions_total[5m])` | 时间序列 | < 50%基线 |
+| **延迟分布** | `histogram_quantile(0.99, ...)` | 热图或时间序列 | > 2倍基线 |
+| **置信度分数** | `avg(ml_prediction_confidence)` | 直方图或时间序列 | < 0.3 |
+| **特征漂移** | `ml_feature_drift_psi` | 热图（特征 × 时间） | > 0.25 |
+| **错误率** | `rate(ml_prediction_errors_total[5m])` | 时间序列 | > 1% |
+| **GPU利用率** | `ml_gpu_utilization_percent` | 仪表或时间序列 | < 30%或> 95% |
+
+### 示例Grafana仪表板JSON（简化版）
 
 ```json
 {
-  "dashboard": {
-    "title": "ML 模型监控",
-    "panels": [
-      {
-        "title": "预测速率",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "rate(ml_predictions_total[5m])",
-            "legendFormat": "{{model_name}} - {{model_version}}"
-          }
-        ]
-      },
-      {
-        "title": "预测延迟",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket[5m]))",
-            "legendFormat": "P95 延迟"
-          },
-          {
-            "expr": "histogram_quantile(0.50, rate(ml_prediction_latency_seconds_bucket[5m]))",
-            "legendFormat": "P50 延迟"
-          }
-        ]
-      },
-      {
-        "title": "模型准确率",
-        "type": "stat",
-        "targets": [
-          {
-            "expr": "ml_model_accuracy",
-            "legendFormat": "{{model_name}}"
-          }
-        ]
-      },
-      {
-        "title": "错误率",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "rate(ml_prediction_errors_total[5m])",
-            "legendFormat": "{{error_type}}"
-          }
-        ]
-      },
-      {
-        "title": "数据漂移分数",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "ml_data_drift_score",
-            "legendFormat": "{{feature_name}}"
-          }
-        ]
-      },
-      {
-        "title": "GPU 利用率",
-        "type": "gauge",
-        "targets": [
-          {
-            "expr": "ml_gpu_utilization_percent",
-            "legendFormat": "GPU {{gpu_id}}"
-          }
-        ]
-      }
-    ],
-    "refresh": "30s",
-    "time": {
-      "from": "now-6h",
-      "to": "now"
+  "panels": [
+    {
+      "title": "预测率",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ml_predictions_total[5m])",
+          "legendFormat": "{{model_name}} - {{model_version}}"
+        }
+      ]
+    },
+    {
+      "title": "p99延迟",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(ml_prediction_latency_seconds_bucket[5m]))",
+          "legendFormat": "{{model_name}}"
+        }
+      ],
+      "thresholds": [
+        {
+          "value": 0.2,
+          "color": "red",
+          "op": "gt"
+        }
+      ]
     }
-  }
+  ]
 }
 ```
 
 ---
 
-## 9.4 告警与自动化响应
+## 9.8 告警策略
 
-### 9.4.1 告警策略
+### 告警严重级别
 
-🟡 **中级**
+| 严重级别 | 响应时间 | 渠道 | 示例 |
+|---------|---------|------|------|
+| **严重** | 立即（< 5分钟） | PagerDuty、电话 | 错误率>5%，完全服务降级 |
+| **高** | < 30分钟 | Slack、邮件 | 延迟>2倍基线，漂移>0.25 |
+| **中** | < 4小时 | Slack、邮件 | 特征漂移>0.1，置信度下降 |
+| **低** | 下一个工作日 | 邮件、工单 | 次要异常，信息性 |
 
-```
-告警策略框架：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  告警严重级别：                                               │
-│  ├── 严重（P0）：模型完全故障                                │
-│  │   ├── 即时通知（PagerDuty）                               │
-│  │   ├── 触发自动回滚                                       │
-│  │   └── 需要人工干预                                       │
-│  │                                                         │
-│  ├── 警告（P1）：显著退化                                    │
-│  │   ├── 团队通知（Slack）                                  │
-│  │   ├── 增加监控频率                                       │
-│  │   └── 需要调查                                           │
-│  │                                                         │
-│  ├── 信息（P2）：检测到小问题                                │
-│  │   ├── 日志条目                                           │
-│  │   ├── 仪表板更新                                         │
-│  │   └── 业务时间审查                                       │
-│  │                                                         │
-│  └── 低（P3）：潜在关注                                     │
-│      ├── 指标记录                                           │
-│      └── 每周审查                                           │
-│                                                             │
-│  告警渠道：                                                  │
-│  ├── PagerDuty（严重）                                      │
-│  ├── Slack（警告）                                          │
-│  ├── 邮件（信息）                                           │
-│  └── 仪表板（所有）                                         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### 告警疲劳预防
 
-### 9.4.2 Prometheus 告警规则
+| 策略 | 实现方式 | 优势 |
+|------|---------|------|
+| **速率限制** | 每个指标每15分钟最多1个告警 | 防止告警风暴 |
+| **聚合** | 将相关告警分组为单个通知 | 减少噪音 |
+| **滞后** | 要求指标连续N次评估超过阈值 | 防止抖动 |
+| **维护窗口** | 在已知维护期间抑制告警 | 减少误报 |
+| **异常检测** | 使用ML检测异常模式而不是静态阈值 | 适应正常变化 |
 
-🔴 **高级**
+### ML的Prometheus告警规则
 
 ```yaml
-# prometheus-rules.yaml
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: ml-model-alerts
-  namespace: monitoring
-spec:
-  groups:
-  - name: ml-model-alerts
-    rules:
-    # 模型性能告警
-    - alert: ModelAccuracyBelowThreshold
-      expr: ml_model_accuracy < 0.85
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "模型准确率低于阈值"
-        description: "模型 {{ $labels.model_name }} 准确率为 {{ $value }}"
-    
-    - alert: ModelAccuracyCritical
-      expr: ml_model_accuracy < 0.75
-      for: 2m
-      labels:
-        severity: critical
-      annotations:
-        summary: "模型准确率严重偏低"
-        description: "模型 {{ $labels.model_name }} 准确率为 {{ $value }}"
-    
-    # 延迟告警
-    - alert: HighPredictionLatency
-      expr: histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket[5m])) > 0.5
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "预测延迟过高"
-        description: "P95 延迟为 {{ $value }}s"
-    
-    - alert: CriticalPredictionLatency
-      expr: histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket[5m])) > 1.0
-      for: 2m
-      labels:
-        severity: critical
-      annotations:
-        summary: "预测延迟严重"
-        description: "P95 延迟为 {{ $value }}s"
-    
-    # 错误率告警
-    - alert: HighErrorRate
-      expr: rate(ml_prediction_errors_total[5m]) / rate(ml_predictions_total[5m]) > 0.05
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "错误率过高"
-        description: "错误率为 {{ $value | humanizePercentage }}"
-    
-    # 数据漂移告警
-    - alert: DataDriftDetected
-      expr: ml_data_drift_score > 0.5
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "检测到数据漂移"
-        description: "特征 {{ $labels.feature_name }} 漂移分数为 {{ $value }}"
-    
-    - alert: CriticalDataDrift
-      expr: ml_data_drift_score > 0.8
-      for: 5m
-      labels:
-        severity: critical
-      annotations:
-        summary: "严重数据漂移"
-        description: "特征 {{ $labels.feature_name }} 漂移分数为 {{ $value }}"
-    
-    # 资源告警
-    - alert: HighGPUUtilization
-      expr: ml_gpu_utilization_percent > 90
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "GPU 利用率过高"
-        description: "GPU {{ $labels.gpu_id }} 利用率为 {{ $value }}%"
-    
-    # 预测量告警
-    - alert: LowPredictionVolume
-      expr: rate(ml_predictions_total[15m]) < 10
-      for: 15m
-      labels:
-        severity: info
-      annotations:
-        summary: "预测量偏低"
-        description: "预测速率为 {{ $value }} req/s"
-```
+groups:
+- name: ml-model-alerts
+  rules:
+  - alert: HighPredictionLatency
+    expr: histogram_quantile(0.99, rate(ml_prediction_latency_seconds_bucket[5m])) > 0.2
+    for: 5m
+    labels:
+      severity: high
+    annotations:
+      summary: "{{ $labels.model_name }}的高预测延迟"
+      description: "p99延迟为{{ $value }}秒，超过200毫秒阈值"
 
-### 9.4.3 自动化响应系统
+  - alert: ModelDriftDetected
+    expr: ml_feature_drift_psi > 0.25
+    for: 15m
+    labels:
+      severity: high
+    annotations:
+      summary: "检测到{{ $labels.feature_name }}的显著漂移"
+      description: "PSI为{{ $value }}，超过0.25阈值"
 
-🔴 **高级**
-
-```python
-import requests
-import json
-from datetime import datetime, timedelta
-from typing import Dict, List
-import logging
-
-class AutomatedResponseSystem:
-    def __init__(self, config: Dict):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-        # 初始化组件
-        self.prometheus_url = config.get('prometheus_url', 'http://localhost:9090')
-        self.alertmanager_url = config.get('alertmanager_url', 'http://localhost:9093')
-        self.kubernetes_api = config.get('kubernetes_api', 'https://kubernetes.default.svc')
-        
-    def check_model_health(self, model_name: str, model_version: str) -> Dict:
-        """检查模型整体健康状态"""
-        
-        # 查询 Prometheus 指标
-        queries = {
-            'accuracy': f'ml_model_accuracy{{model_name="{model_name}",model_version="{model_version}"}}',
-            'latency_p95': f'histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket{{model_name="{model_name}"}}[5m]))',
-            'error_rate': f'rate(ml_prediction_errors_total{{model_name="{model_name}"}}[5m]) / rate(ml_predictions_total{{model_name="{model_name}"}}[5m])',
-            'drift_score': f'ml_data_drift_score{{model_name="{model_name}"}}'
-        }
-        
-        results = {}
-        for metric_name, query in queries.items():
-            response = requests.get(f'{self.prometheus_url}/api/v1/query', params={'query': query})
-            if response.status_code == 200:
-                data = response.json()
-                if data['data']['result']:
-                    results[metric_name] = float(data['data']['result'][0]['value'][1])
-        
-        # 确定健康状态
-        health_status = {
-            'model_name': model_name,
-            'model_version': model_version,
-            'timestamp': datetime.now().isoformat(),
-            'metrics': results,
-            'status': 'healthy',
-            'issues': []
-        }
-        
-        # 检查阈值
-        if results.get('accuracy', 1.0) < 0.85:
-            health_status['status'] = 'degraded'
-            health_status['issues'].append('准确率偏低')
-        
-        if results.get('latency_p95', 0) > 0.5:
-            health_status['status'] = 'degraded'
-            health_status['issues'].append('延迟过高')
-        
-        if results.get('error_rate', 0) > 0.05:
-            health_status['status'] = 'critical'
-            health_status['issues'].append('错误率过高')
-        
-        if results.get('drift_score', 0) > 0.5:
-            health_status['status'] = 'warning'
-            health_status['issues'].append('检测到数据漂移')
-        
-        return health_status
-    
-    def auto_rollback(self, model_name: str, reason: str) -> bool:
-        """自动回滚到之前的模型版本"""
-        
-        self.logger.warning(f"触发自动回滚：{model_name}，原因：{reason}")
-        
-        # 获取之前稳定的版本
-        previous_version = self._get_previous_stable_version(model_name)
-        
-        if previous_version:
-            # 更新 SeldonDeployment
-            success = self._update_seldon_deployment(model_name, previous_version)
-            
-            if success:
-                # 发送通知
-                self._send_notification(
-                    severity="critical",
-                    title=f"自动回滚：{model_name}",
-                    message=f"已回滚到版本 {previous_version}。原因：{reason}"
-                )
-                
-                # 记录回滚事件
-                self._log_rollback_event(model_name, previous_version, reason)
-                
-                return True
-        
-        return False
-    
-    def auto_scale(self, model_name: str, metric: str, target_value: float) -> bool:
-        """根据指标自动扩缩模型部署"""
-        
-        # 获取当前副本数
-        current_replicas = self._get_current_replicas(model_name)
-        
-        # 根据指标计算期望副本数
-        if metric == 'latency':
-            current_latency = self._get_metric(model_name, 'latency_p95')
-            if current_latency > target_value * 1.2:
-                desired_replicas = min(current_replicas + 2, 10)  # 扩容
-            elif current_latency < target_value * 0.8:
-                desired_replicas = max(current_replicas - 1, 2)  # 缩容
-            else:
-                desired_replicas = current_replicas
-        elif metric == 'queue_depth':
-            current_queue = self._get_metric(model_name, 'queue_depth')
-            if current_queue > target_value:
-                desired_replicas = min(current_replicas + 1, 10)
-            else:
-                desired_replicas = current_replicas
-        
-        # 如果需要则应用扩缩
-        if desired_replicas != current_replicas:
-            return self._scale_deployment(model_name, desired_replicas)
-        
-        return True
-    
-    def trigger_retraining(self, model_name: str, reason: str) -> str:
-        """触发模型重训练管道"""
-        
-        # 创建 Kubeflow Pipeline 运行
-        pipeline_run = self._create_kubeflow_run(
-            pipeline_name="model-retraining",
-            params={
-                "model_name": model_name,
-                "reason": reason,
-                "trigger_time": datetime.now().isoformat()
-            }
-        )
-        
-        # 发送通知
-        self._send_notification(
-            severity="info",
-            title=f"重训练已触发：{model_name}",
-            message=f"管道运行已启动：{pipeline_run['run_id']}。原因：{reason}"
-        )
-        
-        return pipeline_run['run_id']
-    
-    def _get_previous_stable_version(self, model_name: str) -> str:
-        """获取之前稳定的模型版本"""
-        # 实现取决于模型注册中心
-        pass
-    
-    def _update_seldon_deployment(self, model_name: str, version: str) -> bool:
-        """更新 SeldonDeployment 使用指定版本"""
-        # 实现取决于 Kubernetes API
-        pass
-    
-    def _send_notification(self, severity: str, title: str, message: str):
-        """通过配置的渠道发送通知"""
-        
-        if severity == "critical":
-            # PagerDuty
-            self._send_pagerduty(title, message)
-        
-        # Slack
-        self._send_slack(severity, title, message)
-        
-        # 邮件
-        self._send_email(severity, title, message)
-    
-    def _send_pagerduty(self, title: str, message: str):
-        """发送 PagerDuty 告警"""
-        pass
-    
-    def _send_slack(self, severity: str, title: str, message: str):
-        """发送 Slack 通知"""
-        pass
-    
-    def _send_email(self, severity: str, title: str, message: str):
-        """发送邮件通知"""
-        pass
-    
-    def _log_rollback_event(self, model_name: str, version: str, reason: str):
-        """记录回滚事件用于审计"""
-        pass
-
-# 用法
-response_system = AutomatedResponseSystem({
-    'prometheus_url': 'http://prometheus:9090',
-    'alertmanager_url': 'http://alertmanager:9093',
-    'kubernetes_api': 'https://kubernetes.default.svc'
-})
-
-# 检查模型健康状态
-health = response_system.check_model_health("text-classifier", "v1.0")
-print(f"模型状态：{health['status']}")
-print(f"问题：{health['issues']}")
-
-# 如果严重则自动回滚
-if health['status'] == 'critical':
-    response_system.auto_rollback("text-classifier", health['issues'][0])
+  - alert: LowConfidenceScores
+    expr: avg(ml_prediction_confidence) < 0.3
+    for: 30m
+    labels:
+      severity: medium
+    annotations:
+      summary: "{{ $labels.model_name }}的低平均置信度"
+      description: "平均置信度为{{ $value }}，低于0.3阈值"
 ```
 
 ---
 
-## 9.5 可观测性平台架构
+## 9.9 何时使用/何时不使用
 
-### 9.5.1 ML 可观测性的三大支柱
+### 何时使用每种监控方法
 
-🟡 **中级**
+| 方法 | 最适合 | 何时使用 |
+|------|--------|---------|
+| **系统监控（Prometheus）** | 所有生产模型 | 始终——基线要求 |
+| **预测分布监控** | 具有渐进退化的模型 | 生产中的大多数ML模型 |
+| **特征漂移检测** | 输入数据变化的模型 | 在用户生成数据上训练的模型 |
+| **置信度分数监控** | 分类模型 | 预测置信度有意义时 |
+| **A/B测试监控** | 模型比较 | 模型部署和评估期间 |
+| **业务指标监控** | 所有模型 | 模型对业务的影响可衡量时 |
+| **影子模式评估** | 高风险模型 | 部署关键模型变更之前 |
 
-```
-ML 可观测性支柱：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              日志                                     │   │
-│  │  ├── 预测日志                                        │   │
-│  │  ├── 错误日志                                        │   │
-│  │  ├── 审计日志                                        │   │
-│  │  └── 系统日志                                        │   │
-│  │                                                     │   │
-│  │  工具：ELK Stack, Fluentd, Loki                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              指标                                     │   │
-│  │  ├── 模型指标（准确率、延迟）                         │   │
-│  │  ├── 系统指标（CPU、内存、GPU）                       │   │
-│  │  ├── 业务指标（转化率、收入）                         │   │
-│  │  └── 数据指标（漂移、质量）                           │   │
-│  │                                                     │   │
-│  │  工具：Prometheus, Grafana, DataDog                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              追踪                                     │   │
-│  │  ├── 请求追踪                                        │   │
-│  │  ├── 模型推理追踪                                     │   │
-│  │  ├── 数据管道追踪                                     │   │
-│  │  └── 分布式追踪                                      │   │
-│  │                                                     │   │
-│  │  工具：Jaeger, Zipkin, OpenTelemetry                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### 何时不使用
 
-### 9.5.2 完整可观测性架构
-
-🔴 **高级**
-
-```
-ML 可观测性平台架构：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              数据收集层                               │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 模型     │  │ 系统     │  │ 业务     │         │   │
-│  │  │ 指标     │  │ 指标     │  │ 指标     │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  │       ▼              ▼              ▼               │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │           Prometheus                         │   │   │
-│  │  │  ├── 时序存储                                │   │   │
-│  │  │  ├── PromQL 查询                            │   │   │
-│  │  │  └── 告警规则                               │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              可视化层                                 │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │              Grafana                         │   │   │
-│  │  │  ├── 模型性能仪表板                          │   │   │
-│  │  │  ├── 系统健康仪表板                          │   │   │
-│  │  │  ├── 业务指标仪表板                          │   │   │
-│  │  │  └── 告警管理                                │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              分析层                                   │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 漂移     │  │ 异常     │  │ 根因     │         │   │
-│  │  │ 检测     │  │ 检测     │  │ 分析     │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              响应层                                   │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 告警     │  │ 自动     │  │ 反馈     │         │   │
-│  │  │ 系统     │  │ 响应     │  │ 循环     │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.5.3 OpenTelemetry 集成
-
-🔴 **高级**
-
-```python
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.jaeger.thrift import JaegerExporter
-from opentelemetry.sdk.resources import Resource
-import time
-
-class MLTracingSetup:
-    def __init__(self, service_name: str, jaeger_endpoint: str):
-        # 创建资源
-        resource = Resource.create({
-            "service.name": service_name,
-            "service.version": "1.0.0",
-            "deployment.environment": "production"
-        })
-        
-        # 配置追踪器
-        provider = TracerProvider(resource=resource)
-        
-        # 配置 Jaeger 导出器
-        jaeger_exporter = JaegerExporter(
-            agent_host_name="localhost",
-            agent_port=6831,
-        )
-        
-        # 添加处理器
-        processor = BatchSpanProcessor(jaeger_exporter)
-        provider.add_span_processor(processor)
-        
-        # 设置全局追踪器
-        trace.set_tracer_provider(provider)
-        
-        self.tracer = trace.get_tracer(__name__)
-    
-    def trace_prediction(self, model_name: str, input_data: dict):
-        """追踪预测请求"""
-        
-        with self.tracer.start_as_current_span("prediction") as span:
-            # 添加属性
-            span.set_attribute("model.name", model_name)
-            span.set_attribute("input.size", len(str(input_data)))
-            
-            # 开始预处理 span
-            with self.tracer.start_as_current_span("preprocessing") as preprocess_span:
-                start_time = time.time()
-                # 预处理逻辑
-                processed_data = self._preprocess(input_data)
-                preprocess_span.set_attribute("preprocessing.duration", 
-                                            time.time() - start_time)
-            
-            # 开始推理 span
-            with self.tracer.start_as_current_span("inference") as inference_span:
-                start_time = time.time()
-                # 推理逻辑
-                prediction = self._predict(processed_data)
-                inference_span.set_attribute("inference.duration", 
-                                           time.time() - start_time)
-                inference_span.set_attribute("prediction.confidence", 
-                                           prediction.get('confidence', 0))
-            
-            # 开始后处理 span
-            with self.tracer.start_as_current_span("postprocessing") as postprocess_span:
-                start_time = time.time()
-                # 后处理逻辑
-                result = self._postprocess(prediction)
-                postprocess_span.set_attribute("postprocessing.duration", 
-                                             time.time() - start_time)
-            
-            return result
-    
-    def _preprocess(self, data):
-        """预处理逻辑"""
-        pass
-    
-    def _predict(self, data):
-        """推理逻辑"""
-        pass
-    
-    def _postprocess(self, prediction):
-        """后处理逻辑"""
-        pass
-
-# 用法
-tracing = MLTracingSetup(
-    service_name="text-classifier",
-    jaeger_endpoint="http://jaeger:14268/api/traces"
-)
-
-# 追踪预测
-result = tracing.trace_prediction(
-    model_name="text-classifier",
-    input_data={"text": "这是一个很好的产品！"}
-)
-```
+| 方法 | 何时避免 | 原因 |
+|------|---------|------|
+| **复杂漂移检测** | 具有静态数据的简单模型 | 开销超过收益 |
+| **实时监控** | 批量预测模型 | 批量监控足够 |
+| **按预测日志记录** | 高吞吐量模型（>100K QPS） | 存储成本过高 |
+| **置信度监控** | 不产生有意义置信度的模型 | 误导性信号 |
+| **自动化重训练触发** | 需要人工审查变更的模型 | 错误自动化决策的风险 |
 
 ---
 
-## 💡 案例研究：Prometheus + Grafana AI 监控系统
+## 9.10 总结
 
-### 系统架构
+ML监控与传统软件监控根本不同，因为ML模型会静默失败。监控策略必须涵盖四层：数据、模型、系统和业务。
 
-```
-Prometheus + Grafana AI 监控系统：
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              ML 服务                                  │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 模型     │  │ 训练     │  │ 数据     │         │   │
-│  │  │ 服务     │  │ 管道     │  │ 管道     │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  └───────┼──────────────┼──────────────┼───────────────┘   │
-│          │              │              │                    │
-│          ▼              ▼              ▼                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              指标导出器                               │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │ 自定义   │  │ Node     │  │ cAdvisor │         │   │
-│  │  │ 导出器   │  │ 导出器   │  │          │         │   │
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘         │   │
-│  │       │              │              │               │   │
-│  └───────┼──────────────┼──────────────┼───────────────┘   │
-│          │              │              │                    │
-│          ▼              ▼              ▼                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Prometheus 服务器                        │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  ├── 抓取间隔（15s-60s）                    │   │   │
-│  │  │  ├── 保留期（30天）                          │   │   │
-│  │  │  ├── 告警规则                               │   │   │
-│  │  │  └── 记录规则                               │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                   │
-│                         ▼                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Grafana 仪表板                           │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  仪表板 1：模型性能                           │   │   │
-│  │  │  ├── 准确率趋势                              │   │   │
-│  │  │  ├── 延迟分布                                │   │   │
-│  │  │  ├── 错误率                                  │   │   │
-│  │  │  └── 预测量                                  │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  仪表板 2：数据质量                           │   │   │
-│  │  │  ├── 数据漂移分数                             │   │   │
-│  │  │  ├── 特征分布                                │   │   │
-│  │  │  ├── 缺失值                                  │   │   │
-│  │  │  └── 数据新鲜度                              │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
-│  │  │  仪表板 3：系统健康                           │   │   │
-│  │  │  ├── CPU/内存使用                            │   │   │
-│  │  │  ├── GPU 利用率                              │   │   │
-│  │  │  ├── 网络 I/O                               │   │   │
-│  │  │  └── 磁盘使用                                │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              告警管道                                 │   │
-│  │                                                     │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │   │
-│  │  │Prometheus│  │ Alert    │  │ 通知     │         │   │
-│  │  │ 告警     │──│ Manager  │──│          │         │   │
-│  │  │ 规则     │  │          │  │          │         │   │
-│  │  └──────────┘  └──────────┘  └──────────┘         │   │
-│  │                     │              │               │   │
-│  │                     ▼              ▼               │   │
-│  │              ┌──────────┐  ┌──────────┐           │   │
-│  │              │ Slack    │  │PagerDuty │           │   │
-│  │              │          │  │          │           │   │
-│  │              └──────────┘  └──────────┘           │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+关键工具和实践：
+1. **Prometheus + Grafana**用于指标收集和可视化（行业标准）
+2. **统计漂移检测**使用PSI、KS检验和散度度量
+3. **多层监控**涵盖数据质量、预测分布、系统健康和业务KPI
+4. **领先指标的主动监控**（数据漂移、置信度分数），而不仅仅是滞后指标（准确性）
+5. **结构化告警**平衡敏感性和告警疲劳预防
 
-### 部署说明
-
-```bash
-# 1. 创建监控命名空间
-kubectl create namespace monitoring
-
-# 2. 部署 Prometheus
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm install prometheus prometheus-community/prometheus \
-  --namespace monitoring \
-  --set alertmanager.enabled=true
-
-# 3. 部署 Grafana
-helm repo add grafana https://grafana.github.io/helm-charts
-helm install grafana grafana/grafana \
-  --namespace monitoring \
-  --set adminPassword=admin123
-
-# 4. 部署自定义 ML 导出器
-cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ml-metrics-exporter
-  namespace: monitoring
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: ml-metrics-exporter
-  template:
-    metadata:
-      labels:
-        app: ml-metrics-exporter
-    spec:
-      containers:
-      - name: exporter
-        image: registry.example.com/ml-metrics-exporter:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: PROMETHEUS_URL
-          value: "http://prometheus-server:9090"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ml-metrics-exporter
-  namespace: monitoring
-spec:
-  selector:
-    app: ml-metrics-exporter
-  ports:
-  - port: 8000
-    targetPort: 8000
-EOF
-
-# 5. 访问仪表板
-kubectl port-forward svc/grafana 3000:80 -n monitoring
-# Grafana：http://localhost:3000 (admin/admin123)
-
-kubectl port-forward svc/prometheus-server 9090:80 -n monitoring
-# Prometheus：http://localhost:9090
-```
-
-### 仪表板配置
-
-```json
-{
-  "dashboard": {
-    "title": "ML 模型监控仪表板",
-    "uid": "ml-model-monitoring",
-    "panels": [
-      {
-        "title": "模型准确率趋势",
-        "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-        "targets": [
-          {
-            "expr": "ml_model_accuracy{model_name=\"text-classifier\"}",
-            "legendFormat": "{{model_version}}"
-          }
-        ],
-        "fieldConfig": {
-          "defaults": {
-            "thresholds": {
-              "steps": [
-                { "color": "red", "value": null },
-                { "color": "green", "value": 0.85 }
-              ]
-            }
-          }
-        }
-      },
-      {
-        "title": "预测延迟（P95）",
-        "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, rate(ml_prediction_latency_seconds_bucket{model_name=\"text-classifier\"}[5m]))",
-            "legendFormat": "P95 延迟"
-          }
-        ]
-      },
-      {
-        "title": "数据漂移分数",
-        "type": "bargauge",
-        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-        "targets": [
-          {
-            "expr": "ml_data_drift_score{model_name=\"text-classifier\"}",
-            "legendFormat": "{{feature_name}}"
-          }
-        ]
-      },
-      {
-        "title": "GPU 利用率",
-        "type": "gauge",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-        "targets": [
-          {
-            "expr": "ml_gpu_utilization_percent",
-            "legendFormat": "GPU {{gpu_id}}"
-          }
-        ]
-      }
-    ],
-    "refresh": "30s",
-    "time": {
-      "from": "now-24h",
-      "to": "now"
-    }
-  }
-}
-```
+Uber的案例研究表明，监控领先指标可以在问题影响业务结果之前预防问题。战争故事表明，仅监控系统健康而忽略预测质量可能导致灾难性故障。
 
 ---
 
-## 总结
+## 9.11 讨论题
 
-**关键要点：**
+1. **监控优先级**：你有100个生产模型但只能对10个实施全面监控。你如何决定监控哪10个？你会使用什么标准？
 
-1. **模型漂移**是不可避免的——持续监控至关重要
-2. **数据漂移检测**需要统计严谨性和适当的基线
-3. **性能监控**必须涵盖模型质量、运营和业务指标
-4. **告警**应该是可操作的且分级的
-5. **可观测性**需要日志、指标和追踪协同工作
+2. **漂移检测**：一个模型显示一个特征的PSI = 0.15。这处于"中度漂移"区域。在决定重训练之前你会采取哪些步骤？
 
-**最佳实践：**
+3. **告警设计**：你的ML监控系统每天生成50个告警，团队正在经历告警疲劳。你将如何重新设计告警策略？
 
-- 在模型开发期间建立清晰的基线
-- 实现具有可配置阈值的自动漂移检测
-- 构建能讲故事的全面仪表板
-- 为常见问题创建操作手册
-- 定期审查和更新监控规则
+4. **真实标签延迟**：对于欺诈检测模型，真实标签（确认的欺诈）仅在预测后30天才可用。你在此期间如何监控模型性能？
 
-**完整 MLOps 架构：**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    完整 MLOps 架构                                │
-│                                                                 │
-│  第6章：MLOps 基础                                               │
-│  ├── 成熟度模型（Level 0-3）                                     │
-│  ├── 工具链选择                                                  │
-│  └── DevOps vs MLOps                                           │
-│                                                                 │
-│  第7章：模型训练                                                 │
-│  ├── 训练环境设计                                                │
-│  ├── 分布式训练                                                 │
-│  ├── HPO 与实验跟踪                                             │
-│  └── 资源管理                                                  │
-│                                                                 │
-│  第8章：模型部署                                                 │
-│  ├── 部署策略                                                   │
-│  ├── 模型服务（Seldon Core）                                    │
-│  ├── A/B 测试与金丝雀发布                                       │
-│  └── 推理优化                                                  │
-│                                                                 │
-│  第9章：模型监控                                                 │
-│  ├── 漂移检测                                                   │
-│  ├── 性能监控                                                   │
-│  ├── 告警与响应                                                 │
-│  └── 可观测性平台                                               │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+5. **成本 vs. 覆盖**：一个模型的全面监控每年需要5000美元的基础设施成本。对于每年产生10万美元业务价值的模型来说这值得吗？1万美元的呢？
 
 ---
 
-*第9章结束*
-*第三部分 MLOps 架构结束*
+## 9.12 练习
+
+### 练习1：监控仪表板设计
+
+为信用风险评分模型设计Grafana仪表板，要求：
+- 每天服务50,000次预测
+- 使用15个输入特征
+- 有3个模型版本（champion + 2个挑战者）
+- 必须满足审计跟踪的法规要求
+
+**任务：**
+1. 列出你要监控的指标
+2. 设计仪表板布局（面板类型和排列）
+3. 为每个指标设置告警阈值
+4. 为不同受众设计仪表板（执行 vs. 运维）
+
+### 练习2：漂移检测管道
+
+实现漂移检测管道，要求：
+- 每小时接收10,000次预测
+- 将特征分布与训练参考进行比较
+- 计算每个特征的PSI
+- 当任何特征的PSI > 0.25时告警
+
+**任务：**
+1. 编写PSI计算的Python代码
+2. 设计参考和当前分布的数据存储
+3. 实现告警逻辑
+4. 估计计算成本
+
+### 练习3：静默故障调查
+
+你收到警报，一个推荐模型的置信度分数在过去一周从0.75下降到0.45。没有其他告警触发。
+
+**任务：**
+1. 列出5个置信度分数下降的假设
+2. 设计调查计划以识别根本原因
+3. 确定这是数据漂移、概念漂移还是系统问题
+4. 提出建议：重训练、回滚还是继续监控？
+
+---
+
+## 9.13 参考资料
+
+- **Prometheus文档**：https://prometheus.io/docs/introduction/overview/
+- **Prometheus最佳实践**：https://prometheus.io/docs/practices/naming/
+- **Grafana文档**：https://grafana.com/docs/
+- **Grafana ML仪表板示例**：https://grafana.com/grafana/dashboards/
+- **Seldon Core监控**：https://docs.seldon.io/projects/seldon-core/en/latest/analytics/analytics.html
+- **Uber工程博客**：https://eng.uber.com/
+- **Uber Michelangelo ML平台**：https://www.uber.com/blog/michelangelo-machine-learning-platform/
+- **Evidently AI（漂移检测）**：https://www.evidentlyai.com/
+- **NannyML（性能估计）**：https://nannyml.readthedocs.io/
+- **Alibi Detect（漂移检测）**：https://docs.seldon.io/projects/alibi-detect/en/latest/
+- **Great Expectations（数据验证）**：https://docs.greatexpectations.io/
+- **Google ML监控最佳实践**：https://cloud.google.com/architecture/ml-monitoring-strategy

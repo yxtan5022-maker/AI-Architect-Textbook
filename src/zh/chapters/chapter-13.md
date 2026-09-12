@@ -4,57 +4,113 @@
 
 ---
 
+## 学习目标
+
+完成本章后，你将能够：
+
+1. 比较全量微调 vs 参数高效微调（LoRA、QLoRA、Adapter）在显存、速度和质量上的差异
+2. 设计从数据准备到评估的指令微调流水线
+3. 使用 PEFT、TRL 和 Unsloth 实现 LoRA/QLoRA 微调
+4. 比较 RLHF、DPO 和 KTO 用于对齐训练
+5. 识别和预防常见微调失败（灾难性遗忘、过拟合、奖励攻击）
+6. 计算不同模型规模微调的资源需求
+
+---
+
 ## 目录
 
-- [13.1 全量微调 vs 参数高效微调](#131-全量微调-vs-参数高效微调)
+- [13.1 全量 vs 参数高效微调](#131-全量-vs-参数高效微调)
 - [13.2 LoRA/QLoRA 架构设计](#132-loraqlora-架构设计)
 - [13.3 指令微调流水线](#133-指令微调流水线)
 - [13.4 RLHF/DPO 架构](#134-rlhfdpo-架构)
 - [13.5 微调数据管理](#135-微调数据管理)
-- [💡 案例：基于 Unsloth 的高效微调实践](#-案例基于-unsloth-的高效微调实践)
+- [13.6 评估与监控](#136-评估与监控)
+- [💡 案例研究：医疗公司如何微调临床 NLP](#-案例研究医疗公司如何微调临床-nlp)
+- [⚠️ 战争故事：微调后模型比基座模型更差](#️-战争故事微调后模型比基座模型更差)
+- [📝 何时使用 / 何时不使用](#-何时使用--何时不使用)
 - [本章小结](#本章小结)
+- [讨论题](#讨论题)
+- [练习](#练习)
 - [参考文献](#参考文献)
 
 ---
 
-## 13.1 全量微调 vs 参数高效微调
+## 13.1 全量 vs 参数高效微调
 
 ### 13.1.1 微调光谱
 
-微调将预训练模型适配到特定任务或领域。全量微调和参数高效微调（PEFT）之间的选择取决于可用资源、数据大小和任务需求：
+微调将预训练模型适配到特定任务或领域。全量微调和参数高效微调（PEFT）的选择取决于可用资源、数据大小和任务需求：
 
-| 数据需求 | 资源 | 质量 | 方法 |
-|----------|------|------|------|
-| 10-100 个样本 | 最小 | 好 | 少样本（无微调） |
-| 100-1K 个样本 | 低 | 更好 | LoRA/QLoRA |
-| 1K-10K 个样本 | 中 | 很好 | 全量微调（小模型） |
-| 10K-100K 个样本 | 高 | 最好 | 全量微调（大模型） |
-| 100K+ 个样本 | 很高 | 最好+ | 从头预训练 |
+```
+┌──────────────────────────────────────────────────────────────┐
+│              微调方法光谱                                        │
+│                                                                │
+│  所需数据     │ 资源    │ 质量 │ 方法                         │
+│  ─────────────│────────│─────│──────────────────────────────│
+│  10-100 样本  │ 极少   │ 好  │ 少样本（不微调）               │
+│  100-1K 样本  │ 低     │ 更好│ LoRA/QLoRA                    │
+│  1K-10K 样本  │ 中等   │ 很好│ 全量微调（小模型）             │
+│  10K-100K 样本│ 高     │ 最佳│ 全量微调（大模型）             │
+│  100K+ 样本   │ 极高   │ 最佳+│ 从头预训练                    │
+│                                                                │
+│  显存对比（LLaMA-2 7B）：                                       │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  全量微调：                                            │    │
+│  │  参数：7B × 4 字节（fp32）= 28 GB                     │    │
+│  │  梯度：7B × 4 字节 = 28 GB                            │    │
+│  │  优化器：7B × 8 字节（Adam）= 56 GB                   │    │
+│  │  总计：~112 GB（需要 2 × A100 80GB）                  │    │
+│  │                                                       │    │
+│  │  LoRA 微调（rank=16）：                                │    │
+│  │  基座模型：7B × 2 字节（bf16）= 14 GB（冻结）         │    │
+│  │  LoRA 参数：~20M × 4 字节 = 80 MB                    │    │
+│  │  LoRA 梯度：~20M × 4 字节 = 80 MB                    │    │
+│  │  LoRA 优化器：~40M × 8 字节 = 320 MB                 │    │
+│  │  总计：~15 GB（可放入 1 × A100 40GB）                │    │
+│  │                                                       │    │
+│  │  QLoRA 微调（rank=16，4 位）：                         │    │
+│  │  基座模型：7B × 0.5 字节 = 3.5 GB（4 位，冻结）      │    │
+│  │  LoRA 参数：~20M × 2 字节 = 40 MB                    │    │
+│  │  LoRA 梯度：~20M × 2 字节 = 40 MB                    │    │
+│  │  LoRA 优化器：~40M × 4 字节 = 160 MB                 │    │
+│  │  总计：~4 GB（可放入消费级 GPU）                      │    │
+│  └──────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
+```
 
-**内存对比（LLaMA-2 7B）：**
+📌 **真实数据**：PEFT（github.com/huggingface/peft）是 Hugging Face 的官方参数高效微调库，支持 LoRA、AdaLoRA、Prefix Tuning 等。TRL（github.com/huggingface/trl）提供 RLHF/DPO 的训练循环。Unsloth（github.com/unslothai/unsloth）实现 2-5 倍更快的 LoRA/QLoRA 微调，显存减少 70%。
 
-| 方法 | 参数 | 梯度 | 优化器 | 总计 |
-|------|------|------|--------|------|
-| 全量微调 (fp32) | 28 GB | 28 GB | 56 GB | ~112 GB |
-| LoRA (rank=16, bf16) | 14 GB (冻结) | 80 MB | 320 MB | ~15 GB |
-| QLoRA (rank=16, 4-bit) | 3.5 GB (冻结) | 40 MB | 160 MB | ~4 GB |
+### 13.1.2 全量微调 vs PEFT 决策矩阵
 
-📌 **核心概念**：全量微调更新所有模型参数。PEFT 方法仅更新一小部分参数，保持基础模型冻结。
+```
+┌──────────────────────────────────────────────────────────────┐
+│              决策矩阵：全量 FT vs PEFT                          │
+│                                                                │
+│  因素                │ 全量 FT   │ LoRA/QLoRA  │ Adapter    │
+│  ────────────────────│──────────│─────────────│────────────│
+│  GPU 显存需求         │ 极高     │ 低          │ 低         │
+│  训练速度             │ 慢       │ 快          │ 快         │
+│  灾难性遗忘风险       │ 高       │ 低          │ 低         │
+│  领域适配             │ 最佳     │ 好          │ 好         │
+│  任务特定             │ 最佳     │ 好          │ 好         │
+│  多任务               │ 不实用   │ 简单（换）  │ 简单       │
+│  模型规模限制         │ ≤70B     │ ≤405B       │ ≤405B      │
+│  数据需求             │ 高       │ 低-中       │ 低         │
+│  推理开销             │ 无       │ 无*         │ 5-10%      │
+│  超参数调优           │ 复杂     │ 简单        │ 中等       │
+│                                                                │
+│  * LoRA 权重可合并到基座模型，零开销                             │
+└──────────────────────────────────────────────────────────────┘
+```
 
-### 13.1.2 何时使用每种方法
+### 13.1.3 按模型规模的资源需求
 
-| 因素 | 全量微调 | LoRA/QLoRA |
-|------|---------|-----------|
-| GPU 内存需求 | 很高 | 低 |
-| 训练速度 | 慢 | 快 |
-| 灾难性遗忘 | 高风险 | 低风险 |
-| 领域适配 | 最好 | 好 |
-| 多任务 | 不切实际 | 容易（切换） |
-| 模型大小限制 | ≤70B | ≤405B |
-
-**推荐：**
-- **使用全量微调**：有 >100K 高质量样本、任务与预训练非常不同、需要最高质量
-- **使用 LoRA/QLoRA**：计算资源有限、需要多任务、数据有限、需要保留基础模型能力
+| 模型规模 | 全量 FT（BF16） | LoRA（rank=16） | QLoRA（4 位） | 1 × RTX 4090 |
+|---------|----------------|----------------|---------------|-------------|
+| 7B | 2 × A100 80GB | 1 × A100 40GB | 1 × RTX 4090 | ✅ |
+| 13B | 4 × A100 80GB | 1 × A100 80GB | 1 × RTX 4090 | ✅（紧张） |
+| 70B | 16 × A100 80GB | 4 × A100 80GB | 2 × A100 80GB | ❌ |
+| 405B | 128 × A100 80GB | 16 × A100 80GB | 8 × A100 80GB | ❌ |
 
 ---
 
@@ -62,226 +118,211 @@
 
 ### 13.2.1 LoRA：低秩适配
 
-📌 **核心概念**：LoRA 不更新完整的权重矩阵 W（d × d），而是学习两个小矩阵 A（d × r）和 B（r × d），其中 r << d。更新为：W' = W + BA。
+LoRA（Hu et al., 2022）冻结预训练模型权重，并在每一层注入可训练的低秩分解矩阵：
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    LoRA 架构                                    │
 │                                                                │
-│  x ──────────────────────┐                                   │
-│  │                       │                                   │
-│  ▼                       ▼                                   │
-│  ┌──────┐           ┌─────────┐                             │
-│  │  W   │（冻结）    │ A (d×r) │（可训练）                    │
-│  │      │           └────┬────┘                             │
-│  └──┬───┘                │                                   │
-│     │                    ▼                                   │
-│     │               ┌─────────┐                             │
-│     │               │ B (r×d) │（可训练）                    │
-│     │               └────┬────┘                             │
-│     │                    │                                   │
-│     └────────┬───────────┘                                   │
-│              ▼                                               │
-│         y = Wx + BAx                                        │
+│  原始层：                                                      │
+│  h = Wx     （W 是 d×d，冻结）                                 │
 │                                                                │
-│  对于 rank r=16：                                             │
-│  LoRA 参数: 4096×16 + 16×4096 = 131K                        │
-│  比率: 131K / 16.8M = 0.78%                                  │
-│  内存节省: 128 倍                                             │
+│  LoRA 层：                                                     │
+│  h = Wx + BAx                                                  │
+│       │   │ │                                                  │
+│       │   │ └─ B：d×r 矩阵（随机初始化）                       │
+│       │   └─── A：r×d 矩阵（随机初始化）                       │
+│       └─────── 冻结的原始权重                                   │
+│                                                                │
+│  其中 r << d（典型值：r=8, 16, 32, 64）                        │
+│                                                                │
+│  可训练参数：每层 2 × d × r                                     │
+│  对于 d=4096, r=16：每层 2 × 4096 × 16 = 131K 参数            │
+│  对于 32 层：32 × 131K = 4.2M 总 LoRA 参数                    │
+│  （vs 7B 基座模型 = 参数的 0.06%）                              │
+│                                                                │
+│  推理时：合并 W_new = W + BA（零开销）                          │
 └──────────────────────────────────────────────────────────────┘
-```
-
-```python
-import torch
-import torch.nn as nn
-import math
-
-class LoRALinear(nn.Module):
-    def __init__(self, original_linear, rank=16, alpha=32, dropout=0.05):
-        super().__init__()
-        self.original_linear = original_linear
-        self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-        self.original_linear.weight.requires_grad = False
-        if self.original_linear.bias is not None:
-            self.original_linear.bias.requires_grad = False
-        d_out, d_in = original_linear.weight.shape
-        self.lora_A = nn.Parameter(torch.empty(d_in, rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, d_out))
-        self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    def forward(self, x):
-        original_output = self.original_linear(x)
-        lora_output = self.lora_dropout(x)
-        lora_output = lora_output @ self.lora_A @ self.lora_B * self.scaling
-        return original_output + lora_output
-
-    def merge_weights(self):
-        self.original_linear.weight.data += (
-            self.lora_B @ self.lora_A * self.scaling
-        ).to(self.original_linear.weight.dtype)
 ```
 
 ### 13.2.2 QLoRA：量化 LoRA
 
-QLoRA（Dettmers 等，2023）将 4 位量化与 LoRA 结合：
+QLoRA（Dettmers et al., 2023）将 4 位量化与 LoRA 结合：
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    QLoRA 架构                                   │
 │                                                                │
-│  4 位 NF4 量化基础模型（3.5 GB for 7B）                        │
-│  + 双重量化（额外节省 0.37 GB）                                │
-│  + 分页优化器（AdamW 状态 CPU 卸载）                            │
-│  + LoRA 可训练适配器                                           │
+│  步骤 1：将基座模型量化为 4 位（NF4 格式）                      │
+│  ┌──────────────────────────────────────────────┐            │
+│  │  基座模型（4 位 NF4）：                         │            │
+│  │  W_4bit = quantize(W_fp32)                    │            │
+│  │  显存：7B × 0.5 字节 = 3.5 GB                 │            │
+│  └──────────────────────────────────────────────┘            │
 │                                                                │
-│  训练流程：                                                     │
-│  输入 x → 反量化 W → 计算 Wx (fp16)                           │
-│                    ↕                                           │
-│              LoRA (fp16): A×B                                  │
-│                    ↓                                           │
-│  输出 = Wx + BAx (fp16)                                      │
-│  仅 A, B 参数可训练                                            │
+│  步骤 2：以 FP16/BF16 添加 LoRA 适配器                        │
+│  ┌──────────────────────────────────────────────┐            │
+│  │  LoRA 适配器（FP16）：                          │            │
+│  │  A：d×r = 4096×16 = 131K 参数                 │            │
+│  │  B：r×d = 16×4096 = 131K 参数                 │            │
+│  │  显存：262K × 2 字节 = 524 KB/层              │            │
+│  └──────────────────────────────────────────────┘            │
+│                                                                │
+│  步骤 3：前向传播                                              │
+│  h = dequant(W_4bit) × x + B × A × x                          │
+│      ─────────────────   ────────────                          │
+│      以 FP16 计算      以 FP16 计算                             │
+│                                                                │
+│  双重量化：                                                    │
+│  量化常量也进行量化                                             │
+│  为 7B 模型节省 ~0.4 GB                                        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-```python
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+📌 **真实数据**：QLoRA 使得在单个 48GB GPU 上微调 65B 参数模型成为可能，同时保持完整 16 位微调任务性能。原始 QLoRA 论文在单个 48GB A6000 GPU 上微调了 65B 模型，结果与完整 16 位微调相当（Dettmers et al., 2023）。
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
+### 13.2.3 LoRA 配置指南
 
-model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b-hf",
-    quantization_config=bnb_config,
-    device_map="auto",
-)
-model = prepare_model_for_kbit_training(model)
+| 目标模块 | 影响范围 | 典型选择 |
+|---------|---------|---------|
+| `q_proj, v_proj` | 仅注意力 | 快速实验 |
+| `q_proj, k_proj, v_proj, o_proj` | 完整注意力 | 好的默认选择 |
+| `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj` | 注意力 + FFN | 最佳质量 |
+| 所有线性层 | 所有可能 | 最大灵活性 |
 
-lora_config = LoraConfig(
-    r=16, lora_alpha=32, lora_dropout=0.05,
-    bias="none", task_type="CAUSAL_LM",
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
-)
+| Rank (r) | 质量 | 显存 | 速度 | 何时使用 |
+|----------|------|------|------|---------|
+| 4 | 好 | 最低 | 最快 | 快速实验 |
+| 8 | 更好 | 低 | 快 | 默认选择 |
+| 16 | 非常好 | 中等 | 中等 | 生产质量 |
+| 32 | 优秀 | 较高 | 较慢 | 高质量要求 |
+| 64 | 最佳 | 高 | 最慢 | 最高质量（收益递减） |
 
-model = get_peft_model(model, lora_config)
-model.print_trainable_parameters()
-# trainable params: 33,554,432 || all params: 6,771,970,048 || 0.50%
-```
-
-### 13.2.3 LoRA 变体与秩选择
-
-| 变体 | 关键创新 | 最佳场景 |
-|------|---------|---------|
-| LoRA | 低秩分解 | 通用微调 |
-| QLoRA | 4位基础 + LoRA | 内存受限 |
-| DoRA | 分解秩适配 | 更高质量 |
-| LoRA+ | A, B 不同学习率 | 更快收敛 |
-| rsLoRA | 秩稳定缩放 | 大秩稳定性 |
-| AdaLoRA | 自适应秩分配 | 混合重要性 |
-
-**LoRA 秩选择指南：**
-- 分类任务：4-8
-- 指令微调：8-32
-- 领域适配：16-64
-- 复杂推理：32-128
-- 代码生成：16-64
+| Alpha (α) | 效果 | 典型设置 |
+|-----------|------|---------|
+| α = r | 平衡 | α=r（如 16） |
+| α = 2r | 更强适配 | 基座模型与目标差异大时 |
+| α = r/2 | 较弱适配 | 基座模型接近目标时 |
 
 ---
 
 ## 13.3 指令微调流水线
 
-### 13.3.1 数据格式
-
-指令微调教会模型遵循指令并产生期望的输出。常见数据格式包括：
-
-- **Alpaca 格式**：instruction + input + output 三字段
-- **ShareGPT 格式**：多轮对话 conversations 数组
-- **ChatML 格式**：OpenAI 兼容的特殊 token 格式
-
-**数据质量指南：**
-- ✅ 多样化的指令（避免重复）
-- ✅ 详细、全面的输出
-- ✅ 一致的格式和风格
-- ✅ 任务类型平衡
-- ❌ 无幻觉事实
-- ❌ 无有毒或偏见内容
-- ❌ 无过短或敷衍的回复
-
-### 13.3.2 完整指令微调流水线
-
-```python
-class InstructionTuningPipeline:
-    def __init__(self, model_name, output_dir):
-        self.model_name = model_name
-        self.output_dir = output_dir
-        self.setup_model()
-
-    def setup_model(self):
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = prepare_model_for_kbit_training(self.model)
-
-    def train(self, dataset, rank=16):
-        lora_config = LoraConfig(
-            r=rank, lora_alpha=32, lora_dropout=0.05,
-            bias="none", task_type="CAUSAL_LM",
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj"],
-        )
-        model = get_peft_model(self.model, lora_config)
-        training_args = SFTConfig(
-            output_dir=self.output_dir,
-            num_train_epochs=3,
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            learning_rate=2e-4,
-            bf16=True,
-            optim="paged_adamw_32bit",
-            gradient_checkpointing=True,
-            max_seq_length=2048,
-            packing=True,
-        )
-        trainer = SFTTrainer(
-            model=model, train_dataset=dataset,
-            tokenizer=self.tokenizer, args=training_args,
-        )
-        trainer.train()
-        model.save_pretrained(f"{self.output_dir}/adapter")
-```
-
-### 13.3.3 数据质量与策划
+### 13.3.1 端到端流水线
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              数据质量流水线                                      │
+│              指令微调流水线                                      │
 │                                                                │
-│  原始数据源 → 去重 → 质量过滤 → 平衡与增强 → 最终数据集      │
-│                                                                │
-│  去重：精确匹配、模糊匹配（MinHash/LSH）、语义去重              │
-│  过滤：移除有毒内容、过短/过长回复、低质量评分                  │
-│  平衡：任务类别平衡、添加 CoT 数据（20%）、多轮对话（15%）     │
+│  1. 数据准备                                                   │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  源数据 → 格式化 → 过滤 → 切分 → 分词                  │    │
+│  │                                                        │    │
+│  │  格式：{"instruction": "...", "input": "...",          │    │
+│  │           "output": "..."}                             │    │
+│  │  过滤：去除重复、过长/过短、有害内容                      │    │
+│  │  切分：90% 训练，5% 验证，5% 测试                       │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                           │                                    │
+│                           ▼                                    │
+│  2. 训练配置                                                   │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  模型：基座模型 + LoRA 配置                            │    │
+│  │  优化器：AdamW（通过 bitsandbytes 8 位）               │    │
+│  │  调度器：余弦 + warmup                                 │    │
+│  │  Batch size：有效 = micro_batch × grad_accum × GPUs    │    │
+│  │  学习率：1e-4 到 3e-4（LoRA）                          │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                           │                                    │
+│                           ▼                                    │
+│  3. 训练循环（TRL 的 SFTTrainer）                              │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  for epoch in epochs:                                 │    │
+│  │      for batch in dataloader:                         │    │
+│  │          loss = model(batch)                          │    │
+│  │          loss.backward()                              │    │
+│  │          optimizer.step()                             │    │
+│  │      在验证集上评估                                     │    │
+│  │      保存最佳检查点                                     │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                           │                                    │
+│                           ▼                                    │
+│  4. 评估                                                      │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  自动：MMLU、HumanEval、MT-Bench                        │    │
+│  │  人工评估：质量、安全性、有用性                          │    │
+│  │  A/B 测试：与基座模型比较                               │    │
+│  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### 13.3.2 训练配置示例
+
+```python
+from transformers import TrainingArguments
+from trl import SFTTrainer
+from peft import LoraConfig
+
+# LoRA 配置
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+# 训练参数
+training_args = TrainingArguments(
+    output_dir="./output",
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,  # 有效 batch = 4*8*4 = 128
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    bf16=True,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=500,
+    evaluation_strategy="steps",
+    eval_steps=500,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    report_to="wandb",
+    gradient_checkpointing=True,
+    optim="adamw_torch_8bit",
+)
+
+# SFT Trainer
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    peft_config=lora_config,
+    tokenizer=tokenizer,
+    args=training_args,
+    max_seq_length=2048,
+    dataset_text_field="text",
+)
+
+trainer.train()
+```
+
+### 13.3.3 超参数指南
+
+| 超参数 | 范围 | 默认值 | 注意事项 |
+|--------|------|--------|---------|
+| 学习率 | 1e-5 到 5e-4 | 2e-4 | LoRA 较高，全量 FT 较低 |
+| Batch Size | 8-256 | 64 | 越大越稳定，需要更多显存 |
+| Epochs | 1-5 | 3 | 数据越多需要的 epoch 越少 |
+| Warmup Ratio | 0.01-0.1 | 0.03 | 总步数的 3% |
+| Weight Decay | 0-0.1 | 0.01 | 正则化 |
+| LoRA Rank | 4-64 | 16 | 越高容量越大 |
+| LoRA Alpha | 8-128 | 32 | 通常为 rank 的 2 倍 |
+| LoRA Dropout | 0-0.1 | 0.05 | 正则化 |
 
 ---
 
@@ -289,652 +330,403 @@ class InstructionTuningPipeline:
 
 ### 13.4.1 RLHF 流水线
 
-RLHF（基于人类反馈的强化学习）使模型与人类偏好对齐：
+基于人类反馈的强化学习将模型与人类偏好对齐：
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    RLHF 流水线                                 │
 │                                                                │
-│  阶段 1: 监督微调 (SFT)                                        │
-│  基础模型 → 在人类示范上 SFT → SFT 模型                       │
-│                                                                │
-│  阶段 2: 奖励模型训练                                          │
-│  SFT 模型生成 K 个回答 → 人类排序 A>B>C>D                      │
-│  训练奖励模型: L_rank = -log(σ(r(y_a) - r(y_b)))             │
-│                                                                │
-│  阶段 3: PPO 优化                                              │
-│  最大化: r(y) - β × KL(π_θ || π_ref)                         │
-│  π_θ: 策略模型（优化中）                                       │
-│  π_ref: 参考模型（SFT 模型，冻结）                             │
-│  r(y): 奖励模型评分                                            │
-│  β: KL 惩罚系数                                               │
+│  阶段 1：监督微调（SFT）                                       │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  基座模型 + 指令数据 → SFT 模型                         │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                           │                                    │
+│                           ▼                                    │
+│  阶段 2：奖励模型训练                                           │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  收集人类偏好数据：                                     │    │
+│  │  Prompt → 生成 2 个回答 → 人类排序（A > B）             │    │
+│  │                                                        │    │
+│  │  训练奖励模型：                                          │    │
+│  │  Loss = -log(sigmoid(r(A) - r(B)))                     │    │
+│  │  奖励模型学习评分回答质量                                │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                           │                                    │
+│                           ▼                                    │
+│  阶段 3：PPO 优化                                              │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  for each prompt:                                      │    │
+│  │      response = SFT_model(prompt)                      │    │
+│  │      reward = Reward_model(prompt, response)           │    │
+│  │      KL_penalty = KL(SFT_model || current_model)      │    │
+│  │      loss = -(reward - β × KL_penalty)                 │    │
+│  │      通过 PPO 更新 current_model                       │    │
+│  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### 13.4.2 DPO：直接偏好优化
 
-📌 **核心概念**：DPO 直接使用偏好对优化策略，避免了 PPO 的 RL 训练复杂性。
-
-| 方面 | RLHF (PPO) | DPO |
-|------|-----------|-----|
-| 阶段数 | 3 (SFT + RM + PPO) | 2 (SFT + DPO) |
-| 所需数据 | 偏好 + 奖励模型 | 偏好对 (chosen/rejected) |
-| 复杂度 | 高 | 低 |
-| 内存需求 | 4 个模型 | 2 个模型 |
-| 稳定性 | 不稳定 | 稳定 |
-| 质量 | 最好（调优后） | 好 |
-
-```python
-from trl import DPOTrainer, DPOConfig
-
-def train_dpo(model_name, preference_data, output_dir):
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-    ref_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    dataset = Dataset.from_dict({
-        "prompt": [item["prompt"] for item in preference_data],
-        "chosen": [item["chosen"] for item in preference_data],
-        "rejected": [item["rejected"] for item in preference_data],
-    })
-
-    dpo_config = DPOConfig(
-        output_dir=output_dir,
-        num_train_epochs=1,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
-        learning_rate=5e-7,
-        beta=0.1,
-        loss_type="sigmoid",
-        bf16=True,
-    )
-
-    trainer = DPOTrainer(
-        model=model, ref_model=ref_model,
-        args=dpo_config, train_dataset=dataset,
-        tokenizer=tokenizer,
-    )
-    trainer.train()
-    return trainer
-```
-
-### 13.4.3 其他对齐方法
-
-| 方法 | 数据需求 | 复杂度 | 质量 |
-|------|---------|--------|------|
-| RLHF (PPO) | 偏好 + RM | 高 | 最好（如调优） |
-| DPO | 对 (chosen/rej) | 低 | 好 |
-| IPO | 对 | 低 | 好 |
-| KTO | 二元 (好/坏) | 低 | 好 |
-| ORPO | 对 | 低 | 好 |
-| RLAIF | AI 偏好 | 中 | 好 |
-
----
-
-## 13.5 微调数据管理
-
-### 13.5.1 数据收集与标注
-
-- **人类标注**：最高质量，最高成本
-- **合成生成**：使用 GPT-4/Claude
-- **现有数据集**：Alpaca、Dolly 等
-- **领域特定收集**：垂直领域数据
-
-### 13.5.2 合成数据生成
-
-```python
-class SyntheticDataGenerator:
-    def __init__(self, api_key, model="gpt-4"):
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-
-    def generate_instructions(self, topic, num_samples=100):
-        prompt = f"Generate {num_samples} diverse, high-quality instructions about {topic}."
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-        return json.loads(response.choices[0].message.content)
-
-    def generate_preference_pairs(self, instructions, num_pairs=1000):
-        pairs = []
-        for inst in instructions[:num_pairs]:
-            response_a = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": inst["instruction"]}],
-                max_tokens=1024,
-            )
-            response_b = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": inst["instruction"]}],
-                max_tokens=1024,
-            )
-            # 由裁判判断哪个更好
-            pairs.append({
-                "prompt": inst["instruction"],
-                "chosen": response_a.choices[0].message.content,
-                "rejected": response_b.choices[0].message.content,
-            })
-        return pairs
-```
-
-### 13.5.3 数据版本控制
-
-使用 DVC/Git LFS 进行数据版本控制，追踪数据变更，标记数据集版本号，存储元数据（大小、来源、质量指标），支持可重现的实验。
-
----
-
-## 💡 案例：基于 Unsloth 的高效微调实践
-
-### 业务背景
-
-一家初创公司需要为客服场景微调 7B 模型（中文）：
-- 1 GPU（RTX 4090，24GB 显存）
-- 5,000 个标注的客服对话
-- 预算：$500
-
-### Unsloth 性能对比
-
-| 框架 | 时间（7B，3轮） | 内存 | 质量 |
-|------|-----------------|------|------|
-| HuggingFace | 8.5 小时 | 18 GB | 基线 |
-| DeepSpeed ZeRO | 5.2 小时 | 12 GB | 基线 |
-| Unsloth | 2.1 小时 | 7 GB | 基线 |
-| Unsloth + 4bit | 1.8 小时 | 4 GB | -0.1% |
-
-### 实现
-
-```python
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from trl import SFTTrainer
-from transformers import TrainingArguments
-
-def train_customer_support_model():
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="unsloth/Qwen2.5-7B",
-        max_seq_length=2048,
-        load_in_4bit=True,
-    )
-
-    model = FastLanguageModel.get_peft_model(
-        model, r=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=16, lora_dropout=0, bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
-    )
-
-    def format_prompt(example):
-        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-你是一个专业的客服助手。<|eot_id|><|start_header_id|>user<|end_header_id|>
-{example['user_message']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-{example['assistant_response']}<|eot_id|>"""
-
-    trainer = SFTTrainer(
-        model=model, tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        dataset_text_field="text",
-        max_seq_length=2048, packing=True,
-        args=TrainingArguments(
-            output_dir="./output",
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            max_steps=500,
-            learning_rate=2e-4,
-            bf16=is_bfloat16_supported(),
-            optim="adamw_8bit",
-            logging_steps=10,
-        ),
-    )
-
-    trainer.train()
-    model.save_pretrained("./customer-support-lora")
-    model.save_pretrained_gguf("./gguf-output", tokenizer,
-                                quantization_method="q4_k_m")
-```
-
-### 训练结果
-
-| 指标 | 值 |
-|------|-----|
-| 训练时间 | 1 小时 23 分钟 |
-| 峰值 GPU 内存 | 6.8 GB |
-| 最终训练损失 | 0.892 |
-| 模型大小 (LoRA) | 84 MB |
-| 模型大小 (GGUF Q4) | 4.2 GB |
-| 成本 | $0.74 |
-
----
-
-## 本章小结
-
-| 主题 | 关键要点 |
-|------|---------|
-| **全量 vs PEFT** | PEFT (LoRA/QLoRA) 以 1% 成本实现 95%+ 质量 |
-| **LoRA 架构** | 低秩分解支持在消费级 GPU 上微调 |
-| **QLoRA** | 4 位基础 + LoRA = 单 GPU 微调 70B 模型 |
-| **指令微调** | 数据质量 > 数量；50K 精心策划样本足够 |
-| **RLHF/DPO** | DPO 比基于 PPO 的 RLHF 更简单稳定 |
-| **数据管理** | 版本控制、去重和质量过滤至关重要 |
-| **Unsloth** | 自定义 CUDA 内核 2-5 倍加速，适合初创公司 |
-
-### 微调决策树
+DPO（Rafailov et al., 2023）通过直接在偏好数据上优化来消除奖励模型：
 
 ```
-是否有 >100K 样本？
-├── 是 → 是否有 4+ A100 GPU？
-│   ├── 是 → 全量微调
-│   └── 否 → LoRA (rank=64)
-└── 否 → 是否有 <10K 样本？
-    ├── 是 → LoRA (rank=8-16) + 数据增强
-    └── 否 → LoRA (rank=16-32)
-         └── 是否有偏好数据？
-             ├── 是 → DPO 对齐
-             └── 否 → 仅指令微调
+┌──────────────────────────────────────────────────────────────┐
+│              RLHF vs DPO 对比                                   │
+│                                                                │
+│  RLHF（3 个阶段）：                                            │
+│  SFT → 奖励模型 → PPO                                          │
+│  - 复杂流水线                                                   │
+│  - 需要奖励模型训练                                             │
+│  - PPO 不稳定且对超参数敏感                                     │
+│  - 需要大量计算用于 PPO                                         │
+│                                                                │
+│  DPO（2 个阶段）：                                              │
+│  SFT → DPO                                                     │
+│  - 简单流水线                                                   │
+│  - 无需奖励模型                                                 │
+│  - 稳定训练（仅交叉熵损失）                                     │
+│  - 计算需求低                                                   │
+│                                                                │
+│  DPO 损失：                                                     │
+│  L = -log σ(β × (log π(y_w|x)/π_ref(y_w|x)                    │
+│               - log π(y_l|x)/π_ref(y_l|x)))                     │
+│                                                                │
+│  其中：                                                         │
+│  y_w = 偏好回答（赢家）                                         │
+│  y_l = 拒绝回答（输家）                                         │
+│  π_ref = 参考模型（SFT 模型）                                   │
+│  β = 温度参数（通常 0.1-0.5）                                   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
----
+📌 **真实数据**：DPO 将对齐训练计算量减少 4-10 倍，同时在人类偏好基准测试上达到与 RLHF 相当或更好的结果。Meta 使用 DPO 对齐 Llama 3 模型（Meta AI, 2024）。
 
-## 参考文献
-
-1. Hu, E. J., et al. (2022). "LoRA: Low-Rank Adaptation of Large Language Models." ICLR.
-2. Dettmers, T., et al. (2023). "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS.
-3. Ouyang, L., et al. (2022). "Training language models to follow instructions with human feedback." NeurIPS.
-4. Rafailov, R., et al. (2023). "Direct Preference Optimization." NeurIPS.
-5. Tunstall, L., et al. (2023). "Zephyr: Direct Distillation of LM Alignment." arXiv.
-6. Unsloth 文档. https://github.com/unslothai/unsloth
-7. Hugging Face PEFT 文档. https://huggingface.co/docs/peft
-8. TRL 文档. https://huggingface.co/docs/trl
-9. Taori, R., et al. (2023). "Stanford Alpaca." GitHub.
-10. Ding, N., et al. (2023). "Enhancing Chat Language Models by Scaling Instructional Conversations." arXiv.
-
----
-
-*← [第12章 - RAG 系统架构](chapter-12.md) | 第四部分完 →*
-
-### 13.3.2 完整指令微调流水线
-
-```python
-class InstructionTuningPipeline:
-    def __init__(self, model_name, output_dir):
-        self.model_name = model_name
-        self.output_dir = output_dir
-        self.setup_model()
-
-    def setup_model(self):
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = prepare_model_for_kbit_training(self.model)
-
-    def prepare_data(self, data_path):
-        with open(data_path, 'r', encoding='utf-8') as f:
-            raw_data = json.load(f)
-        formatted_data = []
-        for item in raw_data:
-            if "conversations" in item:
-                text = self._format_conversations(item["conversations"])
-            else:
-                text = self._format_alpaca(
-                    item.get("instruction", ""),
-                    item.get("input", ""),
-                    item.get("output", "")
-                )
-            formatted_data.append({"text": text})
-        return Dataset.from_list(formatted_data)
-
-    def _format_alpaca(self, instruction, input_text, output):
-        if input_text:
-            return (
-                f"### Instruction:\n{instruction}\n\n"
-                f"### Input:\n{input_text}\n\n"
-                f"### Response:\n{output}"
-            )
-        return f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
-
-    def _format_conversations(self, conversations):
-        text = ""
-        for turn in conversations:
-            if turn["from"] == "human":
-                text += f"<|user|>\n{turn['value']}\n"
-            elif turn["from"] == "gpt":
-                text += f"<|assistant|>\n{turn['value']}\n"
-        return text
-
-    def train(self, dataset, rank=16):
-        lora_config = LoraConfig(
-            r=rank, lora_alpha=32, lora_dropout=0.05,
-            bias="none", task_type="CAUSAL_LM",
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj"],
-        )
-        model = get_peft_model(self.model, lora_config)
-        training_args = SFTConfig(
-            output_dir=self.output_dir,
-            num_train_epochs=3,
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            learning_rate=2e-4,
-            weight_decay=0.01,
-            warmup_ratio=0.03,
-            lr_scheduler_type="cosine",
-            logging_steps=10,
-            save_strategy="epoch",
-            bf16=True,
-            optim="paged_adamw_32bit",
-            gradient_checkpointing=True,
-            max_seq_length=2048,
-            packing=True,
-        )
-        trainer = SFTTrainer(
-            model=model,
-            train_dataset=dataset,
-            tokenizer=self.tokenizer,
-            args=training_args,
-        )
-        trainer.train()
-        model.save_pretrained(f"{self.output_dir}/adapter")
-        return trainer
-```
-
-### 13.3.3 数据质量与策划
-
-数据质量对微调效果至关重要。高质量数据的关键原则：
-
-- **多样性**：指令应覆盖广泛的任务类型，避免重复模式
-- **详细性**：输出应详细、全面，而非简短敷衍
-- **一致性**：格式和风格在整个数据集中保持一致
-- **平衡性**：各任务类型的样本数应大致均衡
-- **准确性**：输出不应包含幻觉事实或错误信息
-
-数据质量流水线包括：原始数据源 → 去重（精确匹配 + MinHash + 语义去重）→ 质量过滤（移除有毒/过短/过长内容）→ 平衡与增强（添加 CoT、多轮对话、代码数据）→ 人工抽查验证。
-
----
-
-## 13.4 RLHF/DPO 架构
-
-### 13.4.1 RLHF 流水线
-
-RLHF（基于人类反馈的强化学习）使模型与人类偏好对齐。它分为三个阶段：
-
-**阶段 1：监督微调（SFT）**
-在高质量的人类示范数据上微调基础模型，得到 SFT 模型。
-
-**阶段 2：奖励模型训练**
-使用 SFT 模型生成多个回答，由人类标注员排序（A > B > C > D），训练奖励模型学习人类偏好：
-
-```
-L_rank = -log(sigma(r(y_preferred) - r(y_rejected)))
-```
-
-**阶段 3：PPO 优化**
-使用近端策略优化（PPO）算法优化策略模型，最大化奖励同时保持与 SFT 模型的 KL 散度约束：
-
-```
-最大化: r(y) - beta * KL(pi_theta || pi_ref)
-```
-
-其中 pi_theta 是正在优化的策略模型，pi_ref 是冻结的 SFT 参考模型，beta 控制 KL 惩罚强度。
-
-### 13.4.2 DPO：直接偏好优化
-
-DPO（Rafailov 等，2023）消除了单独奖励模型的需求，直接使用偏好对优化策略：
-
-📌 **核心概念**：DPO 直接使用偏好对（chosen/rejected）优化策略，避免了 PPO 的 RL 训练复杂性。
-
-```
-DPO 损失:
-L_DPO = -log sigma(beta * (log pi_theta(y_w|x) / pi_ref(y_w|x)
-                       - log pi_theta(y_l|x) / pi_ref(y_l|x)))
-
-y_w: 偏好（获胜）回答
-y_l: 拒绝（失败）回答
-pi_theta: 正在训练的策略
-pi_ref: 参考策略（SFT 模型）
-beta: 温度参数
-```
-
-| 方面 | RLHF (PPO) | DPO |
-|------|-----------|-----|
-| 阶段数 | 3 (SFT + RM + PPO) | 2 (SFT + DPO) |
-| 所需数据 | 偏好 + 奖励模型 | 偏好对 (chosen/rejected) |
-| 复杂度 | 高（4个模型同时在内存中） | 低（仅2个模型） |
-| 稳定性 | 不稳定，需要仔细调参 | 稳定 |
-| 质量 | 最好（如调优） | 好 |
-| 灵活性 | 更高（可用奖励塑形） | 较低 |
+### 13.4.3 DPO 训练示例
 
 ```python
 from trl import DPOTrainer, DPOConfig
 from datasets import Dataset
 
-def train_dpo(model_name, preference_data, output_dir):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, device_map="auto")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, device_map="auto")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+# 准备偏好数据集
+# 每个样本有：prompt、chosen（偏好）、rejected（拒绝）
+preference_data = {
+    "prompt": ["2+2 等于多少？", "解释引力。"],
+    "chosen": ["4", "引力是吸引物体的力..."],
+    "rejected": ["5", "我不知道。"]
+}
+dataset = Dataset.from_dict(preference_data)
 
-    dataset = Dataset.from_dict({
-        "prompt": [item["prompt"] for item in preference_data],
-        "chosen": [item["chosen"] for item in preference_data],
-        "rejected": [item["rejected"] for item in preference_data],
-    })
+# DPO 配置
+dpo_config = DPOConfig(
+    output_dir="./dpo_output",
+    per_device_train_batch_size=4,
+    learning_rate=5e-7,
+    beta=0.1,  # KL 惩罚系数
+    loss_type="sigmoid",  # 标准 DPO 损失
+    num_train_epochs=1,
+    gradient_accumulation_steps=4,
+    bf16=True,
+    logging_steps=10,
+    save_steps=100,
+)
 
-    dpo_config = DPOConfig(
-        output_dir=output_dir,
-        num_train_epochs=1,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=8,
-        learning_rate=5e-7,
-        beta=0.1,
-        loss_type="sigmoid",
-        bf16=True,
-        logging_steps=10,
-        max_length=1024,
-        max_prompt_length=512,
-        gradient_checkpointing=True,
-    )
+# DPO Trainer
+trainer = DPOTrainer(
+    model=model,
+    ref_model=ref_model,  # SFT 模型作为参考
+    train_dataset=dataset,
+    tokenizer=tokenizer,
+    args=dpo_config,
+)
 
-    trainer = DPOTrainer(
-        model=model, ref_model=ref_model,
-        args=dpo_config, train_dataset=dataset,
-        tokenizer=tokenizer,
-    )
-    trainer.train()
-    trainer.save_model(output_dir)
-    return trainer
+trainer.train()
 ```
 
-### 13.4.3 其他对齐方法
+### 13.4.4 RLHF vs DPO vs KTO
 
-| 方法 | 数据需求 | 复杂度 | 质量 | 说明 |
-|------|---------|--------|------|------|
-| RLHF (PPO) | 偏好 + RM | 高 | 最好 | 前沿模型首选 |
-| DPO | 对 (chosen/rejected) | 低 | 好 | 默认选择 |
-| IPO | 对 | 低 | 好 | DPO 变体 |
-| KTO | 二元 (好/坏) | 低 | 好 | 更简单的标注 |
-| ORPO | 对 | 低 | 好 | 无需参考模型 |
-| RLAIF | AI 偏好 | 中 | 好 | 减少人类标注 |
-| Constitutional | AI 反馈 | 低 | 好 | Anthropic 方法 |
-
-**趋势（2024-2026）**：DPO 及其变体正成为默认选择；RLHF 主要用于前沿模型；RLAIF 减少对人类标注的需求。
+| 方法 | 所需数据 | 计算量 | 稳定性 | 质量 | 最佳场景 |
+|------|---------|--------|--------|------|---------|
+| **RLHF** | 偏好对 | 极高 | 低 | 最高 | 最大对齐质量 |
+| **DPO** | 偏好对 | 低 | 高 | 非常好 | 大多数用例 |
+| **KTO** | 二元反馈（好/坏） | 低 | 高 | 好 | 无偏好对时 |
+| **IPO** | 偏好对 | 低 | 高 | 好 | 避免过度优化 |
+| **ORPO** | 偏好对 | 低 | 高 | 好 | 单阶段对齐 |
 
 ---
 
 ## 13.5 微调数据管理
 
-### 13.5.1 数据收集与标注
+### 13.5.1 数据质量是关键
 
-微调数据的质量直接决定模型性能。数据来源包括：
+📌 **真实数据**：研究一致表明数据质量比数量更重要。微软的一项研究发现，10K 高质量样本在指令微调中优于 100K 低质量样本（Li et al., 2023）。
 
-- **人类标注**：最高质量，但成本最高（每小时$15-50）
-- **合成生成**：使用 GPT-4/Claude 生成，成本较低
-- **现有数据集**：Alpaca、Dolly、OpenAssistant 等开源数据集
-- **领域特定收集**：垂直领域的专业数据
-- **用户交互日志**：生产环境中的真实交互
-
-标注工具推荐：Label Studio（开源）、Argilla（LLM 专注）、Scale AI / Surge AI（托管服务）。
-
-质量保证：标注者间一致性（IAA > 0.8）、自动质量检查、10% 人工抽查、A/B 测试验证模型性能。
-
-### 13.5.2 合成数据生成
-
-```python
-class SyntheticDataGenerator:
-    def __init__(self, api_key, model="gpt-4"):
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-
-    def generate_instructions(self, topic, num_samples=100):
-        prompt = f"Generate {num_samples} diverse, high-quality instructions about {topic}."
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-        return json.loads(response.choices[0].message.content)
-
-    def generate_preference_pairs(self, instructions, num_pairs=1000):
-        pairs = []
-        for inst in instructions[:num_pairs]:
-            response_a = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": inst["instruction"]}],
-                max_tokens=1024, temperature=0.8,
-            )
-            response_b = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": inst["instruction"]}],
-                max_tokens=1024, temperature=0.8,
-            )
-            judge_prompt = f"Compare responses A and B for: {inst['instruction']}\nA: {response_a.choices[0].message.content}\nB: {response_b.choices[0].message.content}\nWhich is better? Reply A or B."
-            judge = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": judge_prompt}],
-                max_tokens=1,
-            )
-            winner = judge.choices[0].message.content.strip()
-            if winner == "A":
-                chosen, rejected = response_a.choices[0].message.content, response_b.choices[0].message.content
-            else:
-                chosen, rejected = response_b.choices[0].message.content, response_a.choices[0].message.content
-            pairs.append({"prompt": inst["instruction"], "chosen": chosen, "rejected": rejected})
-        return pairs
-```
-
-### 13.5.3 数据版本控制
-
-使用 DVC/Git LFS 进行数据版本控制是微调项目的关键实践。推荐的目录结构：
+### 13.5.2 数据准备检查清单
 
 ```
-data/
-  v1.0/
-    train.jsonl
-    val.jsonl
-    test.jsonl
-    metadata.json
-  v1.1/
-    train.jsonl (增加 10K 样本)
-    metadata.json
-  current -> v1.1/  (符号链接)
+┌──────────────────────────────────────────────────────────────┐
+│              数据质量检查清单                                    │
+│                                                                │
+│  ☐ 去重                                                        │
+│    - 精确重复                                                   │
+│    - 近似重复（相似度 > 0.95）                                  │
+│    - 模板重复（相同结构，不同实体）                              │
+│                                                                │
+│  ☐ 过滤                                                        │
+│    - 过短（< 10 tokens）                                        │
+│    - 过长（> max_seq_length）                                   │
+│    - 有害/有毒内容                                              │
+│    - PII（姓名、邮箱、电话号码）                                 │
+│    - 低质量（乱码、随机字符）                                   │
+│                                                                │
+│  ☐ 格式化                                                      │
+│    - 一致的 instruction/input/output 结构                       │
+│    - 正确的转义和编码                                            │
+│    - 正确分词                                                   │
+│                                                                │
+│  ☐ 平衡                                                        │
+│    - 多样的指令类型                                             │
+│    - 平衡的难度级别                                             │
+│    - 代表目标用例                                               │
+│                                                                │
+│  ☐ 验证                                                        │
+│    - 随机样本的人工审查                                          │
+│    - 检查标签错误                                               │
+│    - 验证答案质量                                               │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-metadata.json 应记录：版本号、创建日期、数据来源、样本数量、类别分布、质量指标、变更日志。
+### 13.5.3 数据增强技术
+
+| 技术 | 描述 | 何时使用 |
+|------|------|---------|
+| **Self-Instruct** | 用 LLM 生成新指令数据 | 扩展小数据集 |
+| **改写** | 重新表述现有指令 | 增加多样性 |
+| **回译** | 翻译到另一种语言再翻回 | 多语言鲁棒性 |
+| **思维链** | 在答案中添加推理步骤 | 提升推理质量 |
+| **拒绝采样** | 生成多个答案，保留最好的 | 提升答案质量 |
 
 ---
 
-## 💡 案例：基于 Unsloth 的高效微调实践
+## 13.6 评估与监控
 
-### 业务背景
+### 13.6.1 评估指标
 
-一家初创公司需要为客服场景微调 7B 模型（中文）：
-- 1 GPU（RTX 4090，24GB 显存）
-- 5,000 个标注的客服对话
-- 预算：$500
+| 指标 | 类型 | 测量什么 |
+|------|------|---------|
+| **困惑度** | 自动 | 语言建模质量（越低越好） |
+| **MMLU** | 基准 | 57 个学科的知识 |
+| **HumanEval** | 基准 | 代码生成能力 |
+| **MT-Bench** | 基准 | 多轮对话质量 |
+| **AlpacaEval** | 基准 | 指令跟随质量 |
+| **胜率** | 人工评估 | 与参考模型的对比 |
+| **毒性** | 安全 | 有害内容生成率 |
 
-### 为什么选择 Unsloth？
+### 13.6.2 训练期间监控
 
-Unsloth 通过自定义 CUDA 内核提供 2-5 倍训练加速和 60% 内存节省：
-
-| 框架 | 时间（7B，3轮） | 内存 | 质量 |
-|------|-----------------|------|------|
-| HuggingFace | 8.5 小时 | 18 GB | 基线 |
-| DeepSpeed ZeRO | 5.2 小时 | 12 GB | 基线 |
-| Unsloth | 2.1 小时 | 7 GB | 基线 |
-| Unsloth + 4bit | 1.8 小时 | 4 GB | -0.1% |
-
-关键优化包括：自定义 Triton 注意力内核、内存高效反向传播、智能梯度检查点、2 倍更快的 RoPE 计算、通过内核融合减少 60% 内存。
-
-### 实现
-
-```python
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from trl import SFTTrainer
-from transformers import TrainingArguments
-
-def train_customer_support_model():
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="unsloth/Qwen2.5-7B",
-        max_seq_length=2048, load_in_4bit=True,
-    )
-    model = FastLanguageModel.get_peft_model(
-        model, r=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=16, lora_dropout=0, bias="none",
-        use_gradient_checkpointing="unsloth", random_state=3407,
-    )
-    def format_prompt(example):
-        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-你是一个专业的客服助手，帮助用户解决产品相关问题。请用中文回答。
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-{example['user_message']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-{example['assistant_response']}<|eot_id|>"""
-
-    dataset = dataset.map(lambda x: {"text": format_prompt(x)})
-    trainer = SFTTrainer(
-        model=model, tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        dataset_text_field="text",
-        max_seq_length=2048, packing=True,
-        args=TrainingArguments(
-            output_dir="./output", per_device_train_batch_size=4,
-            gradient_accumulation_steps=4, max_steps=500,
-            learning_rate=2e-4, bf16=is_bfloat16_supported(),
-            optim="adamw_8bit", logging_steps=10,
-        ),
-    )
-    trainer.train()
-    model.save_pretrained("./customer-support-lora")
-    model.save_pretrained_gguf("./gguf", tokenizer, quantization_method="q4_k_m")
+```
+┌──────────────────────────────────────────────────────────────┐
+│              训练监控仪表板                                      │
+│                                                                │
+│  损失曲线：                                                     │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  训练损失：应稳步下降                                   │    │
+│  │  验证损失：应下降，然后趋于平稳                         │    │
+│  │  ⚠️ 如果验证损失上升：过拟合！                          │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                                │
+│  梯度指标：                                                     │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  梯度范数：应稳定（不爆炸）                             │    │
+│  │  学习率：遵循 warmup + 余弦调度                         │    │
+│  │  GPU 显存：应稳定（无 OOM）                             │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                                │
+│  质量指标（每 N 步）：                                           │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  从验证 prompt 生成样本                                 │    │
+│  │  检查：幻觉、格式合规、质量                              │    │
+│  │  与基座模型输出比较                                     │    │
+│  └──────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### 训练结果
+### 13.6.3 常见微调失败
 
-| 指标 | 值 |
-|------|-----|
-| 训练时间 | 1 小时 23 分钟 |
-| 峰值 GPU 内存 | 6.8 GB |
-| 最终训练损失 | 0.892 |
-| 验证损失 | 0.914 |
-| 模型大小 (LoRA) | 84 MB |
-| 模型大小 (GGUF Q4) | 4.2 GB |
-| 成本 (按需) | $0.74 |
+| 失败 | 症状 | 原因 | 修复 |
+|------|------|------|------|
+| **灾难性遗忘** | 模型丢失通用知识 | 过多 epoch、学习率过高 | 降低学习率、减少 epoch、使用 LoRA |
+| **过拟合** | 训练损失↓、验证损失↑ | 训练过多、数据太少 | 早停、正则化、更多数据 |
+| **奖励攻击** | 高奖励、差输出 | 奖励模型被利用 | 更好的奖励模型、KL 惩罚 |
+| **模式崩溃** | 所有输出相似 | 策略太确定性 | 提高温度、多样化数据 |
+| **格式退化** | 模型忽略指令格式 | 数据格式不一致 | 标准化数据格式 |
 
-质量指标：客户意图识别 94.2%、回答有用性 4.1/5.0、回答安全性 99.8%、中文语言质量 4.3/5.0。与基线对比：意图识别 67% → 94%（+27%），有用性 2.8 → 4.1（+1.3），响应时间 2.1s → 0.3s（7 倍更快）。
+---
+
+## 💡 案例研究：医疗公司如何微调临床 NLP
+
+### 背景
+
+一家医疗 AI 公司需要构建临床 NLP 系统，从医疗记录中提取结构化信息。任务：从非结构化临床笔记中识别诊断、药物、手术和实验室结果。
+
+### 架构决策
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| **基座模型** | Llama 3 8B | 良好的医学知识、开放权重 |
+| **微调方法** | QLoRA（4 位，rank=16） | GPU 预算有限、需要快速迭代 |
+| **数据规模** | 50K 份标注临床笔记 | 高质量、专家标注 |
+| **目标模块** | 所有注意力 + FFN 层 | 最大任务适配 |
+| **对齐** | DPO + 临床医生偏好 | 确保医学准确性 |
+
+### 数据流水线
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│              临床 NLP 数据流水线                                 │
+│                                                                │
+│  原始临床笔记（10 万+）                                         │
+│       │                                                        │
+│       ▼                                                        │
+│  去标识化（HIPAA 合规）                                         │
+│  - 移除姓名、日期、位置                                         │
+│  - 用合成占位符替换                                             │
+│       │                                                        │
+│       ▼                                                        │
+│  专家标注（50K 笔记）                                          │
+│  - 3 名认证医师                                                │
+│  - 标注者间一致性：κ = 0.89                                    │
+│       │                                                        │
+│       ▼                                                        │
+│  格式化为指令跟随                                               │
+│  {"instruction": "从此临床笔记中提取诊断",                      │
+│   "input": "患者出现胸痛...",                                   │
+│   "output": [{"diagnosis": "急性 MI", "confidence": 0.95}]}    │
+│       │                                                        │
+│       ▼                                                        │
+│  质量控制                                                       │
+│  - 自动检查：有效 JSON、无空字段                                 │
+│  - 人工审查：10% 随机样本                                       │
+│  - 对抗测试：边界情况、缩写                                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 结果
+
+| 指标 | 基座 Llama 3 8B | 微调后模型 | 改进 |
+|------|-----------------|-----------|------|
+| F1（诊断抽取） | 0.42 | 0.91 | +117% |
+| F1（药物抽取） | 0.38 | 0.89 | +134% |
+| F1（手术抽取） | 0.35 | 0.87 | +149% |
+| 幻觉率 | 23% | 2% | -91% |
+| HIPAA 合规 | 100% | 100% | 保持 |
+
+### 关键要点
+
+1. **领域特定数据质量至关重要**：医学标注必须是专家级别的
+2. **QLoRA 实现快速迭代**：训练速度快 3 倍，显存减少 70%
+3. **DPO 对齐确保安全**：临床医生偏好防止危险输出
+4. **评估必须领域适配**：标准 NLP 指标无法捕获医学准确性
+
+---
+
+## ⚠️ 战争故事：微调后模型比基座模型更差
+
+### 背景
+
+一家金融科技公司在 10 万条客户支持对话上微调了 Llama 3 70B，构建金融顾问聊天机器人。他们使用 LoRA（rank=32）在 8 × A100 GPU 上训练了 3 个 epoch。
+
+### 问题
+
+微调后，自动评估显示改进：
+- 指令跟随：78% → 89%
+- 回答相关性：72% → 85%
+- 金融准确性：65% → 71%
+
+但部署到生产后，客户投诉增加：
+- "机器人给的是通用金融建议，不个性化"
+- "它以前能回答产品特定问题，现在不行了"
+- "它推荐我们甚至不提供的产品"
+
+### 根因分析
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    失败分析                                     │
+│                                                                │
+│  1. 数据问题：                                                  │
+│  - 训练数据来自不同的产品线                                     │
+│  - 客户对话是关于产品 A 的                                      │
+│  - 生产用户问的是产品 B（更新的）                               │
+│  - 模型学会了产品 A 的特性，忘记了产品 B                        │
+│                                                                │
+│  2. 灾难性遗忘：                                                │
+│  - 基座模型知道两个产品（从预训练）                              │
+│  - 在产品 A 数据上的微调覆盖了关于 B 的知识                      │
+│  - 没有正则化来保留通用知识                                     │
+│                                                                │
+│  3. 评估差距：                                                  │
+│  - 自动评估使用与训练数据相同的分布                              │
+│  - 生产数据有不同分布                                           │
+│  - 评估显示改进，生产显示退化                                   │
+│                                                                │
+│  4. 数据泄露：                                                  │
+│  - 训练数据包含错误金融建议                                     │
+│  - 模型学会了自信地给出错误建议                                 │
+│  - 更高的"置信度"分数掩盖了更低的准确性                         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 修复方案
+
+1. **包含所有产品数据**：用产品 A 和 B 的对话重新训练
+2. **添加通用知识正则化**：在金融知识库上继续预训练
+3. **在目标分布上评估**：用产品 B 数据评估（不只是产品 A）
+4. **人工审查流水线**：所有 AI 回复在部署前经过合规审查
+5. **降低 LoRA rank**：从 32 降到 8 以限制适配能力
+
+### 影响
+
+- **2 周浪费的计算**：约 $5 万 GPU 成本
+- **产品上线延迟 3 周**
+- **客户信任损害**：15% 的测试用户转向竞争对手
+
+### 关键要点
+
+1. **在目标分布上评估**，而非仅训练分布
+2. **包含多样化数据**：覆盖所有产品、用例和边界情况
+3. **正则化防止遗忘**：使用较低 rank 的 LoRA，添加通用知识数据
+4. **人工审查必不可少**：自动指标可能具有误导性
+5. **从小处着手**：在子集上微调，彻底评估，然后扩展
+
+---
+
+## 📝 何时使用 / 何时不使用
+
+### 微调方法选择
+
+| 场景 | 推荐方法 | 原因 |
+|------|---------|------|
+| 快速原型、有限数据 | LoRA（rank=8） | 快速迭代、低成本 |
+| 生产质量、中等数据 | LoRA（rank=16-32） | 质量成本平衡好 |
+| 最高质量、无限预算 | 全量微调 | 最佳适配 |
+| 消费级 GPU（24GB） | QLoRA（4 位） | 大模型的唯一选择 |
+| 与人类偏好对齐 | DPO | 稳定、高效、效果好 |
+| 与二元反馈对齐 | KTO | 无偏好对时 |
+| 多任务 | LoRA（换适配器） | 同一基座、不同适配器 |
+| 实时适配 | LoRA | 快速适配器切换 |
+
+### 何时微调 vs 何时用 RAG
+
+| 用例 | 微调？ | RAG？ | 原因 |
+|------|--------|------|------|
+| 格式/风格适配 | ✅ | ❌ | 学习模式，而非事实 |
+| 领域词汇 | ✅ | ⚠️ | 微调用于术语，RAG 用于事实 |
+| 知识更新 | ❌ | ✅ | RAG 实时更新 |
+| 私有知识 | ⚠️ | ✅ | RAG 数据留在你的数据库 |
+| 任务特定行为 | ✅ | ❌ | 微调用于行为 |
+| 多领域知识 | ❌ | ✅ | RAG 扩展到多个领域 |
+| 推理改进 | ✅ | ❌ | 用 CoT 数据微调 |
+| 引用要求 | ❌ | ✅ | RAG 提供源文档 |
 
 ---
 
@@ -942,45 +734,82 @@ def train_customer_support_model():
 
 | 主题 | 关键要点 |
 |------|---------|
-| **全量 vs PEFT** | PEFT (LoRA/QLoRA) 以 1% 成本实现 95%+ 质量 |
-| **LoRA 架构** | 低秩分解支持在消费级 GPU 上微调 |
-| **QLoRA** | 4 位基础 + LoRA = 单 GPU 微调 70B 模型 |
-| **指令微调** | 数据质量 > 数量；50K 精心策划样本足够 |
-| **RLHF/DPO** | DPO 比基于 PPO 的 RLHF 更简单稳定 |
-| **数据管理** | 版本控制、去重和质量过滤至关重要 |
-| **Unsloth** | 自定义 CUDA 内核 2-5 倍加速，适合初创公司 |
+| **PEFT vs 全量 FT** | PEFT（LoRA/QLoRA）以 1-10% 的成本达到全量 FT 90-95% 的质量 |
+| **LoRA** | 低秩适配；rank=16 是好的默认值；推理时可合并 |
+| **QLoRA** | 4 位量化基座 + LoRA 适配器；可在单 GPU 上微调 70B |
+| **指令微调** | 数据质量 > 数据数量；10K 高质量 > 100K 低质量 |
+| **RLHF** | 3 阶段流水线：SFT → 奖励模型 → PPO；昂贵但有效 |
+| **DPO** | 2 阶段流水线：SFT → DPO；比 RLHF 便宜 4-10 倍，质量相当 |
+| **数据管理** | 去重、过滤、格式化、平衡、验证；人工审查必不可少 |
+| **评估** | 使用多指标；在目标分布上评估，而非训练分布 |
+| **常见失败** | 灾难性遗忘、过拟合、奖励攻击、模式崩溃 |
 
-### 微调决策树
+---
 
-```
-是否有 >100K 样本？
-├── 是 → 是否有 4+ A100 GPU？
-│   ├── 是 → 全量微调
-│   └── 否 → LoRA (rank=64)
-└── 否 → 是否有 <10K 样本？
-    ├── 是 → LoRA (rank=8-16) + 数据增强
-    └── 否 → LoRA (rank=16-32)
-         │
-         └── 是否有偏好数据？
-             ├── 是 → DPO 对齐
-             └── 否 → 仅指令微调
-```
+## 讨论题
+
+1. **资源分配**：你有 $10,000 的微调预算。你可以：
+   - 选项 A：在 50K 样本上全量微调 7B 模型
+   - 选项 B：在 10K 样本上 LoRA 微调 70B 模型
+   
+   你会选择哪个？为什么？哪些因素影响你的决策？
+
+2. **对齐策略**：一家公司想将客服聊天机器人与品牌声音对齐。他们有 5,000 对来自客服代理的偏好/拒绝回答。他们应该用 RLHF、DPO 还是 KTO？有哪些权衡？
+
+3. **数据策略**：你正在构建医疗问答系统。你有 1,000 个专家标注样本但需要更多数据。你会使用什么增强策略？如何验证增强数据的质量？
+
+4. **评估设计**：你的微调模型在 MMLU 上得分 95%，但用户抱怨它比基座模型"更没用"。你会如何调查和解决这个差异？
+
+5. **架构决策**：你需要服务一个同时处理通用问题（来自预训练的知识）和公司特定问题（需要微调）的模型。你应该微调整个模型还是用 RAG？混合方法呢？
+
+---
+
+## 练习
+
+### 练习 1：LoRA 微调
+
+使用 PEFT + TRL：
+1. 在自定义数据集（Alpaca 格式）上使用 LoRA 微调 Llama 3 8B
+2. 实验不同 rank（4、8、16、32）并比较：
+   - 训练时间
+   - GPU 显存使用
+   - 验证损失
+   - 样本质量（人工评估）
+3. 创建报告，为你的用例推荐最优 rank
+
+### 练习 2：DPO 对齐
+
+使用 TRL：
+1. 创建偏好数据集（100 对 chosen/rejected 回答）
+2. 使用不同 β 值（0.05、0.1、0.2、0.5）DPO 微调模型
+3. 使用胜率评估（与 SFT 模型比较）
+4. 分析 β 对回答质量和多样性的影响
+5. 写 β 选择建议
+
+### 练习 3：失败模式调查
+
+给定预训练模型和微调版本：
+1. 在 5 个不同基准上运行评估
+2. 识别微调模型表现更差的领域
+3. 分析训练数据寻找可能原因
+4. 提出并实施修复（数据增强、正则化等）
+5. 将发现记录在失败分析报告中
 
 ---
 
 ## 参考文献
 
-1. Hu, E. J., et al. (2022). "LoRA: Low-Rank Adaptation of Large Language Models." ICLR.
-2. Dettmers, T., et al. (2023). "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS.
-3. Ouyang, L., et al. (2022). "Training language models to follow instructions with human feedback." NeurIPS.
-4. Rafailov, R., et al. (2023). "Direct Preference Optimization." NeurIPS.
-5. Tunstall, L., et al. (2023). "Zephyr: Direct Distillation of LM Alignment." arXiv.
-6. Unsloth 文档. https://github.com/unslothai/unsloth
-7. Hugging Face PEFT 文档. https://huggingface.co/docs/peft
-8. TRL 文档. https://huggingface.co/docs/trl
-9. Taori, R., et al. (2023). "Stanford Alpaca." GitHub.
-10. Ding, N., et al. (2023). "Enhancing Chat Language Models." arXiv.
+1. Hu, E. J., et al. (2022). "LoRA: Low-Rank Adaptation of Large Language Models." https://arxiv.org/abs/2106.09685
+2. Dettmers, T., et al. (2023). "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS. https://arxiv.org/abs/2305.14314
+3. Rafailov, R., et al. (2023). "Direct Preference Optimization: Your Language Model is Secretly a Reward Model." NeurIPS. https://arxiv.org/abs/2305.18290
+4. Touvron, H., et al. (2023). "Llama 2: Open Foundation and Fine-Tuned Chat Models." https://arxiv.org/abs/2307.09288
+5. Meta AI. (2024). "The Llama 3 Herd of Models." https://arxiv.org/abs/2407.21783
+6. Hugging Face PEFT 文档. https://huggingface.co/docs/peft
+7. Hugging Face TRL 文档. https://huggingface.co/docs/trl
+8. Unsloth 文档. https://github.com/unslothai/unsloth
+9. Ouyang, L., et al. (2022). "Training language models to follow instructions with human feedback." NeurIPS. https://arxiv.org/abs/2203.02155
+10. Christiano, P., et al. (2017). "Deep Reinforcement Learning from Human Preferences." NeurIPS. https://arxiv.org/abs/1706.03741
 
 ---
 
-*← [第12章 - RAG 系统架构](chapter-12.md) | 第四部分完 →*
+*下一章：[第 14 章 - 生产部署](chapter-14.md) →*
