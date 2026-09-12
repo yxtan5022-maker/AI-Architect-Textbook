@@ -1,0 +1,173 @@
+\documentclass[12pt,a4paper,twoside]{book}
+
+% Encoding and language support
+\usepackage[UTF8]{ctex}
+\usepackage[english]{babel}
+
+% Math support
+\usepackage{amsmath,amssymb,amsthm}
+
+% Code listings support
+\usepackage{listings}
+\usepackage{xcolor}
+
+% Graphics support
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows,shapes,positioning}
+
+% Table support
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+
+% Bibliography support
+\usepackage[backend=biber,style=gb7714-2015,sorting=none]{biblatex}
+\addbibresource{references.bib}
+
+% Hyperlinks
+\usepackage[
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=red,
+    urlcolor=magenta,
+    bookmarks=true
+]{hyperref}
+
+% Page layout
+\usepackage{geometry}
+\geometry{
+    left=3cm,
+    right=3cm,
+    top=3cm,
+    bottom=3cm
+}
+
+% Header and footer
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\leftmark}
+\fancyhead[RO]{\rightmark}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Chapter styling
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+    {\normalfont\huge\bfseries}
+    {\chaptertitlename\ \thechapter}
+    {20pt}
+    {\Huge}
+\titlespacing*{\chapter}{0pt}{50pt}{40pt}
+
+% List configuration
+\usepackage{enumitem}
+\setlist{nosep}
+
+% Theorem environments
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[chapter]
+\newtheorem{example}{Example}[chapter]
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[chapter]
+
+% Code listing style
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+% Title information
+\title{
+    \textbf{AI Architect Textbook}\\
+    \vspace{1cm}
+    \textbf{AI 架构师教程}\\
+    \vspace{0.5cm}
+    \large From Fundamentals to Practice
+}
+\author{
+    AI Architect Team
+}
+\date{\today}
+
+\begin{document}
+
+% Title page
+\maketitle
+\thispagestyle{empty}
+\clearpage
+
+% Copyright page
+\thispagestyle{empty}
+\vspace*{\fill}
+\begin{center}
+    \textbf{AI Architect Textbook}\\
+    AI 架构师教程\\
+    \vspace{1cm}
+    \copyright\ 2026 AI Architect Team\\
+    All rights reserved.
+\end{center}
+\vspace*{\fill}
+\clearpage
+
+% Table of contents
+\tableofcontents
+\clearpage
+
+% Include chapters
+\include{chapters/chapter-01}
+\include{chapters/chapter-02}
+\include{chapters/chapter-03}
+\include{chapters/chapter-04}
+\include{chapters/chapter-05}
+\include{chapters/chapter-06}
+\include{chapters/chapter-07}
+\include{chapters/chapter-08}
+\include{chapters/chapter-09}
+\include{chapters/chapter-10}
+\include{chapters/chapter-11}
+\include{chapters/chapter-12}
+\include{chapters/chapter-13}
+\include{chapters/chapter-14}
+\include{chapters/chapter-15}
+\include{chapters/chapter-16}
+\include{chapters/chapter-17}
+\include{chapters/chapter-18}
+\include{chapters/chapter-19}
+\include{chapters/chapter-20}
+\include{chapters/chapter-21}
+\include{chapters/chapter-22}
+\include{chapters/chapter-23}
+\include{chapters/chapter-24}
+\include{chapters/chapter-25}
+
+% Appendices
+\appendix
+\include{appendix}
+
+% Bibliography
+\printbibliography[heading=bibintoc,title={References}]
+
+\end{document}
